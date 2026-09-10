@@ -67,14 +67,22 @@ The formula is published to
 which is what makes `brew install randallyash/spillover/spill` work.
 
 The tap repository exists, with a `main` branch and a README. **One thing is
-still needed before the first release**, or the release fails at the publish step
+needed before the Homebrew job will pass**, or it fails at the publish step
 because the job cannot push to the tap:
 
 1. Create a fine-grained personal access token at
    <https://github.com/settings/personal-access-tokens/new>:
    - **Repository access** → *Only select repositories* → `homebrew-spillover`
    - **Permissions** → *Repository permissions* → **Contents: Read and write**
-   - Give it an expiry you are happy renewing
+   - **Expiration** → one year
+
+   One year is the maximum for a fine-grained token, and releases are
+   infrequent, so anything shorter tends to lapse between them and fails a
+   release for a reason nobody remembers. GitHub emails before it expires.
+
+   Keep the scope as narrow as above. This token can write to a repository whose
+   contents people `brew install`, so a leaked one could publish a malicious
+   formula. That is also why it should not be set to never expire.
 
 2. Store it as a secret on the main repository:
 
@@ -84,10 +92,19 @@ because the job cannot push to the tap:
 
    `gh` prompts for the value, so it never lands in your shell history.
 
+When the token expires, renew it by repeating both steps. Nothing in the
+repository changes, because the secret is referenced by name only.
+
 Until it is set, the `publish-homebrew-formula` job fails, and because the
 `announce` job waits on it the run ends red. The release artifacts still
 publish — `host` runs first — so the installers keep working, but it looks
 broken.
+
+To re-run just that job after setting the secret, without rebuilding anything:
+
+```sh
+gh run rerun <run-id> --failed --repo randallyash/spillover
+```
 
 To turn the tap off entirely, drop the last two lines of `dist-workspace.toml`
 and run `dist generate`.
