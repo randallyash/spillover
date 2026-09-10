@@ -41,33 +41,38 @@ notice that, cancel, and start over somewhere else. spill treats it as expected:
 
 ## Install
 
-> **No release has been published yet**, so the packaged options below are not live.
-> Until v0.1.0 is tagged, build from source — that path works today.
+**macOS and Linux:**
 
-**From source** (works now):
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/randallyash/spillover/releases/latest/download/spill-installer.sh | sh
+```
+
+**Windows, with the installer:**
+
+```powershell
+powershell -c "irm https://github.com/randallyash/spillover/releases/latest/download/spill-installer.ps1 | iex"
+```
+
+There is also a `.msi` on the [releases page](https://github.com/randallyash/spillover/releases)
+if you would rather install from a package.
+
+**From source**, with Rust 1.85 or newer:
 
 ```sh
 cargo install --git https://github.com/randallyash/spillover
 ```
 
-Or clone and build:
-
-```sh
-git clone https://github.com/randallyash/spillover
-cd spillover
-cargo build --release      # the binary lands in target/release/spill
-```
-
-**Once a release is published**, these will work:
-
-| Platform | Command |
+| Route | Status |
 | --- | --- |
-| macOS, Linux | `curl --proto '=https' --tlsv1.2 -LsSf https://github.com/randallyash/spillover/releases/latest/download/spill-installer.sh \| sh` |
-| macOS, Homebrew | `brew install randallyash/spillover/spill` |
-| Windows | `powershell -c "irm https://github.com/randallyash/spillover/releases/latest/download/spill-installer.ps1 \| iex"` |
-| Windows, package | the `.msi` on the [releases page](https://github.com/randallyash/spillover/releases) |
-| Arch Linux | `yay -S spill-bin` — the `PKGBUILD` is in this repository, not yet submitted to the AUR |
-| Any | prebuilt archives for five platforms, on the [releases page](https://github.com/randallyash/spillover/releases) |
+| Installer script (macOS, Linux) | works |
+| Installer script (Windows), `.msi` | published |
+| `cargo install --git` | works |
+| Prebuilt archives, five platforms | on the [releases page](https://github.com/randallyash/spillover/releases) |
+| Homebrew | formula is published with each release, but not yet pushed to a tap, so `brew install` does not work |
+| Arch (AUR) | `PKGBUILD` is in [`packaging/arch`](packaging/arch) with verified checksums, not yet submitted to the AUR |
+
+Everything is signed off with `sha256.sum` on each release.
 
 ## Quick start
 
@@ -291,8 +296,10 @@ setup wizard, zero-config first run, `doctor`, and `-p`.
 
 Not yet:
 
-- A published release, so the packaged install routes above are not live.
-- A submitted AUR package, and Homebrew requires the tap token to be set.
+- **Homebrew** needs a tap token before the formula can be published, so
+  `brew install` is not available yet. The formula itself ships with each release.
+- **The AUR package** is written but not submitted, so `yay -S spill-bin` does not
+  work yet.
 - Windows `winget` and `scoop` manifests.
 - Per-tier CLI session resumption: a CLI fallback gets the whole conversation each
   turn rather than continuing its own session.
