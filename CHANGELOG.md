@@ -4,7 +4,9 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.0] - 2026-09-10
+
+First release. Everything below is new.
 
 ### Added
 
@@ -90,3 +92,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   PowerShell installers, a Windows `.msi`, a Homebrew formula published to a tap,
   and checksums, with an AUR `PKGBUILD` and a script that verifies a published
   tarball installs and runs.
+- On Windows, a path written in double quotes is rejected with an explanation.
+  `workspace = "C:\Users\me"` is not valid TOML, and the worse case —
+  `"C:\x86"` — is a *valid* escape that parses into a path holding a control
+  character, so nothing works for reasons that stay invisible. Write it in single
+  quotes instead. `config.example.toml` says so too.
+- The test suite runs on Linux, macOS and Windows, and the platform-specific
+  parts of it use the shell and separators of whichever platform is running
+  rather than assuming a POSIX one.
+
+[0.1.0]: https://github.com/randallyash/spillover/releases/tag/v0.1.0

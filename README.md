@@ -1,5 +1,9 @@
 # spill
 
+[![CI](https://github.com/randallyash/spillover/actions/workflows/ci.yml/badge.svg)](https://github.com/randallyash/spillover/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/randallyash/spillover)](https://github.com/randallyash/spillover/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Run your prompt on a local model first. When that model stalls, repeats itself, or
 gets stuck in a loop, spill abandons it and re-runs the same turn on the next model
 you listed — automatically, without you retyping anything.
