@@ -242,15 +242,16 @@ mod tests {
 
     #[test]
     fn an_installed_agent_cli_is_not_reported() {
-        let config = config(
+        let (bin, flag) = crate::provider::cli::portable_shell();
+        let config = config(&format!(
             r#"
             [[tier]]
             id = "shell"
             kind = "cli"
-            bin = "sh"
-            args = ["-c", "{prompt}"]
-            "#,
-        );
+            bin = "{bin}"
+            args = ["{flag}", "{{prompt}}"]
+            "#
+        ));
         assert!(notes(&Library::embedded(), &config).is_empty());
     }
 
@@ -291,16 +292,17 @@ mod tests {
 
     #[tokio::test]
     async fn a_cli_tier_builds_without_touching_the_network() {
-        let config = config(
+        let (bin, flag) = crate::provider::cli::portable_shell();
+        let config = config(&format!(
             r#"
             [[tier]]
             id = "shell"
             name = "A shell"
             kind = "cli"
-            bin = "sh"
-            args = ["-c", "{prompt}"]
-            "#,
-        );
+            bin = "{bin}"
+            args = ["{flag}", "{{prompt}}"]
+            "#
+        ));
 
         let tiers = build(&Library::embedded(), &config, Path::new("/tmp"))
             .await
@@ -332,21 +334,22 @@ mod tests {
 
     #[test]
     fn the_chain_keeps_the_configured_order() {
-        let config = config(
+        let (bin, flag) = crate::provider::cli::portable_shell();
+        let config = config(&format!(
             r#"
             [[tier]]
             id = "first"
             kind = "cli"
-            bin = "sh"
-            args = ["-c", "{prompt}"]
+            bin = "{bin}"
+            args = ["{flag}", "{{prompt}}"]
 
             [[tier]]
             id = "second"
             kind = "cli"
-            bin = "sh"
-            args = ["-c", "{prompt}"]
-            "#,
-        );
+            bin = "{bin}"
+            args = ["{flag}", "{{prompt}}"]
+            "#
+        ));
 
         // Built manually to avoid the async path in a pure test.
         let tiers = vec![

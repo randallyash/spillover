@@ -129,6 +129,27 @@ fn platform_shell(command: &str) -> tokio::process::Command {
 mod tests {
     use super::*;
 
+    // The tool runs `sh -c` on unix and `cmd /C` on Windows, so the test
+    // commands have to be written for whichever shell is actually there.
+
+    /// Listed in the workspace, so the test knows the command ran there.
+    #[cfg(unix)]
+    const LIST: &str = "ls";
+    #[cfg(windows)]
+    const LIST: &str = "dir /b";
+
+    /// Writes to stderr and exits 3.
+    #[cfg(unix)]
+    const FAIL_WITH_MESSAGE: &str = "echo oops >&2; exit 3";
+    #[cfg(windows)]
+    const FAIL_WITH_MESSAGE: &str = "echo oops 1>&2 & exit /b 3";
+
+    /// Succeeds and prints nothing.
+    #[cfg(unix)]
+    const QUIET_SUCCESS: &str = "true";
+    #[cfg(windows)]
+    const QUIET_SUCCESS: &str = "exit 0";
+
     #[tokio::test]
     async fn runs_a_command_and_returns_its_output() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -148,7 +169,7 @@ mod tests {
     async fn runs_in_the_workspace_directory() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("marker.txt"), "x").expect("write");
-        let outcome = RunShell.run(&json!({"command": "ls"}), dir.path()).await;
+        let outcome = RunShell.run(&json!({"command": LIST}), dir.path()).await;
         assert!(
             outcome.content.contains("marker.txt"),
             "{}",
@@ -160,9 +181,9 @@ mod tests {
     async fn a_failing_command_is_a_tool_error_with_its_stderr() {
         let dir = tempfile::tempdir().expect("tempdir");
         let outcome = RunShell
-            .run(&json!({"command": "echo oops >&2; exit 3"}), dir.path())
+            .run(&json!({"command": FAIL_WITH_MESSAGE}), dir.path())
             .await;
-        assert!(outcome.is_error);
+        assert!(outcome.is_error, "{}", outcome.content);
         assert!(
             outcome.content.contains("exit status 3"),
             "{}",
@@ -186,7 +207,9 @@ mod tests {
     #[tokio::test]
     async fn a_command_with_no_output_says_so() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let outcome = RunShell.run(&json!({"command": "true"}), dir.path()).await;
+        let outcome = RunShell
+            .run(&json!({"command": QUIET_SUCCESS}), dir.path())
+            .await;
         assert!(!outcome.is_error);
         assert!(
             outcome.content.contains("(no output)"),

@@ -178,6 +178,24 @@ impl Provider for CliProvider {
     }
 }
 
+/// A command that exists on every platform, with the flag it takes for a
+/// command line. For tests that need *some* installed CLI.
+///
+/// `sh` is not present on Windows, so a test naming it passes or fails by
+/// accident depending on whether Git Bash happens to be on `PATH`. This names
+/// what is actually there.
+#[cfg(test)]
+pub fn portable_shell() -> (&'static str, &'static str) {
+    #[cfg(unix)]
+    {
+        ("sh", "-c")
+    }
+    #[cfg(windows)]
+    {
+        ("cmd", "/C")
+    }
+}
+
 /// Whether a command can be found on PATH.
 ///
 /// Used to report a missing agent CLI when a tier is set up or checked, rather

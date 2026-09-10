@@ -417,9 +417,10 @@ mod tests {
     #[tokio::test]
     async fn every_configured_tier_appears_even_when_one_fails() {
         let library = Library::embedded();
+        let (bin, flag) = crate::provider::cli::portable_shell();
         let report = diagnose(
             &library,
-            &config(
+            &config(&format!(
                 r#"
                 [[tier]]
                 id = "dead"
@@ -430,10 +431,10 @@ mod tests {
                 [[tier]]
                 id = "shell"
                 kind = "cli"
-                bin = "sh"
-                args = ["-c", "{prompt}"]
-                "#,
-            ),
+                bin = "{bin}"
+                args = ["{flag}", "{{prompt}}"]
+                "#
+            )),
         )
         .await;
 

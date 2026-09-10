@@ -117,6 +117,13 @@ fn display_path(workspace: &Path, path: &Path) -> String {
 mod tests {
     use super::*;
 
+    /// Paths come back with the platform's own separator, so comparisons are
+    /// made on a flattened copy. These tests are about which files matched, not
+    /// about how the separator is spelled.
+    fn flat(text: &str) -> String {
+        text.replace('\\', "/")
+    }
+
     fn fixture() -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(dir.path().join("src/deep")).expect("mkdir");
@@ -133,34 +140,38 @@ mod tests {
         let dir = fixture();
         let outcome = Glob.run(&json!({"pattern": "**/*.rs"}), dir.path()).await;
         assert!(!outcome.is_error, "{}", outcome.content);
-        assert!(
-            outcome.content.contains("src/main.rs"),
-            "{}",
-            outcome.content
-        );
-        assert!(
-            outcome.content.contains("src/deep/lib.rs"),
-            "{}",
-            outcome.content
-        );
+
+        let content = flat(&outcome.content);
+        assert!(content.contains("src/main.rs"), "{content}");
+        assert!(content.contains("src/deep/lib.rs"), "{content}");
     }
 
     #[tokio::test]
     async fn skips_build_output_and_other_ignored_directories() {
         let dir = fixture();
         let outcome = Glob.run(&json!({"pattern": "**/*.rs"}), dir.path()).await;
+
+        let content = flat(&outcome.content);
         assert!(
-            !outcome.content.contains("target/"),
-            "target/ should be ignored: {}",
-            outcome.content
+            !content.contains("target/"),
+            "target/ should be ignored: {content}"
         );
+        // And the check above is meaningful: the same run did find real matches.
+        assert!(content.contains("src/main.rs"), "{content}");
     }
 
     #[tokio::test]
     async fn results_are_relative_to_the_workspace() {
         let dir = fixture();
         let outcome = Glob.run(&json!({"pattern": "src/*.rs"}), dir.path()).await;
-        assert!(!outcome.content.contains(&dir.path().display().to_string()));
+
+        let content = flat(&outcome.content);
+        let workspace = flat(&dir.path().display().to_string());
+        assert!(
+            !content.contains(&workspace),
+            "results should be relative, not absolute: {content}"
+        );
+        assert!(content.contains("src/main.rs"), "{content}");
     }
 
     #[tokio::test]

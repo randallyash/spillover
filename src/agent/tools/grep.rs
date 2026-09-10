@@ -198,6 +198,13 @@ fn search_tree(
 mod tests {
     use super::*;
 
+    /// Paths come back with the platform's own separator, so comparisons are
+    /// made on a flattened copy. These tests are about which lines matched, not
+    /// about how the separator is spelled.
+    fn flat(text: &str) -> String {
+        text.replace('\\', "/")
+    }
+
     fn fixture() -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(dir.path().join("src")).expect("mkdir");
@@ -218,10 +225,11 @@ mod tests {
         let dir = fixture();
         let outcome = Grep.run(&json!({"pattern": "todo"}), dir.path()).await;
         assert!(!outcome.is_error, "{}", outcome.content);
+
+        let content = flat(&outcome.content);
         assert!(
-            outcome.content.contains("src/main.rs:2: let todo = 1;"),
-            "got: {}",
-            outcome.content
+            content.contains("src/main.rs:2: let todo = 1;"),
+            "got: {content}"
         );
     }
 
@@ -229,21 +237,26 @@ mod tests {
     async fn skips_ignored_directories() {
         let dir = fixture();
         let outcome = Grep.run(&json!({"pattern": "todo"}), dir.path()).await;
+
+        let content = flat(&outcome.content);
         assert!(
-            !outcome.content.contains("target/"),
-            "target/ must be skipped: {}",
-            outcome.content
+            !content.contains("target/"),
+            "target/ must be skipped: {content}"
         );
+        // And the check above is meaningful: the same run did find real matches.
+        assert!(content.contains("src/main.rs"), "{content}");
     }
 
     #[tokio::test]
     async fn skips_binary_files() {
         let dir = fixture();
         let outcome = Grep.run(&json!({"pattern": "todo"}), dir.path()).await;
+
+        let content = flat(&outcome.content);
+        assert!(content.contains("src/main.rs"), "{content}");
         assert!(
-            !outcome.content.contains("data.bin"),
-            "binary files must be skipped: {}",
-            outcome.content
+            !content.contains("data.bin"),
+            "binary files must be skipped: {content}"
         );
     }
 
@@ -253,11 +266,9 @@ mod tests {
         let outcome = Grep
             .run(&json!({"pattern": "nothing", "glob": "*.rs"}), dir.path())
             .await;
-        assert!(
-            outcome.content.contains("src/lib.rs"),
-            "{}",
-            outcome.content
-        );
+
+        let content = flat(&outcome.content);
+        assert!(content.contains("src/lib.rs"), "{content}");
     }
 
     #[tokio::test]
@@ -269,12 +280,10 @@ mod tests {
                 dir.path(),
             )
             .await;
-        assert!(
-            outcome.content.contains("src/main.rs"),
-            "{}",
-            outcome.content
-        );
-        assert!(!outcome.content.contains("lib.rs"), "{}", outcome.content);
+
+        let content = flat(&outcome.content);
+        assert!(content.contains("src/main.rs"), "{content}");
+        assert!(!content.contains("lib.rs"), "{content}");
     }
 
     #[tokio::test]

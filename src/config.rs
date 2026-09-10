@@ -23,15 +23,35 @@ pub enum ConfigError {
         source: std::io::Error,
     },
 
-    #[error("{path} is not valid TOML:\n{source}")]
+    #[error("{path} is not valid TOML:\n{source}{hint}")]
     Parse {
         path: PathBuf,
+        // Boxed: the parser's error is large, and this variant is returned by
+        // every entry point that loads configuration.
         #[source]
-        source: toml::de::Error,
+        source: Box<toml::de::Error>,
+        /// Extra guidance, or empty. Static because it is one of a few fixed
+        /// sentences.
+        hint: &'static str,
     },
 
     #[error("{0}")]
     Invalid(String),
+}
+
+/// Guidance for the errors people actually hit.
+///
+/// The phrasing is matched against the TOML parser's own wording, which differs
+/// by what follows the backslash: `\U` reports too few unicode digits, while
+/// `\m` reports a missing escaped value.
+fn parse_hint(error: &toml::de::Error) -> &'static str {
+    let message = error.to_string();
+    if message.contains("escaped value") || message.contains("unicode value digits") {
+        "\n\nHint: inside double quotes a backslash starts an escape, so a Windows path needs \
+         either single quotes — workspace = 'C:\\Users\\me' — or doubled backslashes."
+    } else {
+        ""
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -228,13 +248,26 @@ impl Config {
     pub fn parse(path: &Path, text: &str) -> Result<Self, ConfigError> {
         let config: Self = toml::from_str(text).map_err(|source| ConfigError::Parse {
             path: path.to_path_buf(),
-            source,
+            hint: parse_hint(&source),
+            source: Box::new(source),
         })?;
         config.validate()?;
         Ok(config)
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
+        // A lone `\x` is a valid escape, so a path like C:\x86\bin parses into a
+        // string holding a control character rather than failing. Nothing would
+        // then work, and the cause would be invisible, so it is caught here.
+        if self.general.workspace.chars().any(char::is_control) {
+            return Err(ConfigError::Invalid(
+                "the workspace path in [general] contains a control character, which usually \
+                 means a backslash was read as an escape. Write it in single quotes — \
+                 workspace = 'C:\\Users\\me' — or double the backslashes."
+                    .to_string(),
+            ));
+        }
+
         if self.schema != SUPPORTED_SCHEMA {
             return Err(ConfigError::Invalid(format!(
                 "this config declares schema {}, but this build understands schema {}; upgrade \
@@ -521,6 +554,81 @@ mod tests {
     fn rejects_an_unknown_schema() {
         let err = parse("schema = 99").expect_err("unknown schema must fail");
         assert!(err.to_string().contains("schema 99"), "got: {err}");
+    }
+
+    #[test]
+    fn a_windows_path_in_single_quotes_parses() {
+        // A literal TOML string takes backslashes as-is, which is the easy way
+        // to write a Windows path.
+        let config = parse(
+            r#"
+            [general]
+            workspace = 'C:\Users\me\project'
+            "#,
+        )
+        .expect("a literal string should accept backslashes");
+        assert_eq!(config.general.workspace, r"C:\Users\me\project");
+    }
+
+    #[test]
+    fn a_windows_path_in_double_quotes_fails_with_a_hint() {
+        // `\U` reads as the start of a unicode escape, which is why this is the
+        // error people will actually meet.
+        let err = parse(
+            r#"
+            [general]
+            workspace = "C:\Users\me\project"
+            "#,
+        )
+        .expect_err("an unescaped backslash is not valid TOML");
+
+        let message = err.to_string();
+        assert!(message.contains("not valid TOML"), "got: {message}");
+        assert!(
+            message.contains("single quotes"),
+            "the error should say how to fix it: {message}"
+        );
+    }
+
+    #[test]
+    fn a_backslash_before_a_letter_also_gets_the_hint() {
+        // A different wording from the parser, and a different sentence from us.
+        let err = parse(
+            r#"
+            [general]
+            workspace = "C:\mystuff"
+            "#,
+        )
+        .expect_err("an unescaped backslash is not valid TOML");
+        assert!(err.to_string().contains("single quotes"), "got: {err}");
+    }
+
+    #[test]
+    fn a_backslash_that_parses_silently_is_caught_as_a_control_character() {
+        // `\x86` IS a valid escape, so this parses happily into a string holding
+        // a control character. Left alone it surfaces much later as "file not
+        // found", so it is rejected here with an explanation instead.
+        let err = parse(
+            r#"
+            [general]
+            workspace = "C:\x86"
+            "#,
+        )
+        .expect_err("a control character in the workspace must be refused");
+
+        let message = err.to_string();
+        assert!(message.contains("control character"), "got: {message}");
+        assert!(
+            message.contains("single quotes"),
+            "the error should say how to fix it: {message}"
+        );
+    }
+
+    #[test]
+    fn an_unrelated_toml_error_gets_no_path_hint() {
+        // The advice is specific, so it should not appear on a plain syntax slip.
+        let err = parse("[[tier]\nid = ").expect_err("bad toml must fail");
+        assert!(!err.to_string().contains("single quotes"), "got: {err}");
     }
 
     #[test]

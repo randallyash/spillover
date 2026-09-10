@@ -261,6 +261,12 @@ spill: tier "local" is kind = "openai" but has neither a base_url nor a preset;
        set preset = "lmstudio", or give the API root such as http://localhost:1234/v1
 ```
 
+**On Windows**, write paths in single quotes — `workspace = 'C:\Users\me\project'`.
+Inside double quotes a backslash starts an escape sequence, so `"C:\Users"` is not
+valid TOML at all, and `"C:\x86"` quietly parses into something that is not the
+path you meant. spill rejects both cases with that explanation rather than leaving
+you to work it out.
+
 spill also warns at startup about the things that would otherwise fail silently: a
 key variable that is not set, or an agent CLI that is not on `PATH`.
 

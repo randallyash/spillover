@@ -8,6 +8,11 @@ schema = 1
 
 [general]
 # Working directory used by the file tools and by delegated CLI agents.
+#
+# On Windows, write this path in single quotes: workspace = 'C:\Users\me\project'
+# Inside double quotes a backslash starts an escape sequence, so "C:\Users"
+# is not valid TOML — and "C:\x86" parses into something that is not the path
+# you meant. Single quotes take it literally.
 workspace = "~"
 # Once a tier fails, stay on the lower tier for the rest of the session.
 sticky_fallback = true

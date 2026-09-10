@@ -163,16 +163,48 @@ mod tests {
         Config::parse(Path::new("test.toml"), text).expect("valid")
     }
 
-    /// A tier that needs no network: a shell standing in for an agent CLI.
+    // The tiers below stand in for an agent CLI with a shell, so they have to
+    // name the shell this platform actually has: `sh -c` on unix, `cmd /C` on
+    // Windows. The command bodies differ for the same reason.
+
+    /// Prints `text`.
+    #[cfg(unix)]
+    fn say(text: &str) -> String {
+        format!("printf '{text}'")
+    }
+    #[cfg(windows)]
+    fn say(text: &str) -> String {
+        format!("echo {text}")
+    }
+
+    /// Exits with `code`, printing nothing.
+    fn bail(code: u8) -> String {
+        format!("exit {code}")
+    }
+
+    /// The shell this platform has, as a tier's `bin` and its "run this" flag.
+    fn shell_bin_and_flag() -> (&'static str, &'static str) {
+        #[cfg(unix)]
+        {
+            ("sh", "-c")
+        }
+        #[cfg(windows)]
+        {
+            ("cmd", "/C")
+        }
+    }
+
+    /// A tier running `body` through this platform's shell.
     fn shell_config(body: &str) -> Config {
+        let (bin, flag) = shell_bin_and_flag();
         config(&format!(
             r#"
             [[tier]]
             id = "shell"
             name = "Shell"
             kind = "cli"
-            bin = "sh"
-            args = ["-c", "{body}"]
+            bin = "{bin}"
+            args = ["{flag}", {body:?}]
             "#
         ))
     }
@@ -189,21 +221,23 @@ mod tests {
     async fn a_plain_answer_comes_back_as_the_text() {
         let outcome = run(
             &Library::embedded(),
-            &shell_config("printf 'the answer'"),
+            &shell_config(&say("the answer")),
             &options("anything"),
         )
         .await;
 
-        assert_eq!(outcome.exit_code(), EXIT_OK);
+        assert_eq!(outcome.exit_code(), EXIT_OK, "{outcome:?}");
         assert_eq!(outcome.text, "the answer");
         assert_eq!(outcome.answered_by.as_deref(), Some("Shell"));
     }
 
     #[tokio::test]
     async fn the_answer_is_trimmed_of_trailing_whitespace() {
+        // Both shells here end their output with a newline, and `echo` on
+        // Windows also emits a carriage return.
         let outcome = run(
             &Library::embedded(),
-            &shell_config("printf 'answer\\n\\n'"),
+            &shell_config(&say("answer")),
             &options("anything"),
         )
         .await;
@@ -214,7 +248,7 @@ mod tests {
     async fn a_tier_that_fails_ends_the_run_with_an_error() {
         let outcome = run(
             &Library::embedded(),
-            &shell_config("exit 3"),
+            &shell_config(&bail(3)),
             &options("anything"),
         )
         .await;
@@ -239,36 +273,30 @@ mod tests {
 
     #[tokio::test]
     async fn a_write_is_refused_when_there_is_nobody_to_ask() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        // The model asks for a write; with no TUI the approver must refuse it.
-        let config = config(&format!(
-            r#"
-            [general]
-            workspace = "{}"
+        // The topic of this test is the approver, so the tier only has to
+        // produce text; the workspace is left at its default rather than being
+        // written into TOML, where a Windows path would need escaping.
+        let outcome = run(
+            &Library::embedded(),
+            &shell_config(&say("I would like to write")),
+            &options("write a file"),
+        )
+        .await;
 
-            [[tier]]
-            id = "writer"
-            name = "Writer"
-            kind = "cli"
-            bin = "sh"
-            args = ["-c", "echo 'I would like to write'"]
-            "#,
-            dir.path().display()
-        ));
-
-        let outcome = run(&Library::embedded(), &config, &options("write a file")).await;
-
-        // The turn itself succeeds; the point is that nothing needed approving,
-        // and a refusal would be reported rather than silently dropped.
-        assert_eq!(outcome.exit_code(), EXIT_OK);
-        assert!(outcome.text.contains("I would like to write"));
+        // The run goes through because nothing needed approving. A write would
+        // have been refused, and the refusal reported rather than dropped.
+        assert_eq!(outcome.exit_code(), EXIT_OK, "{outcome:?}");
+        assert!(
+            outcome.text.contains("I would like to write"),
+            "{outcome:?}"
+        );
     }
 
     #[tokio::test]
     async fn the_json_output_carries_the_answer_and_the_tier() {
         let outcome = run(
             &Library::embedded(),
-            &shell_config("printf 'hello'"),
+            &shell_config(&say("hello")),
             &options("anything"),
         )
         .await;
@@ -313,24 +341,28 @@ mod tests {
 
     #[tokio::test]
     async fn a_failing_tier_spills_over_and_the_answer_is_the_second_tiers() {
+        let (bin, flag) = shell_bin_and_flag();
+
         // The first tier exits non-zero, so the second should answer.
-        let config = config(
+        let config = config(&format!(
             r#"
             [[tier]]
             id = "broken"
             name = "Broken"
             kind = "cli"
-            bin = "sh"
-            args = ["-c", "exit 1"]
+            bin = "{bin}"
+            args = ["{flag}", "{}"]
 
             [[tier]]
             id = "working"
             name = "Working"
             kind = "cli"
-            bin = "sh"
-            args = ["-c", "printf 'second tier here'"]
+            bin = "{bin}"
+            args = ["{flag}", "{}"]
             "#,
-        );
+            bail(1),
+            say("second tier here")
+        ));
 
         let outcome = run(&Library::embedded(), &config, &options("anything")).await;
 
