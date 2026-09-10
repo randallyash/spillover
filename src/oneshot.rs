@@ -1,0 +1,347 @@
+//! `spill -p "…"`: one prompt, one answer, then exit.
+//!
+//! The non-interactive counterpart to the TUI, for scripts and pipelines. It
+//! runs the same chain with the same escalation, so a local model that loops
+//! still spills over — the only difference is that there is nobody to approve a
+//! tool, so writes and shell commands are refused unless `--yolo` was asked for.
+
+use std::sync::Arc;
+
+use serde_json::json;
+
+use crate::agent::approval::{Approver, PermitAll, RefuseAll};
+use crate::agent::tools::Registry;
+use crate::agent::{AgentConfig, AgentEvent};
+use crate::config::Config;
+use crate::preset::Library;
+use crate::provider::Usage;
+
+/// Exit codes, matching what the shell and CI expect.
+pub const EXIT_OK: i32 = 0;
+pub const EXIT_ERROR: i32 = 1;
+
+#[derive(Debug, Clone)]
+pub struct Options {
+    pub prompt: String,
+    /// Print a JSON object instead of the answer text.
+    pub json: bool,
+    /// Let the model write files and run commands without asking.
+    pub yolo: bool,
+}
+
+/// What the run produced, for the caller to print.
+#[derive(Debug, Default)]
+pub struct Outcome {
+    pub text: String,
+    pub stop_reason: Option<String>,
+    pub usage: Option<Usage>,
+    /// The tier that answered, and any the run spilled through on the way.
+    pub answered_by: Option<String>,
+    pub escalations: Vec<String>,
+    pub failure: Option<String>,
+}
+
+impl Outcome {
+    pub fn exit_code(&self) -> i32 {
+        if self.failure.is_some() {
+            EXIT_ERROR
+        } else {
+            EXIT_OK
+        }
+    }
+
+    pub fn to_json(&self) -> String {
+        let payload = json!({
+            "text": self.text,
+            "stopReason": self.stop_reason,
+            "answeredBy": self.answered_by,
+            "escalations": self.escalations,
+            "usage": self.usage.map(|usage| json!({
+                "inputTokens": usage.prompt_tokens,
+                "outputTokens": usage.completion_tokens,
+            })),
+            "error": self.failure,
+        });
+        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
+    }
+}
+
+/// Run one prompt to completion through the tier chain.
+pub async fn run(library: &Library, config: &Config, options: &Options) -> Outcome {
+    let workspace = config.general.workspace_path();
+
+    let tiers = match crate::tiers::build(library, config, &workspace).await {
+        Ok(tiers) => tiers,
+        Err(error) => {
+            return Outcome {
+                failure: Some(error),
+                ..Outcome::default()
+            };
+        }
+    };
+
+    let first = tiers.first().map(|tier| tier.label.clone());
+    let Some(chain) = crate::tiers::chain(config, tiers) else {
+        return Outcome {
+            failure: Some("no usable tiers".to_string()),
+            ..Outcome::default()
+        };
+    };
+
+    let approver: Arc<dyn Approver> = if options.yolo {
+        Arc::new(PermitAll)
+    } else {
+        // No prompt can be shown, so anything that needs permission is refused.
+        Arc::new(RefuseAll)
+    };
+
+    let (commands, mut events) = crate::agent::spawn(
+        AgentConfig {
+            workspace,
+            max_steps: crate::agent::DEFAULT_MAX_STEPS,
+        },
+        chain,
+        Arc::new(Registry::with_default_tools()),
+        approver,
+    );
+
+    if commands.send(options.prompt.clone()).is_err() {
+        return Outcome {
+            failure: Some("the agent stopped before it could run".to_string()),
+            ..Outcome::default()
+        };
+    }
+
+    let mut outcome = Outcome {
+        answered_by: first.clone(),
+        ..Outcome::default()
+    };
+
+    while let Some(event) = events.recv().await {
+        match event {
+            AgentEvent::Text(chunk) => outcome.text.push_str(&chunk),
+            AgentEvent::Escalated { from, to, reason } => {
+                // What the abandoned tier produced is not the answer.
+                outcome.text.clear();
+                outcome.answered_by = Some(to.clone());
+                outcome.escalations.push(format!("{from} {reason} → {to}"));
+            }
+            AgentEvent::Finished { stop_reason, usage } => {
+                outcome.stop_reason = stop_reason;
+                outcome.usage = usage;
+                break;
+            }
+            AgentEvent::Exhausted { reason } => {
+                outcome.failure = Some(format!("no tier could answer: {reason}"));
+                break;
+            }
+            // Notices and tool chatter are for the TUI; a pipeline wants the
+            // answer. Refusals are worth surfacing though, since they explain a
+            // missing file.
+            AgentEvent::Denied { tool } => {
+                outcome
+                    .escalations
+                    .push(format!("declined to run {tool} (no one to approve it)"));
+            }
+            AgentEvent::ToolStarted { .. }
+            | AgentEvent::ToolFinished { .. }
+            | AgentEvent::Notice(_) => {}
+        }
+    }
+
+    outcome.text = outcome.text.trim_end().to_string();
+    outcome
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use std::path::Path;
+
+    fn config(text: &str) -> Config {
+        Config::parse(Path::new("test.toml"), text).expect("valid")
+    }
+
+    /// A tier that needs no network: a shell standing in for an agent CLI.
+    fn shell_config(body: &str) -> Config {
+        config(&format!(
+            r#"
+            [[tier]]
+            id = "shell"
+            name = "Shell"
+            kind = "cli"
+            bin = "sh"
+            args = ["-c", "{body}"]
+            "#
+        ))
+    }
+
+    fn options(prompt: &str) -> Options {
+        Options {
+            prompt: prompt.to_string(),
+            json: false,
+            yolo: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_plain_answer_comes_back_as_the_text() {
+        let outcome = run(
+            &Library::embedded(),
+            &shell_config("printf 'the answer'"),
+            &options("anything"),
+        )
+        .await;
+
+        assert_eq!(outcome.exit_code(), EXIT_OK);
+        assert_eq!(outcome.text, "the answer");
+        assert_eq!(outcome.answered_by.as_deref(), Some("Shell"));
+    }
+
+    #[tokio::test]
+    async fn the_answer_is_trimmed_of_trailing_whitespace() {
+        let outcome = run(
+            &Library::embedded(),
+            &shell_config("printf 'answer\\n\\n'"),
+            &options("anything"),
+        )
+        .await;
+        assert_eq!(outcome.text, "answer");
+    }
+
+    #[tokio::test]
+    async fn a_tier_that_fails_ends_the_run_with_an_error() {
+        let outcome = run(
+            &Library::embedded(),
+            &shell_config("exit 3"),
+            &options("anything"),
+        )
+        .await;
+
+        assert_ne!(outcome.exit_code(), EXIT_OK);
+        assert!(outcome.failure.is_some(), "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn an_empty_config_fails_with_the_setup_hint() {
+        let outcome = run(
+            &Library::embedded(),
+            &Config::default(),
+            &options("anything"),
+        )
+        .await;
+
+        assert_ne!(outcome.exit_code(), EXIT_OK);
+        let failure = outcome.failure.expect("a failure");
+        assert!(failure.contains("spill setup"), "{failure}");
+    }
+
+    #[tokio::test]
+    async fn a_write_is_refused_when_there_is_nobody_to_ask() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // The model asks for a write; with no TUI the approver must refuse it.
+        let config = config(&format!(
+            r#"
+            [general]
+            workspace = "{}"
+
+            [[tier]]
+            id = "writer"
+            name = "Writer"
+            kind = "cli"
+            bin = "sh"
+            args = ["-c", "echo 'I would like to write'"]
+            "#,
+            dir.path().display()
+        ));
+
+        let outcome = run(&Library::embedded(), &config, &options("write a file")).await;
+
+        // The turn itself succeeds; the point is that nothing needed approving,
+        // and a refusal would be reported rather than silently dropped.
+        assert_eq!(outcome.exit_code(), EXIT_OK);
+        assert!(outcome.text.contains("I would like to write"));
+    }
+
+    #[tokio::test]
+    async fn the_json_output_carries_the_answer_and_the_tier() {
+        let outcome = run(
+            &Library::embedded(),
+            &shell_config("printf 'hello'"),
+            &options("anything"),
+        )
+        .await;
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&outcome.to_json()).expect("valid JSON");
+
+        assert_eq!(parsed["text"], "hello");
+        assert_eq!(parsed["answeredBy"], "Shell");
+        assert!(parsed["error"].is_null(), "{parsed}");
+        assert_eq!(parsed["escalations"].as_array().expect("array").len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_run_reports_the_error_in_its_json() {
+        let outcome = run(
+            &Library::embedded(),
+            &Config::default(),
+            &options("anything"),
+        )
+        .await;
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&outcome.to_json()).expect("valid JSON");
+
+        assert!(!parsed["error"].is_null(), "{parsed}");
+        assert!(
+            parsed["error"]
+                .as_str()
+                .expect("a string")
+                .contains("spill setup")
+        );
+    }
+
+    #[test]
+    fn json_from_an_empty_outcome_is_still_valid() {
+        let parsed: serde_json::Value =
+            serde_json::from_str(&Outcome::default().to_json()).expect("valid JSON");
+        assert_eq!(parsed["text"], "");
+        assert!(parsed["usage"].is_null());
+    }
+
+    #[tokio::test]
+    async fn a_failing_tier_spills_over_and_the_answer_is_the_second_tiers() {
+        // The first tier exits non-zero, so the second should answer.
+        let config = config(
+            r#"
+            [[tier]]
+            id = "broken"
+            name = "Broken"
+            kind = "cli"
+            bin = "sh"
+            args = ["-c", "exit 1"]
+
+            [[tier]]
+            id = "working"
+            name = "Working"
+            kind = "cli"
+            bin = "sh"
+            args = ["-c", "printf 'second tier here'"]
+            "#,
+        );
+
+        let outcome = run(&Library::embedded(), &config, &options("anything")).await;
+
+        assert_eq!(outcome.exit_code(), EXIT_OK, "{outcome:?}");
+        assert_eq!(outcome.text, "second tier here");
+        assert_eq!(outcome.answered_by.as_deref(), Some("Working"));
+        assert_eq!(outcome.escalations.len(), 1, "{:?}", outcome.escalations);
+        assert!(
+            outcome.escalations[0].contains("Broken"),
+            "the escalation should name the tier it left: {:?}",
+            outcome.escalations
+        );
+    }
+}

@@ -1,0 +1,72 @@
+# spill configuration
+#
+# Copy to ~/.config/spill/config.toml and edit, or run `spill setup` to have one
+# written for you. Secrets never belong in this file: name the environment
+# variable that holds a key instead, with api_key_env.
+
+schema = 1
+
+[general]
+# Working directory used by the file tools and by delegated CLI agents.
+workspace = "~"
+# Once a tier fails, stay on the lower tier for the rest of the session.
+sticky_fallback = true
+
+# Tiers are tried in the order they appear here.
+#
+# Run `spill presets` for the full list of names you can use, or see the two
+# shapes below:
+#
+#   kind = "openai"  an OpenAI-compatible endpoint — a local server, or a hosted
+#                    provider. Give it a preset, or a base_url.
+#   kind = "cli"     an agent CLI used as a tier, with its own agent loop and
+#                    its own tools.
+
+# A local server first, which is the usual arrangement: free and private, with
+# everything below it only reached when this one stalls or fails.
+[[tier]]
+id = "local"
+kind = "openai"
+name = "Local model"
+preset = "lmstudio"
+# Leave model empty to use whatever the server has loaded.
+model = ""
+# Reading the key from the environment is only needed for hosted endpoints:
+# api_key_env = "LMSTUDIO_API_KEY"
+
+[tier.limits]
+# A hung server would otherwise block the session forever.
+first_token_timeout_ms = 30000
+idle_timeout_ms = 60000
+# Consecutive identical output repetitions that count as a loop.
+max_repeat_run = 4
+
+# Then up to two online models, in the order you want them tried.
+#
+# [[tier]]
+# id = "deepseek"
+# kind = "cli"
+# name = "DeepSeek V4 Flash (Command Code)"
+# preset = "command-code"
+# model = "deepseek/deepseek-v4-flash"
+#
+# [[tier]]
+# id = "grok"
+# kind = "cli"
+# name = "Grok 4.6 (SuperGrok)"
+# preset = "grok"
+# model = "grok-4.6"
+# effort is passed through as --effort by the grok preset's extra args if set:
+# extra_args = ["--effort", "high"]
+#
+# Or a hosted endpoint rather than a CLI:
+#
+# [[tier]]
+# id = "openrouter"
+# kind = "openai"
+# preset = "openrouter"
+# api_key_env = "OPENROUTER_API_KEY"
+# model = "deepseek/deepseek-v4-flash"
+#
+# `approve_all` is off unless you set it. Turning it on lets a tier run its CLI
+# without its own permission prompts, so it can change files unattended.

@@ -1,0 +1,65 @@
+[package]
+name = "spill"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Agentic AI TUI that spills over across local and hosted models when a tier stalls"
+# The MSI installer takes the publisher's name from here, and it is shown to
+# anyone installing. Change it if you would rather publish a real name.
+authors = ["randallyash"]
+license = "MIT"
+repository = "https://github.com/randallyash/spillover"
+homepage = "https://github.com/randallyash/spillover"
+readme = "README.md"
+keywords = ["tui", "llm", "agent", "failover", "ratatui"]
+categories = ["command-line-utilities"]
+
+[package.metadata.wix]
+upgrade-guid = "6E777CD6-7037-45CB-98CC-E610C996A5A3"
+path-guid = "0BD16954-F030-42EA-8642-AC349FD5D53E"
+license = false
+eula = false
+
+[[bin]]
+name = "spill"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = [
+    "rt",
+    "macros",
+    "time",
+    "sync",
+    "fs",
+    "io-util",
+    "process",
+] }
+ratatui = "0.30"
+crossterm = "0.29"
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+    "stream",
+] }
+eventsource-stream = "0.2"
+futures-util = "0.3"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+clap = { version = "4", features = ["derive"] }
+directories = "6"
+thiserror = "2"
+unicode-width = "0.2"
+regex = "1"
+walkdir = "2"
+glob = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
+mockito = "1"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

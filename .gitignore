@@ -1,0 +1,11 @@
+# Rust build output
+/target
+
+# Local configuration and secrets must never be committed
+config.toml
+*.local.toml
+.env
+
+# Editor and OS noise
+*.swp
+.DS_Store

@@ -1,0 +1,59 @@
+# Maintainer: randallyash
+#
+# Installs the released binary rather than building from source, so the package
+# tracks what upstream actually published.
+#
+# The release artifacts are produced by cargo-dist. Before pushing, refresh the
+# checksums, which cannot be known until the release exists:
+#
+#   updpkgsums
+#
+# and confirm the version and the URLs match the tag you are packaging.
+
+pkgname=spill-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Agentic AI TUI that runs your local model first and spills over when it stalls"
+arch=('x86_64' 'aarch64')
+url="https://github.com/randallyash/spillover"
+license=('MIT')
+depends=('glibc' 'gcc-libs')
+provides=('spill')
+conflicts=('spill', 'spill-bin-git')
+options=('!strip')
+
+_base="https://github.com/randallyash/spillover/releases/download/v${pkgver}"
+source_x86_64=("spill-${pkgver}-x86_64.tar.xz::${_base}/spill-x86_64-unknown-linux-gnu.tar.xz")
+source_aarch64=("spill-${pkgver}-aarch64.tar.xz::${_base}/spill-aarch64-unknown-linux-gnu.tar.xz")
+
+# Filled in with `updpkgsums` against the published release.
+sha256sums_x86_64=('SKIP')
+sha256sums_aarch64=('SKIP')
+
+package() {
+  # The archive holds the binary and its documentation, at the top level.
+  local root
+  root="$(find "$srcdir" -maxdepth 2 -type f -name spill -printf '%h\n' | head -n 1)"
+  [[ -n "$root" ]] || root="$srcdir"
+
+  install -Dm755 "$root/spill" "$pkgdir/usr/bin/spill"
+
+  local licence
+  licence="$(find "$srcdir" -maxdepth 2 -type f -name LICENSE | head -n 1)"
+  if [[ -n "$licence" ]]; then
+    install -Dm644 "$licence" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  fi
+
+  local readme
+  readme="$(find "$srcdir" -maxdepth 2 -type f -name README.md | head -n 1)"
+  if [[ -n "$readme" ]]; then
+    install -Dm644 "$readme" "$pkgdir/usr/share/doc/$pkgname/README.md"
+  fi
+
+  # Configuration examples, for people who would rather read than run setup.
+  local example
+  example="$(find "$srcdir" -maxdepth 2 -type f -name 'config.example.toml' | head -n 1)"
+  if [[ -n "$example" ]]; then
+    install -Dm644 "$example" "$pkgdir/usr/share/doc/$pkgname/config.example.toml"
+  fi
+}

@@ -1,0 +1,156 @@
+# The preset library, compiled into the binary.
+#
+# Every entry here has had its invocation shape checked against the tool's own
+# documentation or `--help` output on a machine where it was installed. Where a
+# flag's position could not be verified, it is left out rather than guessed at:
+# a preset that produces a wrong command line is worse than no preset.
+#
+# `{prompt}`, `{model}` and `{workspace}` are substituted as whole arguments,
+# never through a shell.
+#
+# Override or extend any of this in ~/.config/spill/presets.toml.
+
+# ---------------------------------------------------------------- local ----
+# Servers people run themselves. No key, and the default ports these ship with.
+
+[[local]]
+id = "lmstudio"
+name = "LM Studio"
+base_url = "http://localhost:1234/v1"
+note = "Turn on \"Serve on Local Network\" in LM Studio if it runs on another machine."
+
+[[local]]
+id = "ollama"
+name = "Ollama"
+base_url = "http://localhost:11434/v1"
+
+[[local]]
+id = "llamacpp"
+name = "llama.cpp"
+base_url = "http://localhost:8080/v1"
+
+[[local]]
+id = "vllm"
+name = "vLLM"
+base_url = "http://localhost:8000/v1"
+
+# --------------------------------------------------------------- online ----
+# Hosted endpoints that speak the OpenAI shape. Keys are never stored by spill:
+# name the environment variable that holds the key.
+
+[[online]]
+id = "openrouter"
+name = "OpenRouter"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+
+[[online]]
+id = "xai"
+name = "xAI"
+base_url = "https://api.x.ai/v1"
+api_key_env = "XAI_API_KEY"
+
+[[online]]
+id = "vercel"
+name = "Vercel AI Gateway"
+base_url = "https://ai-gateway.vercel.sh/v1"
+api_key_env = "AI_GATEWAY_API_KEY"
+
+[[online]]
+id = "huggingface"
+name = "Hugging Face"
+base_url = "https://router.huggingface.co/v1"
+api_key_env = "HF_TOKEN"
+
+# ------------------------------------------------------------------ cli ----
+# Agent CLIs used as a tier. These run their own agent loop and their own tools,
+# so spill hands them the conversation and streams back what they produce.
+#
+# `dialect` says how to read their output. `plain` is the default print mode of
+# most of these, and is what makes an unlisted CLI still usable.
+
+[[cli]]
+id = "command-code"
+name = "Command Code"
+bin = "cmd"
+dialect = "command-code"
+args = ["-p", "{prompt}"]
+model_args = ["-m", "{model}"]
+extra_args = ["--output-format", "json"]
+approve_args = ["--yolo"]
+models = ["deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro"]
+note = "Uses your Command Code plan. --yolo lets it edit files unattended."
+
+[[cli]]
+id = "grok"
+name = "Grok Build"
+bin = "grok"
+dialect = "grok"
+args = ["-p", "{prompt}"]
+model_args = ["-m", "{model}"]
+extra_args = ["--output-format", "streaming-json"]
+approve_args = ["--always-approve"]
+workdir_args = ["--cwd", "{workspace}"]
+models = ["grok-4.6", "grok-4.5"]
+note = "Uses your SuperGrok login from ~/.grok."
+
+[[cli]]
+id = "claude"
+name = "Claude Code"
+bin = "claude"
+dialect = "plain"
+args = ["-p", "{prompt}"]
+model_args = ["--model", "{model}"]
+approve_args = ["--dangerously-skip-permissions"]
+
+[[cli]]
+id = "gemini"
+name = "Gemini CLI"
+bin = "gemini"
+dialect = "plain"
+args = ["-p", "{prompt}"]
+model_args = ["-m", "{model}"]
+
+[[cli]]
+id = "copilot"
+name = "GitHub Copilot"
+bin = "copilot"
+dialect = "plain"
+args = ["-p", "{prompt}"]
+model_args = ["--model", "{model}"]
+approve_args = ["--allow-all-tools"]
+
+[[cli]]
+id = "cursor-agent"
+name = "Cursor Agent"
+bin = "cursor-agent"
+dialect = "plain"
+args = ["-p", "{prompt}"]
+model_args = ["--model", "{model}"]
+approve_args = ["--yolo"]
+
+# Subcommand-style CLIs. Neither the model flag's position nor where an
+# unattended flag belongs relative to the subcommand could be verified, so
+# neither is shipped: the CLI keeps its own default model and its own
+# permissions, which is the safe way round. Both can be added in config.
+
+[[cli]]
+id = "codex"
+name = "Codex"
+bin = "codex"
+dialect = "plain"
+args = ["exec", "{prompt}"]
+
+[[cli]]
+id = "opencode"
+name = "opencode"
+bin = "opencode"
+dialect = "plain"
+args = ["run", "{prompt}"]
+
+[[cli]]
+id = "crush"
+name = "Crush"
+bin = "crush"
+dialect = "plain"
+args = ["run", "{prompt}"]
