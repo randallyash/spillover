@@ -100,5 +100,8 @@ First release. Everything below is new.
 - The test suite runs on Linux, macOS and Windows, and the platform-specific
   parts of it use the shell and separators of whichever platform is running
   rather than assuming a POSIX one.
+- Homebrew: the formula is published to the
+  [`randallyash/spillover`](https://github.com/randallyash/homebrew-spillover)
+  tap, so `brew install randallyash/spillover/spill` works.
 
 [0.1.0]: https://github.com/randallyash/spillover/releases/tag/v0.1.0

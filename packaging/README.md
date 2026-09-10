@@ -66,9 +66,9 @@ The formula is published to
 [randallyash/homebrew-spillover](https://github.com/randallyash/homebrew-spillover),
 which is what makes `brew install randallyash/spillover/spill` work.
 
-The tap repository exists, with a `main` branch and a README. **One thing is
-needed before the Homebrew job will pass**, or it fails at the publish step
-because the job cannot push to the tap:
+The tap is set up and working: v0.1.0's formula is published, with checksums that
+match the release archives. The steps below are what it took, kept for renewal
+when the token expires.
 
 1. Create a fine-grained personal access token at
    <https://github.com/settings/personal-access-tokens/new>:

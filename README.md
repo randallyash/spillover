@@ -48,6 +48,12 @@ curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/randallyash/spillover/releases/latest/download/spill-installer.sh | sh
 ```
 
+**macOS, with Homebrew:**
+
+```sh
+brew install randallyash/spillover/spill
+```
+
 **Windows, with the installer:**
 
 ```powershell
@@ -68,8 +74,8 @@ cargo install --git https://github.com/randallyash/spillover
 | Installer script (macOS, Linux) | works |
 | Installer script (Windows), `.msi` | published |
 | `cargo install --git` | works |
+| Homebrew | `brew install randallyash/spillover/spill` |
 | Prebuilt archives, five platforms | on the [releases page](https://github.com/randallyash/spillover/releases) |
-| Homebrew | formula is published with each release, but not yet pushed to a tap, so `brew install` does not work |
 | Arch (AUR) | `PKGBUILD` is in [`packaging/arch`](packaging/arch) with verified checksums, not yet submitted to the AUR |
 
 Everything is signed off with `sha256.sum` on each release.
@@ -296,8 +302,6 @@ setup wizard, zero-config first run, `doctor`, and `-p`.
 
 Not yet:
 
-- **Homebrew** needs a tap token before the formula can be published, so
-  `brew install` is not available yet. The formula itself ships with each release.
 - **The AUR package** is written but not submitted, so `yay -S spill-bin` does not
   work yet.
 - Windows `winget` and `scoop` manifests.
