@@ -12,6 +12,12 @@ pub mod chat;
 pub mod input;
 pub mod markdown;
 pub mod menu;
+/// Frame inspection, for making the pictures in the README.
+///
+/// Test-only on purpose: it is a build tool rather than a feature, so there is
+/// no reason for a released binary to carry it.
+#[cfg(test)]
+pub mod screenshot;
 pub mod sidebar;
 pub mod status;
 pub mod theme;

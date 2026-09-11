@@ -61,6 +61,20 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- The README leads with what spill is actually for — local until it isn't — and
+  carries four pictures of the real interface. They are not drawings: a test walks
+  the buffer `draw` produced, records each cell's symbol and styling as JSON, and a
+  small renderer turns that into PNG. So a screenshot cannot drift from the
+  program, because the program is what produced it.
+
+  The renderer maps the theme's *named* colours onto a terminal palette — which is
+  how spill works, since it asks for "yellow" and the terminal decides what that
+  looks like — and needed one per-glyph font fallback. Caskaydia Mono has no shape
+  for U+2717, the cross that marks a spilled-past tier, so it was drawn as an empty
+  box in the one picture that exists to show a spill. Comparing against a
+  known-unassigned codepoint is what found it; the bounding-box test tried first
+  called the box "present" and would have shipped it.
+
 - **Consulting a tier instead of handing the turn over.** Escalating changes which
   model you are using for the rest of the session, and makes the bigger one pay for
   the whole conversation again. `on_stuck = "consult"` on a tier keeps that tier

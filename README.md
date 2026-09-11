@@ -4,33 +4,62 @@
 [![Release](https://img.shields.io/github/v/release/randallyash/spillover)](https://github.com/randallyash/spillover/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Run your prompt on a local model first. When that model stalls, repeats itself, or
-gets stuck in a loop, spill abandons it and re-runs the same turn on the next model
-you listed — automatically, without you retyping anything.
+**Local until it isn't.**
+
+An agentic coding assistant for the terminal that runs on your own machine first, for
+free and in private, and reaches for a hosted model only when your local one actually
+misbehaves. No retyping, no cancelling, no watching it loop.
+
+![spill: a local model stalls, and the turn moves on](assets/hero.png)
+
+Your prompt goes to the local model. When that model repeats itself, stops making
+progress, goes quiet, or fails outright, spill abandons it and re-runs the same turn on
+the next model in your list. The abandoned answer is thrown away rather than inherited,
+so the model that takes over starts from your question and not from someone else's
+half-finished loop. You keep using the free model and the paid one stays where it
+belongs: unspent, until the moment it is needed.
 
 ```
-tier 1  local model       free, private, no API key — tried first
+tier 1  local model       free, private, no API key — tried first, every turn
 tier 2  first fallback    reached only when tier 1 misbehaves
 tier 3  last resort
 ```
 
 ## Why this is useful
 
-Local models are free, private, and good enough for a lot of work, but they
-occasionally hang or degenerate into repeating themselves. Most tools leave you to
-notice that, cancel, and start over somewhere else. spill treats it as expected:
+Local models are free, private, and good enough for a lot of work, but they occasionally
+hang or degenerate into repeating themselves. Most tools leave you to notice that,
+cancel, and start over somewhere else. spill treats it as expected:
 
-- **You keep using the free local model.** It is tier 1, so that is where your
-  prompts go by default. The paid models below it are only reached when the local
-  one actually fails.
-- **A stuck model costs you nothing.** No watching for a loop, no cancel-and-retype.
-  The turn is re-issued on the next tier by itself.
+- **You keep using the free local model.** It is tier 1, so that is where your prompts
+  go by default — and it is where they keep going, turn after turn, as long as it
+  behaves. The paid models below it are reached only when the local one actually fails.
+- **A stuck model costs you nothing.** No watching for a loop, no cancel-and-retype. The
+  turn is re-issued on the next tier by itself, in the same conversation, with the
+  reason written into the transcript.
 - **One interface, any model.** Tiers are generic: any OpenAI-compatible endpoint
   (LM Studio, Ollama, llama.cpp, vLLM, OpenRouter, xAI) or any agent CLI you already
   have installed and logged in (`cmd`, `grok`, `claude`, `codex`, `gemini`, and
   others). An existing CLI subscription works as a fallback with no separate API key.
-- **It is an agent, not just a chat window.** It reads, searches, edits files and
-  runs commands, and asks before anything that writes.
+- **It is an agent, not just a chat window.** It reads, searches, edits files and runs
+  commands, asks before anything that writes, and renders the answer as markdown
+  instead of showing you its asterisks.
+
+## What is underneath
+
+The fallback is the headline, but it is not the only thing here. These are the parts
+worth knowing about once the basics make sense.
+
+| | |
+| --- | --- |
+| **Consult a tier instead of handing over** | Escalating changes which model you use for the rest of the session. `on_stuck = "consult"` keeps the cheap model driving and spends the big one on one narrow question, built from the raw tool error rather than from the stuck model's own account of the problem. See [Consulting instead of handing over](#consulting-instead-of-handing-over). |
+| **Plan mode** | `Shift+Tab` makes a turn read-only. Not asked for in a prompt — the write tools are withheld from the model, and a call for one is refused before it reaches your disk. See [Modes](#modes). |
+| **Commands** | `/tier`, `/escalate`, `/retry`, `/drop`, `/sticky`, `/cost`, `/context`, `/compact`, `/clear`. Type `/` and they appear, with a description beside each. |
+| **Cost you can see** | Tokens *and* cache reads, attributed per tier, with a sparkline of per-turn spend. A cross-tier fallback is a cache miss no design can avoid; this is where you find out what it cost. |
+| **Session continuity** | A CLI tier keeps its own conversation across turns and receives only the new message, instead of the whole transcript being flattened into every prompt. |
+| **Stopping a turn** | `Esc` stops it where it stands — including a tool mid-flight, so a build is killed rather than waited out — without changing which model you chose. |
+| **Compaction** | Earlier turns fold into a short ledger when a tier is abandoned, so the incoming model's cold read is small. The ledger keeps what the tools *did*, because a discarded conversation does not undo a written file. |
+| **Bracketed paste, scrolling diffs** | A multi-line paste arrives intact. A diff too long for the approval box scrolls, with its position shown, so you are never asked to approve something you cannot read. |
 
 ## Requirements
 
@@ -394,6 +423,8 @@ try another way rather than repeating itself. When the preview is longer than th
 `↑`/`↓` and `PageUp`/`PageDown` read the rest of it, with the position shown in the
 title, so you are never asked to approve a change you cannot see.
 
+![the approval prompt, reading a diff too long for one screen](assets/approval.png)
+
 Pasting is bracketed, so a multi-line paste arrives as one block with its line breaks
 intact rather than as a stream of keystrokes.
 
@@ -414,9 +445,13 @@ to the model at all, and if one is named anyway — a hallucinated tool, or a ha
 over from build mode — the call is refused before it reaches the disk. The model is told
 why, so it can get on with the plan rather than retrying.
 
+![spill in plan mode: the prompt box says so, and the answer is a plan](assets/plan.png)
+
 ## Commands
 
 Type `/` to open the menu of everything below. `?` shows them alongside every key.
+
+![the command menu, opening as you type a slash](assets/commands.png)
 
 The ones worth knowing are the ones about the chain, because they are what a
 single-model agent cannot offer:
@@ -457,8 +492,10 @@ part of spilling over, so the next tier starts from something small.
 
 Working today: configuration and validation, the terminal UI, OpenAI-compatible
 streaming with model auto-discovery, the agent loop with seven tools and approval,
-stuck detection and tier escalation, delegated CLI tiers, the preset library, the
-setup wizard, zero-config first run, `doctor`, and `-p`.
+stuck detection and tier escalation, consulting a tier instead of escalating,
+build and plan modes, slash commands, session continuity for CLI tiers, cost
+reporting per tier, delegated CLI tiers, the preset library, the setup wizard,
+zero-config first run, `doctor`, and `-p`.
 
 Not yet:
 
@@ -467,6 +504,9 @@ Not yet:
 - Windows `winget` and `scoop` manifests.
 - `spill setup` offers hosted endpoints but does not yet validate a model id that was
   typed by hand rather than picked from the list.
+- The Grok tier is written and its session flags are verified, but it could not be
+  exercised end to end here: every `grok` call on this machine answers
+  `402 Payment Required — usage balance exhausted`.
 
 ## License
 
