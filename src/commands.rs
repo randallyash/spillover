@@ -41,6 +41,16 @@ pub const CATALOGUE: &[Spec] = &[
         summary: "Spill to the next tier now, without waiting for it to stall",
     },
     Spec {
+        name: "consult",
+        arg: Arg::None,
+        summary: "Ask the tier below one question, and keep driving",
+    },
+    Spec {
+        name: "on-stuck",
+        arg: Arg::Required("<escalate|consult>"),
+        summary: "What a stuck tier does for the rest of the session",
+    },
+    Spec {
         name: "retry",
         arg: Arg::Optional("<name|number>"),
         summary: "Send the last turn again, here or on another tier",
@@ -202,6 +212,19 @@ pub fn usage(spec: &Spec) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_on_stuck_parses() {
+        let parsed = parse("/on-stuck consult");
+        println!("PARSED: {parsed:?}");
+        assert_eq!(
+            parsed,
+            Input::Command {
+                name: "on-stuck".into(),
+                argument: "consult".into()
+            }
+        );
+    }
 
     #[test]
     fn every_command_has_a_unique_name_and_a_summary() {

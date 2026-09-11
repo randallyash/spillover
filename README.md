@@ -52,9 +52,9 @@ worth knowing about once the basics make sense.
 
 | | |
 | --- | --- |
-| **Consult a tier instead of handing over** | Escalating changes which model you use for the rest of the session. `on_stuck = "consult"` keeps the cheap model driving and spends the big one on one narrow question, built from the raw tool error rather than from the stuck model's own account of the problem. See [Consulting instead of handing over](#consulting-instead-of-handing-over). |
+| **Consult a tier instead of handing over** | Escalating changes which model you use for the rest of the session. `on_stuck = "consult"` keeps the cheap model driving and spends the big one on one narrow question, built from the raw tool error rather than from the stuck model's own account of the problem — and `/on-stuck consult` turns it on for the session without editing a file. See [Consulting instead of handing over](#consulting-instead-of-handing-over). |
 | **Plan mode** | `Shift+Tab` makes a turn read-only. Not asked for in a prompt — the write tools are withheld from the model, and a call for one is refused before it reaches your disk. See [Modes](#modes). |
-| **Commands** | `/tier`, `/escalate`, `/retry`, `/drop`, `/sticky`, `/cost`, `/context`, `/compact`, `/clear`. Type `/` and they appear, with a description beside each. |
+| **Commands** | `/tier`, `/escalate`, `/consult`, `/on-stuck`, `/retry`, `/drop`, `/sticky`, `/cost`, `/context`, `/compact`, `/clear`. Type `/` and they appear, with a description beside each. |
 | **Cost you can see** | Tokens *and* cache reads, attributed per tier, with a sparkline of per-turn spend. A cross-tier fallback is a cache miss no design can avoid; this is where you find out what it cost. Counted per **request**, which is what a turn is made of — one per tool call, plus any spill or consult — so a turn that read four files is billed as five requests and reported as five. Cost is counted as the tier reports it rather than only off a finished response, so a tier that *failed* — stalled, looped, or stopped by you — still shows what it spent. |
 | **Session continuity** | A CLI tier keeps its own conversation across turns and receives only the new message, instead of the whole transcript being flattened into every prompt. |
 | **Stopping a turn** | `Esc` stops it where it stands — including a tool mid-flight, so a build is killed rather than waited out — without changing which model you chose. |
@@ -255,6 +255,9 @@ one is abandoned, and the expensive one pays for the whole conversation again. A
 **consult** is the alternative — keep the cheap model driving, and spend the bigger
 one on one narrow question.
 
+The default is `escalate`, and it stays the default: consulting is newer, and the
+tiers where it pays off are the ones you would want to be sure of first.
+
 ```toml
 [[tier]]
 id = "local"
@@ -263,6 +266,19 @@ preset = "lmstudio"
 on_stuck = "consult"      # default is "escalate"
 consults_per_turn = 2     # the default
 ```
+
+You do not have to decide in a file, though. `/on-stuck consult` switches every tier
+for the rest of the session and `/on-stuck escalate` puts it back, and `/consult` asks
+for **one** consult on the next stall without changing anything — which is the way to
+find out whether it helps before committing to it. The session panel says which policy
+is live, and marks a policy you chose rather than one from your configuration:
+
+```
+fallback   sticky
+on stuck * consult
+```
+
+The `*` means the session chose it. Restarting returns to whatever the config says.
 
 When that tier gets stuck, the next tier in the chain is asked a question built from
 evidence spill already holds: your own words, the reason the tier was judged stuck, and
@@ -402,9 +418,9 @@ running, `✓` when it worked, `✗` when it did not, `!` for something worth no
 the color agrees with the glyph rather than replacing it.
 
 On a terminal 104 columns or wider, a panel on the right shows the chain as a row per tier
-with its state, the working directory, the session's token and cache totals, and a
-sparkline of per-turn spend, which is the only place the real cost of a fallback is
-visible. On a narrower terminal the conversation takes that space and the active tier
+with its state, the fallback policy and the stuck policy in force, the working directory,
+the session's token and cache totals, and a sparkline of per-turn spend, which is the only
+place the real cost of a fallback is visible. On a narrower terminal the conversation takes that space and the active tier
 moves down to the footer instead.
 
 The prompt leads with `❯`, so the line you type on reads as a command line rather than as
@@ -466,6 +482,8 @@ single-model agent cannot offer:
 | `/tier <name\|number>` | Answer from that tier until told otherwise |
 | `/tier auto` | Go back to the configured order |
 | `/escalate` | Spill to the next tier now, without waiting for a stall |
+| `/consult` | Ask the tier below one question about the next stall, and keep driving |
+| `/on-stuck <escalate\|consult>` | What a stuck tier does for the rest of the session |
 | `/retry [tier]` | Send the last turn again, here or somewhere else |
 | `/drop` | Discard the active tier's own conversation and start it fresh |
 | `/sticky <on\|off>` | Whether a spill keeps the lower tier for the session |

@@ -13,6 +13,7 @@ use tokio::sync::watch;
 
 use crate::agent::approval::{Approver, Decision};
 use crate::agent::tools::{Registry, Risk, ToolOutcome};
+use crate::config::OnStuck;
 use crate::detect::progress::ProgressDetector;
 use crate::detect::{StuckReason, Watchdog};
 use crate::fallback::{FallbackChain, Tier};
@@ -159,6 +160,14 @@ pub enum Command {
     SetMode(Mode),
     /// Move to the next tier now, and stay there.
     Escalate,
+    /// Ask the next tier about the next stall, and keep the driver.
+    ///
+    /// A one-shot rather than a mode: "try a consult here" is a different
+    /// intention from "consult from now on", and the second one has a command of
+    /// its own.
+    Consult,
+    /// Choose the stuck policy for the rest of the session.
+    SetOnStuck(OnStuck),
     /// Send the last turn again, optionally on a named tier.
     Retry { tier: Option<String> },
     /// Forget the active tier's own conversation.
@@ -365,6 +374,60 @@ async fn handle_command(
             }
         }
 
+        Command::Consult => {
+            // Refused now rather than at the stall: a request that could never
+            // be honoured is worth saying so about while the user is looking.
+            if !state.chain.can_consult() {
+                let _ = events.send(AgentEvent::Notice(format!(
+                    "{} is the last tier, so there is nobody to consult — /escalate hands it \
+                     over instead",
+                    short(&state.chain.active().label)
+                )));
+            } else {
+                state.chain.consult_next_stall();
+                let consultant = state
+                    .chain
+                    .consultant()
+                    .map(|tier| short(&tier.label).to_string())
+                    .unwrap_or_default();
+                let driver = short(&state.chain.active().label).to_string();
+                let _ = events.send(AgentEvent::Notice(format!(
+                    "the next stall goes to {consultant} as one question, and {driver} keeps \
+                     the turn — once"
+                )));
+            }
+        }
+
+        Command::SetOnStuck(policy) => {
+            state.chain.set_on_stuck(policy);
+            let _ = events.send(AgentEvent::Notice(match policy {
+                OnStuck::Consult => {
+                    let consultant = state
+                        .chain
+                        .consultant()
+                        .map(|tier| short(&tier.label).to_string())
+                        .unwrap_or_default();
+                    if state.chain.can_consult() {
+                        format!(
+                            "from now on a stuck tier asks {consultant} one question and keeps \
+                             the turn, rather than handing it over — /on-stuck escalate to go back"
+                        )
+                    } else {
+                        // The policy is set, but this chain is one tier deep, so
+                        // it can never take effect. Saying so beats a setting
+                        // that silently does nothing.
+                        "consult needs a tier below to ask, and this chain has one tier, so it \
+                         cannot take effect"
+                            .to_string()
+                    }
+                }
+                OnStuck::Escalate => {
+                    "from now on a stuck tier hands the turn to the next one, as configured"
+                        .to_string()
+                }
+            }));
+        }
+
         Command::Retry { tier } => {
             let Some(last) = state.last.clone() else {
                 let _ = events.send(AgentEvent::Notice(
@@ -537,6 +600,14 @@ fn describe_context(session: &Session, chain: &FallbackChain) -> String {
     out
 }
 
+/// A tier's name without its address, for anything a person reads.
+///
+/// The address belongs in the session panel; repeating it in every notice is how
+/// a one-line message turns into three wrapped ones.
+fn short(label: &str) -> &str {
+    crate::fallback::tier_name(label)
+}
+
 /// What one tier made of a turn, and what finding out cost.
 ///
 /// The usage is carried out of the attempt rather than reported from inside it,
@@ -629,10 +700,18 @@ async fn run_turn(
             Attempt::Stuck(reason, _) => {
                 let from = label;
                 // Read out of the driver before it can be borrowed mutably below.
-                let (wants_consult, cap) = {
-                    let tier = chain.active();
-                    (tier.consults_when_stuck(), tier.consults_per_turn)
-                };
+                // Taken rather than read, so a one-shot request applies to one
+                // stall and cannot quietly become the policy.
+                let asked_for = chain.take_consult_request();
+                let cap = chain.active().consults_per_turn;
+                let wants_consult = asked_for || chain.consults_when_stuck();
+                if asked_for && !chain.can_consult() {
+                    let _ = events.send(AgentEvent::Notice(
+                        "this is the last tier, so there is nobody to consult — handing the turn \
+                         over instead"
+                            .to_string(),
+                    ));
+                }
 
                 // A consult keeps the driver in charge, so it is tried before
                 // handing the turn over. It is only tried when it can succeed:
@@ -1276,7 +1355,7 @@ mod tests {
     use super::*;
     use crate::agent::approval::testing::{AlwaysApprove, AlwaysDeny};
     use crate::agent::tools::Registry;
-    use crate::config::{Limits, OnStuck};
+    use crate::config::Limits;
     use crate::provider::{ProviderError, TurnSummary};
     use async_trait::async_trait;
     use std::collections::VecDeque;
@@ -2456,6 +2535,229 @@ mod tests {
             said.contains("dropped"),
             "it should say the sessions went too: {said}"
         );
+    }
+
+    #[tokio::test]
+    async fn consult_asks_once_and_leaves_the_policy_alone() {
+        // The whole point of a one-shot: trying consult must not silently turn
+        // it on for the rest of the session, which is what `/on-stuck` is for.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (chain, driver, consultant) = consultable(2);
+        let (tx, mut rx) = loop_over(dir.path(), chain);
+
+        tx.send(Command::Consult).expect("send");
+        let events = collect(&mut rx).await;
+        assert!(
+            notices(&events)
+                .iter()
+                .any(|note| note.contains("the next stall")),
+            "{:?}",
+            notices(&events)
+        );
+
+        tx.send(Command::Prompt("go".to_string())).expect("send");
+        let events = drain_from(&mut rx).await;
+
+        assert_eq!(
+            consulted(&events).len(),
+            1,
+            "the request should have been honoured: {events:?}"
+        );
+        assert_eq!(driver.request_count(), 2, "the driver kept the turn");
+        assert_eq!(consultant.request_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_consult_request_is_not_honoured_twice() {
+        // Taken, not read. A request that survived would make every later stall
+        // consult, which is a policy change wearing a one-shot's clothes.
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // One consult wanted, but the driver loops past it so a second stall
+        // happens. The second must escalate, not consult again.
+        let driver = Arc::new(ScriptedProvider {
+            turns: Mutex::new(VecDeque::new()),
+            requests: Mutex::new(Vec::new()),
+            fallback: looping_answer(),
+            fail_with: None,
+        });
+        let consultant = ScriptedProvider::new(vec![answer("advice one")]);
+
+        let mut first = Tier::new(
+            "Local".to_string(),
+            "m0".to_string(),
+            driver,
+            Limits::default(),
+        );
+        // Configured to escalate, so only the one-shot can produce a consult.
+        first.on_stuck = OnStuck::Escalate;
+        first.consults_per_turn = 5;
+        let second = Tier::new(
+            "DeepSeek".to_string(),
+            "m1".to_string(),
+            consultant.clone(),
+            Limits::default(),
+        );
+        let chain = FallbackChain::new(vec![first, second], true).expect("a chain");
+
+        let (tx, mut rx) = loop_over(dir.path(), chain);
+        tx.send(Command::Consult).expect("send");
+        let _ = collect(&mut rx).await;
+        tx.send(Command::Prompt("go".to_string())).expect("send");
+        let events = drain_from(&mut rx).await;
+
+        assert_eq!(
+            consulted(&events).len(),
+            1,
+            "one request means one consult, however many stalls follow: {events:?}"
+        );
+        // Twice: once as the consultant, and once as the tier the second stall
+        // escalated into. Only the first was a consult, which is what the count
+        // of `Consulted` events above is measuring.
+        assert_eq!(consultant.request_count(), 2);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Escalated { .. })),
+            "the second stall should escalate: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn on_stuck_changes_the_policy_for_the_rest_of_the_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (chain, driver, consultant) = consultable(2);
+        let (tx, mut rx) = loop_over(dir.path(), chain);
+
+        tx.send(Command::SetOnStuck(OnStuck::Consult))
+            .expect("send");
+        let events = collect(&mut rx).await;
+        let said = notices(&events).join(" ");
+        assert!(said.contains("from now on"), "{said}");
+        assert!(
+            said.contains("keeps the turn"),
+            "it should say what it means: {said}"
+        );
+
+        // No `/consult` needed: the policy alone produces the consult.
+        tx.send(Command::Prompt("go".to_string())).expect("send");
+        let events = drain_from(&mut rx).await;
+
+        assert_eq!(consulted(&events).len(), 1, "{events:?}");
+        assert_eq!(driver.request_count(), 2);
+        assert_eq!(consultant.request_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn on_stuck_escalate_puts_it_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (chain, _driver, _consultant) = consultable(2);
+        let (tx, mut rx) = loop_over(dir.path(), chain);
+
+        tx.send(Command::SetOnStuck(OnStuck::Escalate))
+            .expect("send");
+        let events = collect(&mut rx).await;
+        assert!(
+            notices(&events)
+                .iter()
+                .any(|note| note.contains("hands the turn to the next one")),
+            "{:?}",
+            notices(&events)
+        );
+
+        tx.send(Command::Prompt("go".to_string())).expect("send");
+        let events = drain_from(&mut rx).await;
+
+        assert!(
+            consulted(&events).is_empty(),
+            "the policy is escalate, so nothing consults: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Escalated { .. })),
+            "{events:?}"
+        );
+        // The count says nothing here: the escalated tier *is* the consultant,
+        // so it would be asked either way. The empty `consulted` above is the
+        // assertion that matters.
+    }
+
+    #[tokio::test]
+    async fn a_policy_notice_uses_short_names_not_addresses() {
+        // The address belongs in the session panel. Repeating it in every notice
+        // is how a one-line message becomes three wrapped ones, which is what
+        // happened the first time this was written.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let driver = ScriptedProvider::new(Vec::new());
+        let consultant = ScriptedProvider::new(Vec::new());
+
+        let tiers = vec![
+            Tier::new(
+                "Local (http://127.0.0.1:8735/v1)".to_string(),
+                "m0".to_string(),
+                driver,
+                Limits::default(),
+            ),
+            Tier::new(
+                "Frontier (http://127.0.0.1:8736/v1)".to_string(),
+                "m1".to_string(),
+                consultant,
+                Limits::default(),
+            ),
+        ];
+        let chain = FallbackChain::new(tiers, true).expect("a chain");
+        let (tx, mut rx) = loop_over(dir.path(), chain);
+
+        tx.send(Command::Consult).expect("send");
+        let events = collect(&mut rx).await;
+        tx.send(Command::SetOnStuck(OnStuck::Consult))
+            .expect("send");
+        let events2 = collect(&mut rx).await;
+
+        let said = format!(
+            "{} {}",
+            notices(&events).join(" "),
+            notices(&events2).join(" ")
+        );
+        assert!(said.contains("Frontier"), "{said}");
+        assert!(
+            !said.contains("http://"),
+            "an address has no place in a notice: {said}"
+        );
+    }
+
+    #[tokio::test]
+    async fn consult_says_so_when_there_is_nobody_to_ask() {
+        // Refused while the user is looking, rather than silently doing nothing
+        // and leaving them to wonder why no consult happened.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (chain, _provider) = one_tier("only");
+        let (tx, mut rx) = loop_over(dir.path(), chain);
+
+        tx.send(Command::Consult).expect("send");
+        let events = collect(&mut rx).await;
+        let said = notices(&events).join(" ");
+
+        assert!(said.contains("last tier"), "{said}");
+        assert!(said.contains("nobody to consult"), "{said}");
+    }
+
+    #[tokio::test]
+    async fn on_stuck_consult_warns_when_the_chain_is_one_tier_deep() {
+        // The policy is remembered, but it cannot ever take effect, and a
+        // setting that silently does nothing is worse than one that says so.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (chain, _provider) = one_tier("only");
+        let (tx, mut rx) = loop_over(dir.path(), chain);
+
+        tx.send(Command::SetOnStuck(OnStuck::Consult))
+            .expect("send");
+        let events = collect(&mut rx).await;
+        let said = notices(&events).join(" ");
+
+        assert!(said.contains("cannot take effect"), "{said}");
+        assert!(said.contains("one tier"), "{said}");
     }
 
     #[tokio::test]

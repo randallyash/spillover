@@ -11,6 +11,7 @@ use crate::agent::first_line;
 use crate::agent::{Canceller, Command, Mode};
 use crate::commands::{self, Input};
 use crate::config::Config;
+use crate::config::OnStuck;
 
 /// How much of the prompt a single paste may add, in characters.
 ///
@@ -94,6 +95,9 @@ pub struct App {
     /// Whether the fallback policy keeps the lower tier. Held here as well as in
     /// the chain because the session panel draws it.
     pub sticky: bool,
+    /// A stuck policy chosen for this session, if one was. `None` means each
+    /// tier's own from configuration, which the panel resolves per tier.
+    pub on_stuck: Option<OnStuck>,
     /// What a turn is allowed to do. The agent enforces it; this copy is so the
     /// interface can say which mode is active.
     pub mode: Mode,
@@ -166,6 +170,7 @@ impl App {
             approval: None,
             busy: false,
             sticky,
+            on_stuck: None,
             mode: Mode::default(),
             cancel: None,
             viewport: Rect::new(0, 0, 80, 24),
@@ -302,6 +307,29 @@ impl App {
     /// exactly the window an escalation happens in.
     pub fn recently_escalated(&self) -> bool {
         matches!(self.escalated_at, Some(at) if self.tick.saturating_sub(at) < FLASH_TICKS)
+    }
+
+    /// The stuck policy actually in force, for the rail to state.
+    ///
+    /// A session choice wins; otherwise it is the answering tier's own from
+    /// configuration, which can differ per tier — consulting a hesitant local
+    /// model is the point, while a frontier tier has nothing better to ask. So
+    /// the answer follows whichever tier is active, and the rail says the truth
+    /// for the tier you are on rather than a global setting that may not apply.
+    pub fn on_stuck(&self) -> OnStuck {
+        if let Some(chosen) = self.on_stuck {
+            return chosen;
+        }
+        self.config
+            .tiers
+            .get(self.active_tier)
+            .map(|tier| tier.on_stuck)
+            .unwrap_or_default()
+    }
+
+    /// Whether the policy is this session's choice rather than the config's.
+    pub fn on_stuck_is_chosen(&self) -> bool {
+        self.on_stuck.is_some()
     }
 
     /// The tier now answering, by name, if the agent is attached.
@@ -843,6 +871,33 @@ impl App {
             "escalate" => {
                 send(self, Command::Escalate);
             }
+
+            "consult" => {
+                send(self, Command::Consult);
+            }
+
+            "on-stuck" => match argument.trim().to_lowercase().as_str() {
+                "escalate" => {
+                    // Recorded only once the chain has been told, so the panel
+                    // cannot report a policy that is not in effect.
+                    if send(self, Command::SetOnStuck(OnStuck::Escalate)) {
+                        self.on_stuck = Some(OnStuck::Escalate);
+                    }
+                }
+                "consult" => {
+                    if send(self, Command::SetOnStuck(OnStuck::Consult)) {
+                        self.on_stuck = Some(OnStuck::Consult);
+                    }
+                }
+                other => {
+                    let complaint = if other.is_empty() {
+                        "usage: /on-stuck <escalate|consult>".to_string()
+                    } else {
+                        format!("/on-stuck takes escalate or consult, not {other:?}")
+                    };
+                    self.messages.push(Message::system(complaint));
+                }
+            },
             "retry" => {
                 let tier = argument.trim();
                 // Busy only if the retry actually went somewhere. Setting it
@@ -2019,6 +2074,151 @@ mod tests {
             .find(|line| line.contains("Local:"))
             .expect("the local line");
         assert!(!local_line.contains("cached"), "{local_line}");
+    }
+
+    // ---- the stuck policy -------------------------------------------------
+
+    #[test]
+    fn the_rail_policy_follows_the_answering_tier_until_it_is_chosen() {
+        // Tiers carry their own, so what the rail says has to follow whichever
+        // one is answering rather than reporting a single global setting.
+        let (mut app, _commands) = app_with_policies(&[OnStuck::Consult, OnStuck::Escalate]);
+        assert_eq!(app.on_stuck(), OnStuck::Consult, "the first tier consults");
+        assert!(!app.on_stuck_is_chosen());
+
+        app.activate_tier("second");
+        assert_eq!(
+            app.on_stuck(),
+            OnStuck::Escalate,
+            "the second tier escalates, and the rail should say so"
+        );
+    }
+
+    #[test]
+    fn a_session_choice_outranks_every_tier() {
+        let (mut app, _commands) = app_with_policies(&[OnStuck::Escalate, OnStuck::Escalate]);
+
+        app.messages.clear();
+        type_and_send(&mut app, "/on-stuck consult");
+        assert_eq!(app.on_stuck(), OnStuck::Consult);
+        assert!(
+            app.on_stuck_is_chosen(),
+            "the rail should show that this was chosen, not configured"
+        );
+
+        // And back, so a session override is not a one-way door.
+        type_and_send(&mut app, "/on-stuck escalate");
+        assert_eq!(app.on_stuck(), OnStuck::Escalate);
+    }
+
+    #[test]
+    fn on_stuck_refuses_nonsense_without_changing_anything() {
+        let (mut app, _commands) = app_with_policies(&[OnStuck::Escalate, OnStuck::Escalate]);
+        let before = app.on_stuck();
+
+        type_and_send(&mut app, "/on-stuck maybe");
+
+        assert_eq!(app.on_stuck(), before);
+        assert!(!app.on_stuck_is_chosen());
+        assert!(
+            last_message(&app).contains("on-stuck takes escalate or consult"),
+            "{}",
+            last_message(&app)
+        );
+
+        // The bare form explains itself rather than guessing.
+        type_and_send(&mut app, "/on-stuck");
+        assert!(
+            last_message(&app).contains("usage"),
+            "{}",
+            last_message(&app)
+        );
+    }
+
+    #[test]
+    fn consult_is_forwarded_to_the_agent() {
+        let (mut app, mut commands) = attached_app();
+        type_and_send(&mut app, "/consult");
+
+        assert_eq!(
+            commands.try_recv().expect("the command should be sent"),
+            Command::Consult
+        );
+    }
+
+    #[test]
+    fn on_stuck_is_forwarded_to_the_agent() {
+        let (mut app, mut commands) = attached_app();
+        type_and_send(&mut app, "/on-stuck consult");
+
+        assert_eq!(
+            commands.try_recv().expect("the command should be sent"),
+            Command::SetOnStuck(OnStuck::Consult)
+        );
+    }
+
+    #[test]
+    fn a_policy_is_not_recorded_when_no_agent_can_be_told() {
+        // Otherwise the rail would report a policy nothing is enforcing, which
+        // is the same mistake `/sticky` made before it was fixed.
+        let mut app = new_app();
+        let before = app.on_stuck();
+
+        type_and_send(&mut app, "/on-stuck consult");
+
+        assert_eq!(
+            app.on_stuck(),
+            before,
+            "nothing was told, so nothing changed"
+        );
+        assert!(!app.on_stuck_is_chosen());
+        assert!(
+            last_message(&app).contains("nowhere to go"),
+            "{}",
+            last_message(&app)
+        );
+    }
+
+    /// An attached app whose tiers carry the given stuck policies.
+    ///
+    /// The receiver comes back with it: dropping it would close the channel, and
+    /// every command would then be refused as "no agent is running".
+    fn app_with_policies(
+        policies: &[OnStuck],
+    ) -> (App, tokio::sync::mpsc::UnboundedReceiver<Command>) {
+        let tiers: String = policies
+            .iter()
+            .enumerate()
+            .map(|(index, policy)| {
+                let kind = match policy {
+                    OnStuck::Consult => "consult",
+                    OnStuck::Escalate => "escalate",
+                };
+                format!(
+                    "\n[[tier]]\nid = \"tier-{index}\"\nname = \"{}\"\nkind = \"openai\"\n                     base_url = \"http://localhost:1234/v1\"\non_stuck = \"{kind}\"\n",
+                    match index {
+                        0 => "first",
+                        _ => "second",
+                    }
+                )
+            })
+            .collect();
+
+        let config = Config::parse(
+            std::path::Path::new("test.toml"),
+            &format!("schema = 1\n{tiers}"),
+        )
+        .expect("the test config should be valid");
+
+        let labels: Vec<String> = config
+            .tiers
+            .iter()
+            .map(|tier| tier.display_name().to_string())
+            .collect();
+        let mut app = App::new(config);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        app.attach(tx, Canceller::default(), &labels, None);
+        (app, rx)
     }
 
     #[test]

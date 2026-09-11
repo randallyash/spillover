@@ -41,11 +41,6 @@ impl Tier {
             consults_per_turn: crate::config::DEFAULT_CONSULTS_PER_TURN,
         }
     }
-
-    /// Whether this tier asks its neighbour for help rather than handing over.
-    pub fn consults_when_stuck(&self) -> bool {
-        self.on_stuck == OnStuck::Consult
-    }
 }
 
 /// A tier label without its parenthetical detail: "Local (http://…)" becomes
@@ -70,6 +65,19 @@ pub struct FallbackChain {
     /// Without this, naming a tier would only last until the next turn on a
     /// non-sticky chain, and `/tier` would look broken.
     pinned: Option<usize>,
+    /// A stuck policy chosen for this session, outranking each tier's own.
+    ///
+    /// Tiers carry their own from configuration, because the right answer
+    /// depends on the model: consulting a hesitant local one is the point, while
+    /// a frontier tier has nothing better to ask. That makes the choice worth
+    /// trying without editing a file, which is what `/on-stuck` is for.
+    on_stuck: Option<OnStuck>,
+    /// Whether the next stall should consult whatever the policy says.
+    ///
+    /// One-shot, and separate from the policy above: this is "try it once, here"
+    /// rather than "do this from now on". Consumed when a stall is handled, so a
+    /// single request cannot quietly change how the rest of the session behaves.
+    consult_next: bool,
 }
 
 impl FallbackChain {
@@ -84,6 +92,8 @@ impl FallbackChain {
             active: 0,
             sticky,
             pinned: None,
+            on_stuck: None,
+            consult_next: false,
         })
     }
 
@@ -126,6 +136,40 @@ impl FallbackChain {
 
     pub fn set_sticky(&mut self, sticky: bool) {
         self.sticky = sticky;
+    }
+
+    /// The stuck policy in force: this session's if one was chosen, otherwise
+    /// the answering tier's own.
+    pub fn on_stuck(&self) -> OnStuck {
+        self.on_stuck.unwrap_or(self.active().on_stuck)
+    }
+
+    /// Choose the stuck policy for the rest of the session.
+    pub fn set_on_stuck(&mut self, policy: OnStuck) {
+        self.on_stuck = Some(policy);
+    }
+
+    /// Whether the answering tier should consult rather than hand the turn over.
+    pub fn consults_when_stuck(&self) -> bool {
+        self.on_stuck() == OnStuck::Consult
+    }
+
+    /// Ask for the next stall to consult, whatever the policy says.
+    pub fn consult_next_stall(&mut self) {
+        self.consult_next = true;
+    }
+
+    /// Whether such a request is outstanding, and taken rather than read.
+    ///
+    /// Taking it is what makes it one-shot: a stall either uses it or spends it,
+    /// and either way the request does not survive to change the next one.
+    pub fn take_consult_request(&mut self) -> bool {
+        std::mem::take(&mut self.consult_next)
+    }
+
+    /// Whether a consult is even possible, which needs a tier below to ask.
+    pub fn can_consult(&self) -> bool {
+        self.consultant().is_some()
     }
 
     /// Choose a tier by hand, and keep choosing it until told otherwise.
@@ -472,6 +516,109 @@ mod tests {
         let chain = chain(&["local", "deepseek", "grok"], true);
         assert_eq!(chain.len(), 3);
         assert_eq!(chain.active_index(), 0);
+    }
+
+    // ---- the stuck policy ------------------------------------------------
+
+    #[test]
+    fn the_stuck_policy_comes_from_the_answering_tier_until_it_is_chosen() {
+        // Tiers carry their own, because the right answer depends on the model.
+        let mut first = Tier::new(
+            "local".to_string(),
+            "m".to_string(),
+            Arc::new(Stub("stub")),
+            Limits::default(),
+        );
+        first.on_stuck = OnStuck::Consult;
+        let second = Tier::new(
+            "grok".to_string(),
+            "m".to_string(),
+            Arc::new(Stub("stub")),
+            Limits::default(),
+        );
+        let mut chain = FallbackChain::new(vec![first, second], true).expect("a chain");
+
+        assert!(chain.consults_when_stuck(), "the local tier consults");
+
+        // And it follows the tier, not the chain: the frontier tier escalates.
+        chain.escalate().expect("one step down");
+        assert!(!chain.consults_when_stuck(), "grok escalates");
+    }
+
+    #[test]
+    fn a_chosen_policy_outranks_every_tier_for_the_session() {
+        let mut first = Tier::new(
+            "local".to_string(),
+            "m".to_string(),
+            Arc::new(Stub("stub")),
+            Limits::default(),
+        );
+        first.on_stuck = OnStuck::Escalate;
+        let second = Tier::new(
+            "grok".to_string(),
+            "m".to_string(),
+            Arc::new(Stub("stub")),
+            Limits::default(),
+        );
+        let mut chain = FallbackChain::new(vec![first, second], true).expect("a chain");
+
+        assert!(!chain.consults_when_stuck());
+        chain.set_on_stuck(OnStuck::Consult);
+
+        assert!(
+            chain.consults_when_stuck(),
+            "the choice wins over the config"
+        );
+
+        // On the tier below too, so one choice covers the chain.
+        chain.escalate().expect("one step down");
+        assert!(chain.consults_when_stuck());
+    }
+
+    #[test]
+    fn a_one_shot_consult_request_is_taken_rather_than_read() {
+        // Taking it is what keeps it one-shot: a request that could be read
+        // twice would quietly become the policy for the rest of the session.
+        let mut chain = chain(&["local", "grok"], true);
+
+        assert!(!chain.take_consult_request(), "nothing was asked for");
+
+        chain.consult_next_stall();
+        assert!(chain.take_consult_request(), "the first stall takes it");
+        assert!(
+            !chain.take_consult_request(),
+            "and the next stall does not get it"
+        );
+        assert!(
+            !chain.consults_when_stuck(),
+            "asking once must not change the policy"
+        );
+    }
+
+    #[test]
+    fn a_consult_needs_somewhere_to_ask() {
+        let chain = chain(&["local", "grok"], true);
+        assert!(chain.can_consult(), "there is a tier below");
+
+        let only = chain_of_one();
+        assert!(
+            !only.can_consult(),
+            "the last tier has nobody to ask, so it escalates instead"
+        );
+    }
+
+    /// A chain of exactly one tier, which is the last tier in any chain.
+    fn chain_of_one() -> FallbackChain {
+        FallbackChain::new(
+            vec![Tier::new(
+                "only".to_string(),
+                "m".to_string(),
+                Arc::new(Stub("stub")),
+                Limits::default(),
+            )],
+            true,
+        )
+        .expect("a chain")
     }
 
     #[test]

@@ -12,6 +12,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Sparkline};
 
 use crate::app::App;
+use crate::config::OnStuck;
 use crate::text;
 use crate::ui::theme::Theme;
 
@@ -55,6 +56,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     lines.push(section_with_value("chain", &position(app), theme, width));
     lines.extend(chain_rows(app, theme, width));
     lines.extend(pair("fallback", &fallback(app), theme, value_width));
+    lines.extend(policy_row(app, theme, value_width));
 
     lines.push(Line::raw(""));
     lines.push(Line::styled("usage", theme.section));
@@ -212,6 +214,18 @@ fn value_width(content_width: usize) -> usize {
 
 /// A label and its value, wrapped under itself so a long path stays readable.
 fn pair(label: &str, value: &str, theme: &Theme, width: usize) -> Vec<Line<'static>> {
+    pair_styled(label, value, Style::default(), theme, width)
+}
+
+/// The same, with the value styled. Used where a value is worth noticing rather
+/// than merely reading.
+fn pair_styled(
+    label: &str,
+    value: &str,
+    value_style: Style,
+    theme: &Theme,
+    width: usize,
+) -> Vec<Line<'static>> {
     let indent = " ".repeat(INDENT);
     let wrapped = text::wrap(value, width);
     let mut lines = Vec::new();
@@ -225,11 +239,41 @@ fn pair(label: &str, value: &str, theme: &Theme, width: usize) -> Vec<Line<'stat
         };
         lines.push(Line::from(vec![
             lead,
-            Span::styled(part.clone(), Style::default()),
+            Span::styled(part.clone(), value_style),
         ]));
     }
 
     lines
+}
+
+/// What a stuck tier does, which is the policy worth watching in a session.
+///
+/// Named `on stuck` rather than folded into `fallback`, because the two are
+/// different questions: `fallback` is whether a spill keeps the lower tier, this
+/// is whether there is a spill at all. Consult is drawn in the warning colour
+/// because it is the non-default and the one that changes what happens, and the
+/// word alone says which is live without relying on the colour.
+fn policy_row(app: &App, theme: &Theme, width: usize) -> Vec<Line<'static>> {
+    let policy = app.on_stuck();
+    let value = match policy {
+        OnStuck::Consult => "consult",
+        OnStuck::Escalate => "escalate",
+    };
+    let style = match policy {
+        OnStuck::Consult => theme.warn,
+        OnStuck::Escalate => Style::default(),
+    };
+
+    // Marked when the session chose it rather than the config, so a policy that
+    // outlives its experiment is visible. The word carries the meaning; this is
+    // a second reading of it.
+    let label = if app.on_stuck_is_chosen() {
+        "on stuck *"
+    } else {
+        "on stuck"
+    };
+
+    pair_styled(label, value, style, theme, width)
 }
 
 /// "2 of 3", which is the number that matters when a chain is failing.
@@ -349,6 +393,105 @@ mod tests {
         let app = app_with(&["A remarkably long tier name", "Grok"]);
         for row in chain_rows(&app, &Theme::default(), 20) {
             assert!(row.width() <= 20, "the row would clip: {row:?}");
+        }
+    }
+
+    /// The panel's rows as plain text.
+    fn rows(app: &App) -> Vec<String> {
+        let theme = Theme::default();
+        let width = value_width(29);
+        let mut lines = Vec::new();
+        lines.extend(pair("fallback", &fallback(app), &theme, width));
+        lines.extend(policy_row(app, &theme, width));
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_panel_says_which_stuck_policy_is_live() {
+        let app = app_with(&["Local", "DeepSeek"]);
+        let text = rows(&app).join("\n");
+
+        assert!(text.contains("on stuck"), "{text}");
+        assert!(
+            text.contains("escalate"),
+            "the policy in force should be named: {text}"
+        );
+        // And it is a separate line from the fallback policy, because they are
+        // different questions: whether a spill happens, and whether it sticks.
+        let fallback = rows(&app)[0].clone();
+        assert!(fallback.contains("fallback"), "{fallback}");
+        assert!(!fallback.contains("escalate"), "{fallback}");
+    }
+
+    #[test]
+    fn the_panel_follows_a_session_choice_and_marks_it_as_chosen() {
+        let mut app = app_with(&["Local", "DeepSeek"]);
+        app.on_stuck = Some(OnStuck::Consult);
+
+        let text = rows(&app).join("\n");
+        assert!(text.contains("consult"), "{text}");
+        assert!(
+            text.contains("on stuck *"),
+            "a policy chosen for the session should be marked as such: {text}"
+        );
+    }
+
+    #[test]
+    fn the_panel_does_not_mark_a_policy_that_came_from_the_config() {
+        let app = app_with(&["Local", "DeepSeek"]);
+        let text = rows(&app).join("\n");
+
+        assert!(text.contains("on stuck"), "{text}");
+        assert!(
+            !text.contains("on stuck *"),
+            "nothing was chosen, so nothing should look altered: {text}"
+        );
+    }
+
+    #[test]
+    fn consult_is_drawn_in_the_warning_colour_and_escalate_is_not() {
+        // Consult is the non-default and the one that changes what happens, so
+        // it is worth noticing — with the word carrying the meaning either way.
+        let theme = Theme::default();
+
+        let mut chosen = app_with(&["Local", "DeepSeek"]);
+        chosen.on_stuck = Some(OnStuck::Consult);
+        let consult = policy_row(&chosen, &theme, value_width(29));
+        let value = &consult[0].spans[1];
+        assert_eq!(value.content, "consult");
+        assert_eq!(value.style, theme.warn);
+
+        let mut configured = app_with(&["Local", "DeepSeek"]);
+        configured.on_stuck = Some(OnStuck::Escalate);
+        let escalate = policy_row(&configured, &theme, value_width(29));
+        assert_eq!(escalate[0].spans[1].content, "escalate");
+        assert_eq!(
+            escalate[0].spans[1].style,
+            Style::default(),
+            "the default should not shout"
+        );
+    }
+
+    #[test]
+    fn the_label_and_the_value_both_fit_the_panel() {
+        // The chosen marker makes the label ten characters, which is exactly the
+        // label column: one more and it would push the value over the edge.
+        let mut app = app_with(&["Local", "DeepSeek"]);
+        app.on_stuck = Some(OnStuck::Consult);
+
+        for line in rows(&app) {
+            assert!(
+                text::display_width(&line) <= 29,
+                "the panel would clip this: {line:?}"
+            );
         }
     }
 

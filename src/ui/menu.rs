@@ -25,7 +25,12 @@ use crate::ui::theme::Theme;
 const MENU_MAX_WIDTH: u16 = 96;
 const MENU_MIN_WIDTH: u16 = 40;
 /// Rows of menu, before it starts scrolling.
-const MENU_MAX_ROWS: usize = 12;
+///
+/// A ceiling rather than a target: what actually decides is the room above the
+/// prompt, so the menu never pushes the conversation off screen. It is one more
+/// than the catalogue needs, so a command added later shows up rather than
+/// silently scrolling out of reach.
+const MENU_MAX_ROWS: usize = 14;
 
 /// The command menu, sitting on top of the prompt.
 pub fn render_menu(frame: &mut Frame, area: Rect, app: &App, theme: &Theme, prompt: Rect) {
@@ -38,8 +43,11 @@ pub fn render_menu(frame: &mut Frame, area: Rect, app: &App, theme: &Theme, prom
         MENU_MIN_WIDTH.min(area.width),
         MENU_MAX_WIDTH.min(area.width),
     );
-    // Room for the rows, the hint line, and the border.
-    let rows = matches.len().min(MENU_MAX_ROWS);
+    // Room for the rows, the hint line, and the border — and no more than the
+    // space between the top of the frame and the prompt, so the menu cannot
+    // cover the prompt it belongs to.
+    let above = prompt.y.saturating_sub(area.y).saturating_sub(3).max(1) as usize;
+    let rows = matches.len().min(MENU_MAX_ROWS).min(above).max(1);
     let height = rows as u16 + 3;
 
     // Sits directly above the prompt when there is room, and drops to the

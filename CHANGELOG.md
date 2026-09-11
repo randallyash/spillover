@@ -8,6 +8,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- The command menu shows every command again. It capped at twelve rows and the
+  catalogue is thirteen, so `/quit` had scrolled out of reach — and the cap is
+  now what fits above the prompt rather than a fixed number, so the menu can
+  never cover the prompt it belongs to.
 - **`spill setup` accepts a model id the endpoint does not serve.** Three gaps
   stacked into one bad first impression: the text step took any non-empty string,
   the review check reported a configured id as *ready* without looking for it in
@@ -126,6 +130,29 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Consult is a command, not just a config key.** It was the interesting new
+  mechanic and it was buried in TOML: the only way to try it was to edit a file
+  and restart. `/on-stuck escalate|consult` now switches every tier for the rest
+  of the session, and `/consult` asks for a single consult on the next stall
+  without changing the policy — the way to find out whether it helps before
+  committing to it.
+
+  The one-shot is taken rather than read when a stall is handled, so a single
+  request cannot quietly become the policy for the session; a request that
+  survived would be a policy change wearing a one-shot's clothes. Asking when
+  there is no tier below is refused while the user is looking at it, and
+  `/on-stuck consult` on a chain one tier deep says the policy cannot take
+  effect rather than silently doing nothing.
+
+- The session panel says which stuck policy is live. It is drawn from the
+  answering tier's own configuration when the session has not chosen one, because
+  tiers differ on purpose — consulting a hesitant local model is the point, while
+  a frontier tier has nothing better to ask — and marked with `*` when the
+  session chose it rather than the config, so an override cannot outlive its
+  experiment unnoticed. Consult is drawn in the warning colour, with the word
+  itself carrying the meaning either way.
+
+  The default stays `escalate`, in config and on screen.
 - The README leads with what spill is actually for — local until it isn't — and
   carries four pictures of the real interface. They are not drawings: a test walks
   the buffer `draw` produced, records each cell's symbol and styling as JSON, and a
