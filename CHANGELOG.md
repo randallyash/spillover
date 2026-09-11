@@ -23,9 +23,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   one. The cost graph still gets one bar per turn rather than per request, so
   spilling does not make one prompt look like two.
 
-  One gap remains and cannot be closed from here: a provider reports usage with
-  its response, so an attempt whose *stream* was killed mid-flight — a repetition
-  loop, a transport failure — never reported any, and there is nothing to count.
+  Usage that arrives before a stream ends is now kept too. It used to be read
+  only off a *finished* response, so an attempt that was abandoned — a stall, a
+  repetition loop, a cancel — threw away a figure the tier had already sent, and
+  the cost of a failing tier, which is exactly what someone is trying to measure,
+  was invisible. Providers now hand out usage as each frame arrives, and Command
+  Code's `model_request_end` and `turn_end` frames are read at all: only its
+  final result line was being looked at, so a run killed before the end reported
+  nothing despite having said what it spent several frames earlier.
+
+  What cannot be closed remains: a provider reports usage with its response, so
+  a stream killed *before any usage frame arrives* has nothing to count, and only
+  a provider that billed in arrears could say otherwise.
 
 - `Ctrl-C` quits from anywhere again. The approval prompt and the help overlay
   both swallow every key they do not use, and the check for `Ctrl-C` sat below

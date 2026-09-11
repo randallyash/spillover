@@ -792,19 +792,28 @@ async fn try_consult(
     // call is over and reported as a consult.
     let (discard, _unused) = mpsc::unbounded_channel();
 
-    let summary = match stream_turn(
+    let (result, observed) = stream_turn(
         &consultant.provider,
         request,
         &discard,
         &mut watchdog,
         &config.cancel,
     )
-    .await
-    {
+    .await;
+
+    let summary = match result {
         Ok(summary) => summary,
         Err(reason) => {
-            // Said out loud, because a silent fallback would make consult look
-            // like it simply did nothing.
+            // A consult that could not finish was still billed for what it did.
+            // Reported before giving up, so the cost is not silently lost along
+            // with the answer — and said out loud, because a silent fallback
+            // would make consult look like it simply did nothing.
+            if let Some(usage) = observed {
+                let _ = events.send(AgentEvent::Spent {
+                    tier: consultant.label.clone(),
+                    usage,
+                });
+            }
             let _ = events.send(AgentEvent::Notice(format!(
                 "{} could not be consulted ({}) — carrying on as if it had not been asked",
                 consultant.label,
@@ -828,7 +837,9 @@ async fn try_consult(
     Some(Answer {
         text,
         about: reason.summary(),
-        usage: summary.usage,
+        // One figure, never both: the finished response's own total if it gave
+        // one, otherwise what arrived before it ended.
+        usage: summary.usage.or(observed),
     })
 }
 
@@ -901,24 +912,38 @@ async fn try_tier(
             tools: tools.clone(),
         };
 
-        let summary = match stream_turn(
+        let (result, observed) = stream_turn(
             &tier.provider,
             request,
             events,
             &mut watchdog,
             &config.cancel,
         )
-        .await
-        {
-            Ok(summary) => summary,
-            Err(StuckReason::Cancelled) => return Attempt::Cancelled(spent),
-            Err(reason) => return Attempt::Stuck(reason, spent),
-        };
+        .await;
 
-        // Folded in before anything else can return, so a step that produced a
-        // tool call — or one whose output is about to be discarded — still
-        // counts what it cost.
-        crate::provider::accumulate(&mut spent, summary.usage);
+        // Folded in before anything else can return, so a request that produced
+        // a tool call — or one whose output is about to be discarded — still
+        // counts what it cost. Exactly one figure is taken per request, never
+        // both, so a request cannot be counted twice.
+        let summary = match result {
+            Ok(summary) => {
+                // The finished response's own total is the better number; what
+                // was observed on the way is the fallback for a provider that
+                // reported as it went.
+                crate::provider::accumulate(&mut spent, summary.usage.or(observed));
+                summary
+            }
+            Err(StuckReason::Cancelled) => {
+                // Nothing finished, so whatever the tier reported before the
+                // stop is what it spent — and it is owed either way.
+                crate::provider::accumulate(&mut spent, observed);
+                return Attempt::Cancelled(spent);
+            }
+            Err(reason) => {
+                crate::provider::accumulate(&mut spent, observed);
+                return Attempt::Stuck(reason, spent);
+            }
+        };
 
         session.push(ChatMessage::assistant(
             summary.text.clone(),
@@ -988,10 +1013,16 @@ async fn stream_turn(
     events: &UnboundedSender<AgentEvent>,
     watchdog: &mut Watchdog,
     cancel: &Canceller,
-) -> Result<TurnSummary, StuckReason> {
+) -> (Result<TurnSummary, StuckReason>, Option<Usage>) {
     let (delta_tx, mut delta_rx) = mpsc::unbounded_channel::<StreamEvent>();
     let provider = provider.clone();
     let mut task = tokio::spawn(async move { provider.stream(request, delta_tx).await });
+
+    // Usage the tier reported before the attempt ended, whichever way it ended.
+    // A killed stream has still been billed, and the figure often arrives before
+    // the answer does, so this is kept rather than only read off a finished
+    // response.
+    let mut observed: Option<Usage> = None;
 
     let outcome = loop {
         let allowance = watchdog.allowance();
@@ -1007,7 +1038,7 @@ async fn stream_turn(
                 // answer that arrived in one burst would look healthy.
                 let mut tripped = None;
                 while let Ok(event) = delta_rx.try_recv() {
-                    if let Some(reason) = observe(event, events, watchdog) {
+                    if let Some(reason) = observe(event, events, watchdog, &mut observed) {
                         tripped = Some(reason);
                         break;
                     }
@@ -1030,7 +1061,7 @@ async fn stream_turn(
                     // The stream closed; the join above now holds the answer.
                     Ok(None) => continue,
                     Ok(Some(event)) => {
-                        if let Some(reason) = observe(event, events, watchdog) {
+                        if let Some(reason) = observe(event, events, watchdog, &mut observed) {
                             break Err(reason);
                         }
                     }
@@ -1044,18 +1075,32 @@ async fn stream_turn(
         task.abort();
     }
 
-    outcome
+    (outcome, observed)
 }
 
 /// Feed one stream event to the watchdog, forwarding text to the UI.
+///
+/// `observed` collects whatever the tier said the request had cost. It is filled
+/// in as the frames arrive rather than read off the finished response, because
+/// an attempt that is abandoned — a loop, a stall, a cancel — never produces a
+/// finished response, and its bills are owed all the same.
 fn observe(
     event: StreamEvent,
     events: &UnboundedSender<AgentEvent>,
     watchdog: &mut Watchdog,
+    observed: &mut Option<Usage>,
 ) -> Option<StuckReason> {
     match event {
         StreamEvent::Activity => {
             watchdog.note_activity();
+            None
+        }
+        StreamEvent::Usage(usage) => {
+            // A frame saying what this cost is a frame: the tier is alive.
+            watchdog.note_activity();
+            // Last one wins. These restate the same figure rather than adding
+            // up, so keeping the latest is right and summing would multiply it.
+            *observed = Some(usage);
             None
         }
         StreamEvent::Text(text) => {
@@ -2904,6 +2949,185 @@ mod tests {
             );
         }
     }
+    // ---- usage reported before a stream ends ------------------------------
+
+    /// Reports what it has spent, then goes quiet for good.
+    ///
+    /// Stands in for a stream that is killed before it can report a total: a
+    /// loop, a stall, a cancel. The request was billed and the figure arrived,
+    /// so losing it would be this program's error rather than the provider's.
+    struct ReportsThenHangs {
+        usage: Usage,
+    }
+
+    #[async_trait]
+    impl Provider for ReportsThenHangs {
+        fn describe(&self) -> String {
+            "reports then hangs".to_string()
+        }
+
+        async fn stream(
+            &self,
+            _request: ChatRequest,
+            events: UnboundedSender<StreamEvent>,
+        ) -> Result<TurnSummary, ProviderError> {
+            let _ = events.send(StreamEvent::Usage(self.usage));
+            std::future::pending::<()>().await;
+            unreachable!("pending never resolves")
+        }
+    }
+
+    /// Reports usage as it goes *and* finishes with the same figure, which is
+    /// what a real provider does.
+    struct ReportsAndFinishes {
+        usage: Usage,
+    }
+
+    #[async_trait]
+    impl Provider for ReportsAndFinishes {
+        fn describe(&self) -> String {
+            "reports and finishes".to_string()
+        }
+
+        async fn stream(
+            &self,
+            _request: ChatRequest,
+            events: UnboundedSender<StreamEvent>,
+        ) -> Result<TurnSummary, ProviderError> {
+            let _ = events.send(StreamEvent::Usage(self.usage));
+            let _ = events.send(StreamEvent::Text("done".to_string()));
+            Ok(TurnSummary {
+                text: "done".to_string(),
+                stop_reason: Some("end_turn".to_string()),
+                usage: Some(self.usage),
+                ..TurnSummary::default()
+            })
+        }
+    }
+
+    fn spent_events(events: &[AgentEvent]) -> Vec<(String, Usage)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Spent { tier, usage } => Some((tier.clone(), *usage)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn usage_reported_before_a_stall_is_still_counted() {
+        // The gap this closes: the tier said what it had spent, then the stream
+        // was abandoned before it could report a total. Reading usage only off a
+        // finished response threw that away, so the cost of a stalled tier —
+        // exactly what someone is trying to measure — was invisible.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stalling = Arc::new(ReportsThenHangs {
+            usage: Usage {
+                prompt_tokens: 9_000,
+                completion_tokens: 12,
+                cache_read_tokens: 4_000,
+                cache_write_tokens: 0,
+            },
+        });
+        let healthy = Quiet::new("recovered");
+
+        let tiers: Vec<(Arc<dyn Provider>, Limits)> =
+            vec![(stalling, short_allowance()), (healthy, Limits::default())];
+        let (tx, mut rx) = loop_over(dir.path(), chain_of(tiers));
+        tx.send(Command::Prompt("go".to_string())).expect("send");
+        let events = drain_from(&mut rx).await;
+
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Escalated { .. })),
+            "the tier should have been abandoned: {events:?}"
+        );
+
+        let spent = spent_events(&events);
+        let stalled = spent
+            .iter()
+            .find(|(tier, _)| tier == "Tier 0")
+            .expect("the stalled tier's spend should be reported");
+        assert_eq!(
+            stalled.1.prompt_tokens, 9_000,
+            "what it reported before the stall is what it spent"
+        );
+        assert_eq!(stalled.1.cache_read_tokens, 4_000);
+    }
+
+    #[tokio::test]
+    async fn usage_reported_before_a_cancel_is_still_counted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stalling = Arc::new(ReportsThenHangs {
+            usage: Usage {
+                prompt_tokens: 5_000,
+                completion_tokens: 8,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+        });
+
+        let (config, cancel) = config_with_cancel(dir.path(), DEFAULT_MAX_STEPS);
+        let (tx, mut rx) = spawn(
+            config,
+            single_tier(stalling),
+            Arc::new(Registry::with_default_tools()),
+            Arc::new(AlwaysApprove::default()),
+        );
+
+        tx.send(Command::Prompt("go".to_string())).expect("send");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        cancel.cancel();
+        let events = collect(&mut rx).await;
+
+        assert!(
+            matches!(events.last(), Some(AgentEvent::Cancelled { .. })),
+            "{events:?}"
+        );
+        let spent = spent_events(&events);
+        assert_eq!(spent.len(), 1, "{events:?}");
+        assert_eq!(
+            spent[0].1.prompt_tokens, 5_000,
+            "a stopped request was still billed"
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_is_not_counted_twice_when_it_is_reported_and_then_summarised() {
+        // A real provider does both: it reports usage as the frames arrive and
+        // again in the finished response. Those are the same figure, so adding
+        // them would double every turn — which is the mistake the first draft of
+        // this made.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = Arc::new(ReportsAndFinishes {
+            usage: Usage {
+                prompt_tokens: 1_000,
+                completion_tokens: 10,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+        });
+
+        let (tx, mut rx) = spawn(
+            config(dir.path(), DEFAULT_MAX_STEPS),
+            single_tier(provider),
+            Arc::new(Registry::with_default_tools()),
+            Arc::new(AlwaysApprove::default()),
+        );
+        tx.send(Command::Prompt("go".to_string())).expect("send");
+        let events = drain_from(&mut rx).await;
+
+        let spent = spent_events(&events);
+        assert_eq!(spent.len(), 1, "one request, one spend: {events:?}");
+        assert_eq!(
+            spent[0].1.prompt_tokens, 1_000,
+            "the same figure twice is still one figure"
+        );
+        assert_eq!(spent[0].1.completion_tokens, 10);
+    }
+
     // ---- consult ----------------------------------------------------------
 
     /// A driver that loops, and a consultant that answers.

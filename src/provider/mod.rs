@@ -19,6 +19,20 @@ pub enum StreamEvent {
     /// being built up, say. This is what keeps a long tool call from looking
     /// like a stalled tier.
     Activity,
+    /// What the tier says this request has cost so far.
+    ///
+    /// Emitted as soon as a frame carries it, rather than only being read off
+    /// the finished response, because a request that is *abandoned* was still
+    /// billed. A tier that loops and is thrown away has already been charged for
+    /// what it generated, and a stream killed mid-flight never reaches the frame
+    /// that would have reported its total at the end — so whatever arrived
+    /// before the kill is worth keeping.
+    ///
+    /// These restate the same figure rather than accumulating: a Command Code
+    /// run reports one usage on `model_request_end`, again on `turn_end`, and
+    /// again on its result line. A reader therefore takes the latest per
+    /// request and sums across requests.
+    Usage(Usage),
 }
 
 #[derive(Debug, Clone, Copy, Default)]

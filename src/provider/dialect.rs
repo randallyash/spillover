@@ -93,8 +93,12 @@ impl Parser for CommandCodeParser {
                     .get("stopReason")
                     .and_then(Value::as_str)
                     .map(str::to_string);
-                if let Some(usage) = value.get("usage").filter(|usage| !usage.is_null()) {
-                    self.usage = read_usage(usage);
+                let reported = value
+                    .get("usage")
+                    .filter(|usage| !usage.is_null())
+                    .and_then(read_usage);
+                if let Some(usage) = reported {
+                    self.usage = Some(usage);
                 }
                 if let Some(id) = value.get("sessionId").and_then(Value::as_str) {
                     self.session_id = Some(id.to_string());
@@ -108,7 +112,10 @@ impl Parser for CommandCodeParser {
                             .to_string(),
                     );
                 }
-                vec![StreamEvent::Activity]
+                match reported {
+                    Some(usage) => vec![StreamEvent::Usage(usage)],
+                    None => vec![StreamEvent::Activity],
+                }
             }
             Some("event") => {
                 // Command Code streams the answer as `text_delta` events while
@@ -121,6 +128,12 @@ impl Parser for CommandCodeParser {
                 {
                     self.session_id = Some(id.to_string());
                 }
+                let mut events = Vec::new();
+
+                // Text is taken first, and taken alongside anything else on the
+                // frame rather than instead of it: returning early would let a
+                // frame that carried both drop part of the answer, which is a
+                // far worse failure than an uncounted token.
                 let is_delta = inner
                     .and_then(|inner| inner.get("type"))
                     .and_then(Value::as_str)
@@ -132,11 +145,24 @@ impl Parser for CommandCodeParser {
                     {
                         if !chunk.is_empty() {
                             self.text.push_str(chunk);
-                            return vec![StreamEvent::Text(chunk.to_string())];
+                            events.push(StreamEvent::Text(chunk.to_string()));
                         }
                     }
                 }
-                vec![StreamEvent::Activity]
+
+                // `model_request_end` and `turn_end` carry usage, and they
+                // arrive before the run ends. Reading them here rather than only
+                // off the final result line is what lets a killed run report
+                // what it had already spent.
+                if let Some(usage) = inner.and_then(command_code_usage) {
+                    self.usage = Some(usage);
+                    events.push(StreamEvent::Usage(usage));
+                }
+
+                if events.is_empty() {
+                    events.push(StreamEvent::Activity);
+                }
+                events
             }
             _ => vec![StreamEvent::Activity],
         }
@@ -154,6 +180,21 @@ impl Parser for CommandCodeParser {
             ..TurnSummary::default()
         })
     }
+}
+
+/// Usage from a Command Code event frame, wherever it sits.
+///
+/// `model_request_end` and `turn_end` carry it at the top level; `run_end` nests
+/// it under `result`. All three arrive *before* the run is over, which is the
+/// reason to look for them at all: a run that is killed or cancelled mid-flight
+/// never reaches its final `result` line, and its bills are still owed.
+fn command_code_usage(inner: &Value) -> Option<Usage> {
+    let direct = inner.get("usage").filter(|usage| !usage.is_null());
+    let nested = inner
+        .get("result")
+        .and_then(|result| result.get("usage"))
+        .filter(|usage| !usage.is_null());
+    read_usage(direct.or(nested)?)
 }
 
 /// Grok Build's `streaming-json`: one `type`-tagged object per line, with text
@@ -185,8 +226,13 @@ impl Parser for GrokParser {
                     .get("stopReason")
                     .and_then(Value::as_str)
                     .map(str::to_string);
-                if let Some(usage) = value.get("usage").filter(|usage| !usage.is_null()) {
-                    self.usage = read_usage(usage);
+                if let Some(usage) = value
+                    .get("usage")
+                    .filter(|usage| !usage.is_null())
+                    .and_then(read_usage)
+                {
+                    self.usage = Some(usage);
+                    return vec![StreamEvent::Usage(usage)];
                 }
                 vec![StreamEvent::Activity]
             }
@@ -194,8 +240,13 @@ impl Parser for GrokParser {
                 if let Some(reason) = value.get("stopReason").and_then(Value::as_str) {
                     self.stop_reason = Some(reason.to_string());
                 }
-                if let Some(usage) = value.get("usage").filter(|usage| !usage.is_null()) {
-                    self.usage = read_usage(usage).or(self.usage);
+                if let Some(usage) = value
+                    .get("usage")
+                    .filter(|usage| !usage.is_null())
+                    .and_then(read_usage)
+                {
+                    self.usage = Some(usage);
+                    return vec![StreamEvent::Usage(usage)];
                 }
                 vec![StreamEvent::Activity]
             }
@@ -313,6 +364,100 @@ mod tests {
         );
         assert_eq!(text_of(&events), "pong");
         assert_eq!(parser.finish().expect("no error").text, "pong");
+    }
+
+    #[test]
+    fn command_code_reports_usage_from_the_frames_that_arrive_before_the_end() {
+        // The fixture's real frames. `model_request_end` and `turn_end` both
+        // carry usage and both arrive before the run is over — which matters
+        // because a run that is killed or cancelled never reaches its final
+        // result line, and its bills are owed regardless.
+        let mut parser = CommandCodeParser::default();
+
+        let early = parser.line(
+            r#"{"type":"event","event":{"type":"model_request_end","model":"m","usage":{"inputTokens":15329,"outputTokens":18,"cacheReadTokens":5632,"cacheWriteTokens":0},"stopReason":"stop"}}"#,
+        );
+        let usage = early
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::Usage(usage) => Some(*usage),
+                _ => None,
+            })
+            .expect("model_request_end carries usage, so it should be reported");
+        assert_eq!(usage.prompt_tokens, 15329);
+        assert_eq!(usage.cache_read_tokens, 5632);
+
+        // And the turn_end frame, which nests nothing but still reports.
+        let mid = parser.line(
+            r#"{"type":"event","event":{"type":"turn_end","turnNumber":1,"hadToolCalls":false,"usage":{"inputTokens":15329,"outputTokens":18}}}"#,
+        );
+        assert!(
+            mid.iter().any(|e| matches!(e, StreamEvent::Usage(_))),
+            "{mid:?}"
+        );
+
+        // run_end nests its usage under `result`, so it needs finding there.
+        let late = parser.line(
+            r#"{"type":"event","event":{"type":"run_end","result":{"finalText":"hi","usage":{"inputTokens":15329,"outputTokens":18}}}}"#,
+        );
+        assert!(
+            late.iter().any(|e| matches!(e, StreamEvent::Usage(_))),
+            "{late:?}"
+        );
+    }
+
+    #[test]
+    fn a_frame_carrying_text_and_usage_yields_both() {
+        // Neither may be dropped for the sake of the other. Losing a text delta
+        // would corrupt the answer; losing the usage would understate the cost.
+        let mut parser = CommandCodeParser::default();
+        let events = parser.line(
+            r#"{"type":"event","event":{"type":"text_delta","delta":"half an answer","usage":{"inputTokens":42,"outputTokens":7}}}"#,
+        );
+
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Text(t) if t == "half an answer")),
+            "{events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Usage(u) if u.prompt_tokens == 42)),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn command_code_still_reports_usage_from_the_result_line() {
+        let mut parser = CommandCodeParser::default();
+        let events = parser.line(
+            r#"{"type":"result","subtype":"success","stopReason":"end_turn","usage":{"inputTokens":15754,"outputTokens":3},"finalText":"pong"}"#,
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Usage(u) if u.prompt_tokens == 15754)),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn grok_reports_usage_as_soon_as_its_frame_arrives() {
+        let mut parser = GrokParser::default();
+
+        let events = parser.line(
+            r#"{"type":"usage","usage":{"input_tokens":12,"output_tokens":3},"stopReason":"end_turn"}"#,
+        );
+        let usage = events
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::Usage(usage) => Some(*usage),
+                _ => None,
+            })
+            .expect("the usage frame should be reported");
+        assert_eq!(usage.prompt_tokens, 12);
     }
 
     #[test]

@@ -239,6 +239,9 @@ impl StreamAccumulator {
         if let Some(usage) = value.get("usage").filter(|usage| !usage.is_null()) {
             if let Some(read) = crate::provider::read_usage(usage) {
                 self.usage = Some(read);
+                // Handed out now as well as kept, so a stream that is killed
+                // before it finishes does not take the figure with it.
+                events.push(StreamEvent::Usage(read));
                 progressed = true;
             }
         }
@@ -467,6 +470,27 @@ mod tests {
             accumulator.finish().stop_reason.as_deref(),
             Some("tool_calls")
         );
+    }
+
+    #[test]
+    fn usage_is_handed_out_as_an_event_not_only_kept_for_the_end() {
+        // A stream that is killed before it finishes never produces a summary,
+        // so a figure only stored would be lost with it. Handing it out as it
+        // arrives is what lets an abandoned request still be paid for.
+        let mut accumulator = StreamAccumulator::default();
+        let events = accumulator.apply(
+            r#"{"choices":[{"delta":{"content":"x"}}],"usage":{"prompt_tokens":11,"completion_tokens":7}}"#,
+        );
+
+        let usage = events
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::Usage(usage) => Some(*usage),
+                _ => None,
+            })
+            .expect("the usage should be emitted, not just stored");
+        assert_eq!(usage.prompt_tokens, 11);
+        assert_eq!(usage.completion_tokens, 7);
     }
 
     #[test]
