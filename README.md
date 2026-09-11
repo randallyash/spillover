@@ -38,6 +38,10 @@ notice that, cancel, and start over somewhere else. spill treats it as expected:
 - To build from source: Rust 1.85 or newer.
 - For a local tier: a model server already running. spill looks for one on the usual
   ports and uses it without configuration.
+- A terminal of at least 46 columns by 12 rows. Below that it says so rather than
+  drawing something garbled.
+- Color is optional. `NO_COLOR=1` turns it off, and nothing is lost: every state is
+  carried by a glyph, a border, or a weight as well as a hue.
 
 ## Install
 
@@ -158,6 +162,15 @@ and it is driven through plain text output, which is what nearly every agent CLI
 prints by default. Full configuration is in
 [`config.example.toml`](config.example.toml).
 
+A `cli` tier can also **keep its own conversation between turns**. The shipped
+`grok` and `command-code` presets do this already: the first turn opens a session,
+and every turn after that continues it and sends only the new message — rather
+than re-sending the whole transcript inside the prompt each time, which a long
+session pays for over and over. For any other CLI, set `session_args` and
+`resume_args` (both take `{session}`); a CLI that picks its own session id needs
+only `resume_args`, and spill reads the id out of its output. Leave them off and
+the tier behaves exactly as before.
+
 ## When it spills over
 
 A turn is abandoned, and retried on the next tier, when the active tier:
@@ -182,13 +195,15 @@ you     explain the parser
 spill   Recovered on the second tier.
 ```
 
-Two things worth knowing:
+Three things worth knowing:
 
 - The abandoned tier's **conversation is discarded**, so the next tier never inherits
   a half-finished answer.
 - Its **side effects are not**. If the tier that stalled already wrote a file or ran
   a command, that happened. Those results stay in the history so the next tier can
   see what was already done.
+- A `cli` tier's **session is dropped** too, so it starts a fresh conversation next
+  time rather than resuming one that holds the answer that was thrown away.
 
 ## One-shot use
 
@@ -285,13 +300,94 @@ you to work it out.
 spill also warns at startup about the things that would otherwise fail silently: a
 key variable that is not set, or an agent CLI that is not on `PATH`.
 
+## Interface
+
+The top line is the tier chain, and it is the part worth watching: the answering tier is
+drawn as a filled block, any tier that was spilled past is marked with a cross, and the
+state word at the far right spins while a turn is in flight. When the chain does not fit,
+the rail shortens the tier names, and then falls back to just the answering tier and its
+position ("2/3") rather than clipping the chain.
+
+Below that is the conversation. The model's markdown is rendered rather than shown raw:
+headings take weight, inline code is styled, a fenced block becomes a framed box with its
+language on the top edge, bullets become dots, and a quote gets a bar down its side. A bar
+down the left marks everything you wrote, so your own turns are findable in a long
+session. Tool calls carry a glyph that says how they went — a spinner while one is
+running, `✓` when it worked, `✗` when it did not, `!` for something worth noticing — and
+the color agrees with the glyph rather than replacing it.
+
+On a terminal 104 columns or wider, a panel on the right shows the chain as a row per tier
+with its state, the working directory, the session's token and cache totals, and a
+sparkline of per-turn spend, which is the only place the real cost of a fallback is
+visible. On a narrower terminal the conversation takes that space and the active tier
+moves down to the footer instead.
+
+The prompt leads with `❯`, so the line you type on reads as a command line rather than as
+text that happens to sit in a box.
+
 ## Keyboard
 
-`Enter` send · `Esc` or `Ctrl-C` quit · `PageUp` / `PageDown` scroll the transcript
+`Enter` send · `Shift+Tab` switch mode · `Esc` or `Ctrl-C` quit · `PageUp` / `PageDown` scroll
 
 Before anything that can change your files, a prompt appears showing exactly what it
 will do. `y` runs it, `n` skips it — and the model is told it was declined, so it can
 try another way rather than repeating itself.
+
+## Modes
+
+`Shift+Tab` switches between two ways to work. `Tab` does the same whenever you are not
+part-way through typing a command.
+
+**build** is the default: it reads, writes files and runs commands, asking first.
+
+**plan** is read-only. Ask it to look into something and you get a plan — what it would
+change, file by file, in what order, and what it needs decided first — instead of an
+edit. While plan mode is on, the prompt box is drawn in the warning colour and says
+`plan`, so the mode you are in is never a guess.
+
+The guarantee is not a request in a prompt. In plan mode the write tools are not offered
+to the model at all, and if one is named anyway — a hallucinated tool, or a habit carried
+over from build mode — the call is refused before it reaches the disk. The model is told
+why, so it can get on with the plan rather than retrying.
+
+## Commands
+
+Type `/` to open the menu of everything below. `?` shows them alongside every key.
+
+The ones worth knowing are the ones about the chain, because they are what a
+single-model agent cannot offer:
+
+| Command | What it does |
+| --- | --- |
+| `/tier` | Show the chain, with each tier's number and state |
+| `/tier <name\|number>` | Answer from that tier until told otherwise |
+| `/tier auto` | Go back to the configured order |
+| `/escalate` | Spill to the next tier now, without waiting for a stall |
+| `/retry [tier]` | Send the last turn again, here or somewhere else |
+| `/drop` | Discard the active tier's own conversation and start it fresh |
+| `/sticky <on\|off>` | Whether a spill keeps the lower tier for the session |
+| `/cost` | Tokens and cache reads so far, tier by tier |
+| `/context` | What actually gets sent on each turn, and how large it has grown |
+| `/compact` | Fold earlier turns into a short ledger to shrink what is sent |
+| `/clear` | Start a new conversation, keeping the tiers as they are |
+| `/help`, `/quit` | The obvious two |
+
+Two details that matter:
+
+- A slash only means a command at the **start of a line**, and only for a name we
+  know. So "what is in `/usr/local/bin`" is a question, not an instruction. Write
+  `//` to start a message with a literal slash.
+- `/compact` is deterministic rather than a model summary: it keeps the last few
+  turns and replaces the rest with a one-line-per-action ledger — including which
+  tools ran, because a file that was written stays written. It costs nothing, it
+  works while the active tier is misbehaving, and it declines to act if the ledger
+  would be larger than what it replaces. Because it changes the shape of the
+  history, it also drops every tier's own session, so nothing continues a
+  conversation that no longer exists.
+
+Running low on context is not something you have to notice: when a tier is
+abandoned and the session has grown past a few turns, the history is compacted as
+part of spilling over, so the next tier starts from something small.
 
 ## Status
 
@@ -305,8 +401,6 @@ Not yet:
 - **The AUR package** is written but not submitted, so `yay -S spill-bin` does not
   work yet.
 - Windows `winget` and `scoop` manifests.
-- Per-tier CLI session resumption: a CLI fallback gets the whole conversation each
-  turn rather than continuing its own session.
 - `spill setup` offers hosted endpoints but does not yet validate a model id that was
   typed by hand rather than picked from the list.
 

@@ -9,6 +9,23 @@ pub fn display_width(text: &str) -> usize {
         .sum()
 }
 
+/// Group a number in threes, so six figures can be read at a glance.
+pub fn thousands(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+
+    for (index, ch) in digits.chars().enumerate() {
+        // A separator goes before every third digit, counting from the right.
+        let from_end = digits.len() - index;
+        if index > 0 && from_end % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+
+    out
+}
+
 /// Split `text` into lines no wider than `width` cells.
 ///
 /// Breaks on spaces where possible and hard-splits a word that cannot fit on a
@@ -159,6 +176,18 @@ mod tests {
     #[test]
     fn strips_control_characters() {
         assert_eq!(wrap("a\rb", 10), vec!["ab"]);
+    }
+
+    #[test]
+    fn thousands_groups_in_threes() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(7), "7");
+        assert_eq!(thousands(999), "999");
+        assert_eq!(thousands(1_000), "1,000");
+        assert_eq!(thousands(15_360), "15,360");
+        assert_eq!(thousands(999_999), "999,999");
+        assert_eq!(thousands(1_000_000), "1,000,000");
+        assert_eq!(thousands(u64::MAX), "18,446,744,073,709,551,615");
     }
 
     #[test]

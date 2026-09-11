@@ -31,6 +31,20 @@ pub enum Risk {
     Write,
 }
 
+impl Risk {
+    /// Whether tools up to this level may be used.
+    ///
+    /// This is the ceiling a run is held to, not the risk of one tool: a run
+    /// allowed `Read` may only use tools that read, which is how a read-only
+    /// mode is enforced rather than merely requested.
+    pub fn permits(self, needed: Risk) -> bool {
+        match self {
+            Risk::Write => true,
+            Risk::Read => needed == Risk::Read,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ToolOutcome {
     pub content: String,
@@ -107,12 +121,22 @@ impl Registry {
             .map(|tool| tool.as_ref())
     }
 
-    pub fn specs(&self) -> Vec<ToolSpec> {
-        self.tools.iter().map(|tool| tool.spec()).collect()
-    }
-
-    pub fn names(&self) -> Vec<&'static str> {
-        self.tools.iter().map(|tool| tool.name()).collect()
+    /// The specs for a run held to `ceiling`.
+    ///
+    /// There is deliberately no accessor that ignores the ceiling: listing
+    /// tools is only ever done to offer them to a model, and which tools may be
+    /// offered is exactly what the ceiling decides.
+    ///
+    /// A read-only run is never offered a write tool, so the model does not
+    /// spend turns reaching for one and being refused. That refusal still
+    /// happens — see the check in the agent loop — because withholding the
+    /// offer is a courtesy to a well-behaved model, not a guarantee.
+    pub fn specs_permitting(&self, ceiling: Risk) -> Vec<ToolSpec> {
+        self.tools
+            .iter()
+            .filter(|tool| ceiling.permits(tool.risk()))
+            .map(|tool| tool.spec())
+            .collect()
     }
 }
 
@@ -231,10 +255,14 @@ pub fn object_schema(properties: Value, required: &[&str]) -> Value {
 mod tests {
     use super::*;
 
+    /// Every spec, which is what a build-mode run is offered.
+    fn all_specs() -> Vec<ToolSpec> {
+        Registry::with_default_tools().specs_permitting(Risk::Write)
+    }
+
     #[test]
     fn the_default_registry_offers_every_tool() {
-        let registry = Registry::with_default_tools();
-        let mut names = registry.names();
+        let mut names: Vec<String> = all_specs().into_iter().map(|spec| spec.name).collect();
         names.sort_unstable();
         assert_eq!(
             names,
@@ -252,8 +280,7 @@ mod tests {
 
     #[test]
     fn every_tool_declares_a_spec_the_model_can_read() {
-        let registry = Registry::with_default_tools();
-        for spec in registry.specs() {
+        for spec in all_specs() {
             assert!(!spec.name.is_empty());
             assert!(
                 !spec.description.is_empty(),
@@ -294,6 +321,54 @@ mod tests {
                 .get("delete_everything")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_read_ceiling_withholds_every_tool_that_changes_anything() {
+        let registry = Registry::with_default_tools();
+        let mut offered: Vec<String> = registry
+            .specs_permitting(Risk::Read)
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect();
+        offered.sort();
+
+        assert_eq!(offered, vec!["glob", "grep", "list_dir", "read_file"]);
+        // The three that can change the world are simply not on the table.
+        for absent in ["write_file", "edit_file", "run_shell"] {
+            assert!(
+                !offered.iter().any(|name| name == absent),
+                "{absent} must not be offered in a read-only run"
+            );
+        }
+    }
+
+    #[test]
+    fn a_write_ceiling_withholds_nothing() {
+        let registry = Registry::with_default_tools();
+        let build = registry.specs_permitting(Risk::Write);
+        let plan = registry.specs_permitting(Risk::Read);
+
+        assert!(
+            build.len() > plan.len(),
+            "the write ceiling must offer more than the read one"
+        );
+        for name in ["write_file", "edit_file", "run_shell"] {
+            assert!(
+                build.iter().any(|spec| spec.name == name),
+                "{name} is missing from a write-ceiling run"
+            );
+        }
+        // And nothing is dropped by a write ceiling that the registry holds.
+        assert_eq!(build.len(), 7);
+    }
+
+    #[test]
+    fn the_risk_ceiling_permits_exactly_what_it_says() {
+        assert!(Risk::Read.permits(Risk::Read));
+        assert!(!Risk::Read.permits(Risk::Write));
+        assert!(Risk::Write.permits(Risk::Read));
+        assert!(Risk::Write.permits(Risk::Write));
     }
 
     #[test]

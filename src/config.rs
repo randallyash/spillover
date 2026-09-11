@@ -149,6 +149,16 @@ pub struct Tier {
     pub approve_args: Vec<String>,
     #[serde(default)]
     pub workdir_args: Vec<String>,
+    /// Flags that open a session under an id spill chooses, with `{session}`
+    /// substituted. Omit for a CLI that mints its own session id.
+    #[serde(default)]
+    pub session_args: Vec<String>,
+    /// Flags that continue the session spill is following, with `{session}`
+    /// substituted. Setting these turns on session continuity for this tier:
+    /// the CLI keeps the conversation and spill sends only the new turn,
+    /// instead of flattening the whole transcript into every prompt.
+    #[serde(default)]
+    pub resume_args: Vec<String>,
     /// Overrides the dialect the preset would use.
     #[serde(default)]
     pub dialect: Option<Dialect>,

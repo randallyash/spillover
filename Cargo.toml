@@ -54,6 +54,9 @@ unicode-width = "0.2"
 regex = "1"
 walkdir = "2"
 glob = "0.3"
+# Session ids for CLI tiers. A CLI that lets us choose its session id needs a
+# real UUID, and this is already in the tree.
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tempfile = "3"

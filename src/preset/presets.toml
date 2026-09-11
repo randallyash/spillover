@@ -68,6 +68,13 @@ api_key_env = "HF_TOKEN"
 #
 # `dialect` says how to read their output. `plain` is the default print mode of
 # most of these, and is what makes an unlisted CLI still usable.
+#
+# `session_args` / `resume_args` turn on session continuity, which is the
+# difference between sending the new turn and re-sending the whole conversation
+# on every turn. Both take `{session}`. A CLI that lets us name the session gets
+# `session_args` to open one; a CLI that picks its own gets only `resume_args`,
+# and the id is read out of its output. Neither is shipped speculatively: a
+# preset without them works exactly as it did, sending the whole transcript.
 
 [[cli]]
 id = "command-code"
@@ -78,6 +85,10 @@ args = ["-p", "{prompt}"]
 model_args = ["-m", "{model}"]
 extra_args = ["--output-format", "json"]
 approve_args = ["--yolo"]
+# `cmd` has no flag to name a new session, but it prints the `sessionId` it chose
+# on its `run_start` event, and `--session <id>` resumes that transcript. So the
+# second turn onwards continues the conversation instead of resending it.
+resume_args = ["--session", "{session}"]
 models = ["deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro"]
 note = "Uses your Command Code plan. --yolo lets it edit files unattended."
 
@@ -91,6 +102,9 @@ model_args = ["-m", "{model}"]
 extra_args = ["--output-format", "streaming-json"]
 approve_args = ["--always-approve"]
 workdir_args = ["--cwd", "{workspace}"]
+# `-s` opens a session under a UUID we choose; `-r` resumes it.
+session_args = ["-s", "{session}"]
+resume_args = ["-r", "{session}"]
 models = ["grok-4.6", "grok-4.5"]
 note = "Uses your SuperGrok login from ~/.grok."
 

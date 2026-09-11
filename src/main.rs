@@ -2,6 +2,7 @@
 
 mod agent;
 mod app;
+mod commands;
 mod config;
 mod detect;
 mod doctor;
@@ -192,6 +193,13 @@ async fn main() {
     std::process::exit(outcome.exit_code());
 }
 
+/// How often the interface redraws while a turn is running.
+///
+/// Fast enough that the spinner reads as motion rather than as a sequence of
+/// stills, slow enough that a redraw is nothing next to the model it is waiting
+/// on.
+const TICK: std::time::Duration = std::time::Duration::from_millis(90);
+
 async fn run(mut config: Config) -> io::Result<()> {
     // Nothing configured. Look for a model that is already running before
     // asking anyone anything, and only interrupt with setup if there is nothing
@@ -243,7 +251,7 @@ async fn run(mut config: Config) -> io::Result<()> {
     let mut approvals = None;
     match start_agent(&config).await {
         AgentStart::Ready(channels) => {
-            app.attach(channels.commands, &channels.tier, channels.warning);
+            app.attach(channels.commands, &channels.tier_labels, channels.warning);
             agent_events = Some(channels.events);
             approvals = Some(channels.approvals);
         }
@@ -258,6 +266,11 @@ async fn run(mut config: Config) -> io::Result<()> {
 
     let (tx, mut input_rx) = mpsc::unbounded_channel::<InputEvent>();
     event::spawn_input_thread(tx);
+
+    let mut ticker = tokio::time::interval(TICK);
+    // A redraw missed because the loop was busy should be skipped rather than
+    // replayed in a burst to catch up.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         terminal.draw(|frame| ui::draw(frame, &mut app))?;
@@ -281,6 +294,18 @@ async fn run(mut config: Config) -> io::Result<()> {
                 // The agent has gone; stop listening rather than spinning on a
                 // closed channel.
                 None => approvals = None,
+            },
+            // The spinner and the streaming caret are the only things here that
+            // move without input, so the timer runs only while a turn is in
+            // flight. An idle app redraws no more often than it ever did.
+            //
+            // It is polled ahead of the agent's events on purpose: while a model
+            // is streaming, those events can arrive faster than a frame, and
+            // `biased` would let them win every time and freeze the caret that
+            // exists to show the stream is still alive. A tick that is not due
+            // yet costs nothing and falls through to the next branch.
+            _ = ticker.tick(), if app.busy => {
+                app.tick = app.tick.wrapping_add(1);
             },
             event = next_or_pending(&mut agent_events) => match event {
                 Some(event) => app.handle_agent_event(event),
@@ -308,11 +333,12 @@ async fn next_or_pending<T>(slot: &mut Option<UnboundedReceiver<T>>) -> Option<T
 }
 
 struct AgentChannels {
-    commands: UnboundedSender<String>,
+    commands: UnboundedSender<crate::agent::Command>,
     events: UnboundedReceiver<AgentEvent>,
     approvals: UnboundedReceiver<ApprovalRequest>,
-    /// The chain, in order, for the transcript.
-    tier: String,
+    /// The chain, in order, under the labels the agent reports tiers by, so the
+    /// header rail can tell which one is answering.
+    tier_labels: Vec<String>,
     /// Anything the user should know about tiers that were left out.
     warning: Option<String>,
 }
@@ -344,7 +370,7 @@ async fn start_agent(config: &Config) -> AgentStart {
         Some(chain) => chain,
         None => return AgentStart::Unavailable("no usable tiers".to_string()),
     };
-    let summary = chain.labels().join("  →  ");
+    let tier_labels = chain.labels();
 
     let (approval_tx, approval_rx) = mpsc::unbounded_channel();
     let (commands, events) = crate::agent::spawn(
@@ -361,7 +387,7 @@ async fn start_agent(config: &Config) -> AgentStart {
         commands,
         events,
         approvals: approval_rx,
-        tier: summary,
+        tier_labels,
         warning,
     }))
 }

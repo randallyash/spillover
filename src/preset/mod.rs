@@ -54,6 +54,13 @@ pub struct Cli {
     pub approve_args: Vec<String>,
     #[serde(default)]
     pub workdir_args: Vec<String>,
+    /// Flags that open a session under an id spill chooses, `{session}`
+    /// substituted. Empty when the CLI mints its own session id.
+    #[serde(default)]
+    pub session_args: Vec<String>,
+    /// Flags that continue a session, `{session}` substituted.
+    #[serde(default)]
+    pub resume_args: Vec<String>,
     /// Models worth offering in the wizard. Empty means "the CLI's own default".
     #[serde(default)]
     pub models: Vec<String>,
@@ -272,6 +279,14 @@ pub fn cli_spec(library: &Library, tier: &Tier) -> Result<CliSpec, PresetError> 
             &tier.workdir_args,
             preset.map(|preset| preset.workdir_args.as_slice()),
         ),
+        session_args: choose(
+            &tier.session_args,
+            preset.map(|preset| preset.session_args.as_slice()),
+        ),
+        resume_args: choose(
+            &tier.resume_args,
+            preset.map(|preset| preset.resume_args.as_slice()),
+        ),
         approve_all: tier.approve_all,
         model: tier.model.clone().filter(|model| !model.trim().is_empty()),
         dialect: tier
@@ -371,7 +386,9 @@ mod tests {
                 .chain(&preset.model_args)
                 .chain(&preset.extra_args)
                 .chain(&preset.approve_args)
-                .chain(&preset.workdir_args);
+                .chain(&preset.workdir_args)
+                .chain(&preset.session_args)
+                .chain(&preset.resume_args);
             for arg in all {
                 let mut rest = arg.as_str();
                 while let Some(start) = rest.find('{') {
@@ -380,7 +397,7 @@ mod tests {
                     };
                     let name = &rest[start + 1..start + end];
                     assert!(
-                        ["prompt", "model", "workspace"].contains(&name),
+                        ["prompt", "model", "workspace", "session"].contains(&name),
                         "{} uses unknown placeholder {{{name}}}",
                         preset.id
                     );
@@ -469,6 +486,66 @@ args = ["--once", "{prompt}"]"#,
         .expect("a hand-written cli tier should work");
         assert_eq!(spec.bin, "my-agent");
         assert_eq!(spec.dialect, Dialect::Plain, "plain is the safe default");
+    }
+
+    #[test]
+    fn a_preset_that_can_name_a_session_ships_both_flags() {
+        let library = Library::embedded();
+        let spec = cli_spec(&library, &tier(r#"preset = "grok""#)).expect("grok should resolve");
+
+        assert!(spec.continues_sessions());
+        assert!(spec.session_args.contains(&"{session}".to_string()));
+        assert!(spec.resume_args.contains(&"{session}".to_string()));
+        assert!(
+            !spec.captures_session(),
+            "grok takes the UUID we hand it, so there is nothing to read back"
+        );
+    }
+
+    #[test]
+    fn a_preset_that_cannot_name_a_session_still_resumes_one() {
+        let library = Library::embedded();
+        let spec =
+            cli_spec(&library, &tier(r#"preset = "command-code""#)).expect("cmd should resolve");
+
+        assert!(spec.continues_sessions());
+        assert!(
+            spec.session_args.is_empty(),
+            "cmd has no flag to open a session under a chosen id"
+        );
+        assert!(
+            spec.captures_session(),
+            "so the id must be read from what it prints"
+        );
+    }
+
+    #[test]
+    fn a_preset_with_no_session_flags_sends_the_whole_transcript() {
+        let library = Library::embedded();
+        let spec =
+            cli_spec(&library, &tier(r#"preset = "claude""#)).expect("claude should resolve");
+        assert!(
+            !spec.continues_sessions(),
+            "continuity is opt-in per preset, never assumed"
+        );
+    }
+
+    #[test]
+    fn session_continuity_is_off_when_a_tier_is_written_longhand() {
+        let library = Library::embedded();
+        // The escape hatch from a preset's session flags: name the binary and
+        // the arguments yourself. An empty list falls back to the preset, so
+        // writing it out is how a tier declines continuity.
+        let spec = cli_spec(
+            &library,
+            &tier(
+                r#"bin = "grok"
+args = ["-p", "{prompt}", "-m", "grok-4.6"]"#,
+            ),
+        )
+        .expect("a hand-written tier needs no preset");
+
+        assert!(!spec.continues_sessions());
     }
 
     #[test]

@@ -25,6 +25,17 @@ pub enum StreamEvent {
 pub struct Usage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    /// Prompt tokens the provider served from its prompt cache. Every provider
+    /// with a cache bills these at a discount, so they are the difference
+    /// between a cheap turn and an expensive one rather than a curiosity.
+    ///
+    /// Whether these are *part of* `prompt_tokens` or additional to it differs
+    /// by provider — OpenAI counts them in, Anthropic does not — so the two are
+    /// reported as they arrived and never added together here.
+    pub cache_read_tokens: u64,
+    /// Prompt tokens this request wrote into the cache, billed at a premium by
+    /// the providers that charge for the write.
+    pub cache_write_tokens: u64,
 }
 
 /// What a completed turn produced.
@@ -34,6 +45,12 @@ pub struct TurnSummary {
     pub tool_calls: Vec<ToolCall>,
     pub stop_reason: Option<String>,
     pub usage: Option<Usage>,
+    /// The session the CLI ran under, when it names one in its own output.
+    ///
+    /// A CLI that mints its own session id (Command Code) reports it here so the
+    /// next turn can continue that session instead of resending the whole
+    /// conversation.
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -94,6 +111,13 @@ pub trait Provider: Send + Sync {
         request: ChatRequest,
         events: UnboundedSender<StreamEvent>,
     ) -> Result<TurnSummary, ProviderError>;
+
+    /// Forget any continued session, because this tier's conversation was
+    /// discarded and it must not resume one that holds that output.
+    ///
+    /// A stateless provider has nothing to forget, which is why this does
+    /// nothing by default.
+    fn forget_session(&self) {}
 }
 
 /// Read token counts from either the Chat Completions or the Messages naming.
@@ -110,11 +134,40 @@ pub fn read_usage(value: &serde_json::Value) -> Option<Usage> {
     let prompt = read(&["prompt_tokens", "input_tokens", "inputTokens"]);
     let completion = read(&["completion_tokens", "output_tokens", "outputTokens"]);
 
-    match (prompt, completion) {
-        (None, None) => None,
-        (prompt, completion) => Some(Usage {
+    // OpenAI puts its cache figure one level down, under the prompt details.
+    let nested = |path: [&str; 2]| {
+        value
+            .get(path[0])
+            .and_then(|inner| inner.get(path[1]))
+            .and_then(serde_json::Value::as_u64)
+    };
+
+    let cache_read = read(&[
+        "cacheReadTokens",
+        "cache_read_tokens",
+        "cache_read_input_tokens",
+        "cached_tokens",
+        "prompt_cache_hit_tokens",
+    ])
+    .or_else(|| nested(["prompt_tokens_details", "cached_tokens"]))
+    .or_else(|| nested(["input_tokens_details", "cached_tokens"]));
+
+    let cache_write = read(&[
+        "cacheWriteTokens",
+        "cache_write_tokens",
+        "cache_creation_input_tokens",
+        "prompt_cache_miss_tokens",
+    ]);
+
+    match (prompt, completion, cache_read, cache_write) {
+        // Nothing recognised. A cache-only object is still recognised: it says
+        // something true about the turn even without a token count.
+        (None, None, None, None) => None,
+        (prompt, completion, cache_read, cache_write) => Some(Usage {
             prompt_tokens: prompt.unwrap_or(0),
             completion_tokens: completion.unwrap_or(0),
+            cache_read_tokens: cache_read.unwrap_or(0),
+            cache_write_tokens: cache_write.unwrap_or(0),
         }),
     }
 }
@@ -152,6 +205,63 @@ mod tests {
         let usage = read_usage(&json!({"output_tokens": 5})).expect("usage");
         assert_eq!(usage.prompt_tokens, 0);
         assert_eq!(usage.completion_tokens, 5);
+    }
+
+    #[test]
+    fn reads_command_codes_cache_counts() {
+        // The exact shape of a real `cmd -p --output-format json` result frame.
+        let usage = read_usage(&json!({
+            "inputTokens": 15360,
+            "outputTokens": 2,
+            "cacheReadTokens": 7424,
+            "cacheWriteTokens": 0,
+        }))
+        .expect("usage");
+        assert_eq!(usage.prompt_tokens, 15360);
+        assert_eq!(usage.completion_tokens, 2);
+        assert_eq!(usage.cache_read_tokens, 7424);
+        assert_eq!(usage.cache_write_tokens, 0);
+    }
+
+    #[test]
+    fn reads_anthropic_style_cache_counts() {
+        let usage = read_usage(&json!({
+            "input_tokens": 100,
+            "output_tokens": 5,
+            "cache_read_input_tokens": 800,
+            "cache_creation_input_tokens": 50,
+        }))
+        .expect("usage");
+        assert_eq!(usage.cache_read_tokens, 800);
+        assert_eq!(usage.cache_write_tokens, 50);
+    }
+
+    #[test]
+    fn reads_openais_nested_cache_count() {
+        let usage = read_usage(&json!({
+            "prompt_tokens": 1000,
+            "completion_tokens": 20,
+            "prompt_tokens_details": {"cached_tokens": 768},
+        }))
+        .expect("usage");
+        assert_eq!(usage.prompt_tokens, 1000);
+        assert_eq!(usage.cache_read_tokens, 768);
+    }
+
+    #[test]
+    fn a_cache_only_usage_object_is_not_discarded() {
+        // No token counts, but it still says something true about the turn.
+        let usage = read_usage(&json!({"cacheReadTokens": 4096})).expect("usage");
+        assert_eq!(usage.cache_read_tokens, 4096);
+        assert_eq!(usage.prompt_tokens, 0);
+    }
+
+    #[test]
+    fn a_provider_with_no_cache_reports_zero_rather_than_nothing() {
+        let usage =
+            read_usage(&json!({"prompt_tokens": 10, "completion_tokens": 1})).expect("usage");
+        assert_eq!(usage.cache_read_tokens, 0);
+        assert_eq!(usage.cache_write_tokens, 0);
     }
 
     #[test]

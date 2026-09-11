@@ -321,6 +321,9 @@ impl StreamAccumulator {
             tool_calls,
             stop_reason: self.stop_reason,
             usage: self.usage,
+            // A chat-completions endpoint is stateless: the caller resends the
+            // whole conversation every turn, so there is no session to continue.
+            session_id: None,
         }
     }
 }

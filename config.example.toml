@@ -75,3 +75,23 @@ max_repeat_run = 4
 #
 # `approve_all` is off unless you set it. Turning it on lets a tier run its CLI
 # without its own permission prompts, so it can change files unattended.
+#
+# Session continuity for a `cli` tier. A CLI tier normally receives the whole
+# conversation flattened into its prompt on every turn, which means re-sending
+# everything the earlier turns established each time. Naming the session flags
+# lets the CLI keep the conversation and spill send only the new turn.
+#
+# Both take `{session}`. A CLI that lets you choose the id gets session_args to
+# open one; a CLI that picks its own gets only resume_args, and the id is read
+# out of its output. The shipped `grok` and `command-code` presets already set
+# these, so this is only needed for a CLI that is not in the preset library.
+#
+# [[tier]]
+# id = "grok"
+# kind = "cli"
+# preset = "grok"
+# session_args = ["-s", "{session}"]
+# resume_args = ["-r", "{session}"]
+#
+# Leaving both off is a supported arrangement, not a broken one: the tier works
+# exactly as it did before, sending the whole transcript every turn.

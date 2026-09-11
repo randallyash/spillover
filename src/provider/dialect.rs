@@ -62,11 +62,15 @@ impl Parser for PlainParser {
 
 /// Command Code prints `{"type":"event",…}` frames as it works and one
 /// `{"type":"result",…}` line carrying `finalText` at the end.
+///
+/// It mints its own session id and names it in the `run_start` event and again
+/// on the result line, so it is picked up here for the next turn to resume.
 #[derive(Default)]
 pub struct CommandCodeParser {
     text: String,
     stop_reason: Option<String>,
     usage: Option<Usage>,
+    session_id: Option<String>,
     error: Option<String>,
 }
 
@@ -92,6 +96,9 @@ impl Parser for CommandCodeParser {
                 if let Some(usage) = value.get("usage").filter(|usage| !usage.is_null()) {
                     self.usage = read_usage(usage);
                 }
+                if let Some(id) = value.get("sessionId").and_then(Value::as_str) {
+                    self.session_id = Some(id.to_string());
+                }
                 if value.get("subtype").and_then(Value::as_str) == Some("error") {
                     self.error = Some(
                         value
@@ -108,6 +115,12 @@ impl Parser for CommandCodeParser {
                 // it works, so the run is visible as it happens rather than
                 // appearing all at once at the end.
                 let inner = value.get("event");
+                if let Some(id) = inner
+                    .and_then(|inner| inner.get("sessionId"))
+                    .and_then(Value::as_str)
+                {
+                    self.session_id = Some(id.to_string());
+                }
                 let is_delta = inner
                     .and_then(|inner| inner.get("type"))
                     .and_then(Value::as_str)
@@ -137,6 +150,7 @@ impl Parser for CommandCodeParser {
             text: self.text,
             stop_reason: self.stop_reason,
             usage: self.usage,
+            session_id: self.session_id,
             ..TurnSummary::default()
         })
     }
@@ -331,6 +345,44 @@ mod tests {
             &[r#"{"type":"result","subtype":"error","error":"not signed in","finalText":""}"#],
         );
         assert_eq!(parser.finish().expect_err("should fail"), "not signed in");
+    }
+
+    /// The whole of a real `cmd -p "…" --output-format json` run, recorded
+    /// verbatim: 30 frames, including the bookkeeping and the `run_end` state
+    /// dump that the parser has to pass over without leaking into the answer.
+    const RECORDED_RUN: &str = include_str!("fixtures/cmd-stream.jsonl");
+
+    #[test]
+    fn a_recorded_command_code_run_is_read_end_to_end() {
+        let mut parser = parser_for(Dialect::CommandCode);
+        let mut events = Vec::new();
+        for line in RECORDED_RUN.lines() {
+            events.extend(parser.line(line));
+        }
+
+        // The thinking deltas are the bulk of the recording, and none of them
+        // may reach the transcript as answer text.
+        assert_eq!(
+            text_of(&events),
+            "hello",
+            "only the text_delta carries the answer"
+        );
+
+        let summary = parser.finish().expect("the recorded run succeeded");
+        assert_eq!(summary.text, "hello");
+        assert_eq!(summary.stop_reason.as_deref(), Some("end_turn"));
+
+        let usage = summary.usage.expect("the result line carries usage");
+        assert_eq!(usage.prompt_tokens, 15329);
+        assert_eq!(usage.completion_tokens, 18);
+        assert_eq!(usage.cache_read_tokens, 5632);
+        assert_eq!(usage.cache_write_tokens, 0);
+
+        assert_eq!(
+            summary.session_id.as_deref(),
+            Some("5d978fce-0cb0-4069-9635-c3cec5bbe020"),
+            "the id to resume this conversation with"
+        );
     }
 
     #[test]

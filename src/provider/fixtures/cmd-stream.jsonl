@@ -1,0 +1,30 @@
+{"type":"event","event":{"type":"run_start","sessionId":"5d978fce-0cb0-4069-9635-c3cec5bbe020"}}
+{"type":"event","event":{"type":"turn_start","turnNumber":1}}
+{"type":"event","event":{"type":"message_start"}}
+{"type":"event","event":{"type":"model_request_start","model":"deepseek/deepseek-v4-flash"}}
+{"type":"event","event":{"type":"model_trace","traceId":"790fdfaeee21e0ac702f001a50079da3"}}
+{"type":"event","event":{"type":"thinking_start"}}
+{"type":"event","event":{"type":"thinking_delta","delta":"The"}}
+{"type":"event","event":{"type":"thinking_delta","delta":" user"}}
+{"type":"event","event":{"type":"thinking_delta","delta":" wants"}}
+{"type":"event","event":{"type":"thinking_delta","delta":" me"}}
+{"type":"event","event":{"type":"thinking_delta","delta":" to"}}
+{"type":"event","event":{"type":"thinking_delta","delta":" reply"}}
+{"type":"event","event":{"type":"thinking_delta","delta":" with"}}
+{"type":"event","event":{"type":"thinking_delta","delta":" exactly"}}
+{"type":"event","event":{"type":"thinking_delta","delta":" \""}}
+{"type":"event","event":{"type":"thinking_delta","delta":"hello"}}
+{"type":"event","event":{"type":"thinking_delta","delta":"\""}}
+{"type":"event","event":{"type":"thinking_delta","delta":" and"}}
+{"type":"event","event":{"type":"thinking_delta","delta":" not"}}
+{"type":"event","event":{"type":"thinking_delta","delta":" use"}}
+{"type":"event","event":{"type":"thinking_delta","delta":" tools"}}
+{"type":"event","event":{"type":"thinking_delta","delta":"."}}
+{"type":"event","event":{"type":"thinking_end","text":"The user wants me to reply with exactly \"hello\" and not use tools."}}
+{"type":"event","event":{"type":"text_delta","delta":"hello"}}
+{"type":"event","event":{"type":"message_update","content":[{"type":"thinking","thinking":"The user wants me to reply with exactly \"hello\" and not use tools.","signature":""},{"type":"text","text":"hello"}]}}
+{"type":"event","event":{"type":"model_request_end","model":"deepseek/deepseek-v4-flash","usage":{"inputTokens":15329,"outputTokens":18,"cacheReadTokens":5632,"cacheWriteTokens":0},"stopReason":"stop"}}
+{"type":"event","event":{"type":"message_end","content":[{"type":"thinking","thinking":"The user wants me to reply with exactly \"hello\" and not use tools.","signature":""},{"type":"text","text":"hello"}]}}
+{"type":"event","event":{"type":"turn_end","turnNumber":1,"hadToolCalls":false,"usage":{"inputTokens":15329,"outputTokens":18,"cacheReadTokens":5632,"cacheWriteTokens":0}}}
+{"type":"event","event":{"type":"run_end","result":{"finalText":"hello","stopReason":"end_turn","turnCount":1,"usage":{"inputTokens":15329,"outputTokens":18,"cacheReadTokens":5632,"cacheWriteTokens":0},"systemPromptTokens":null,"nextState":{"sessionId":"5d978fce-0cb0-4069-9635-c3cec5bbe020","messages":[{"role":"user","content":[{"type":"text","text":"Reply with exactly: hello. Do not use any tools."}],"meta":{"source":"user","createdAt":1789136860858,"messageId":"fc0244a1-b5f9-4ad6-a8a8-bf24a27e3fac"}},{"role":"assistant","content":[{"type":"thinking","thinking":"The user wants me to reply with exactly \"hello\" and not use tools.","signature":""},{"type":"text","text":"hello"}],"meta":{"source":"model","createdAt":1789136863250,"messageId":"991522e2-cb25-4f0e-aef9-24267fa14ded"}}],"interrupted":false,"modState":{"workspace":{"cwd":"/tmp/commandcode-1000/-home-ramzal/f723999d-db3e-4f38-a281-1933e4207f9c/scratchpad","platform":"linux","branch":null,"gitStatus":null,"recentCommits":[],"additionalDirectories":[]},"compaction":{"tokens":15366,"basis":{"role":"assistant","content":[{"type":"thinking","thinking":"The user wants me to reply with exactly \"hello\" and not use tools.","signature":""},{"type":"text","text":"hello"}],"meta":{"source":"model","createdAt":1789136863250,"messageId":"991522e2-cb25-4f0e-aef9-24267fa14ded"}}}}}}}}
+{"type":"result","subtype":"success","sessionId":"5d978fce-0cb0-4069-9635-c3cec5bbe020","stopReason":"end_turn","usage":{"inputTokens":15329,"outputTokens":18,"cacheReadTokens":5632,"cacheWriteTokens":0},"durationMs":2487,"finalText":"hello"}

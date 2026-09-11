@@ -59,6 +59,8 @@ impl Outcome {
             "usage": self.usage.map(|usage| json!({
                 "inputTokens": usage.prompt_tokens,
                 "outputTokens": usage.completion_tokens,
+                "cacheReadTokens": usage.cache_read_tokens,
+                "cacheWriteTokens": usage.cache_write_tokens,
             })),
             "error": self.failure,
         });
@@ -105,7 +107,10 @@ pub async fn run(library: &Library, config: &Config, options: &Options) -> Outco
         approver,
     );
 
-    if commands.send(options.prompt.clone()).is_err() {
+    if commands
+        .send(crate::agent::Command::Prompt(options.prompt.clone()))
+        .is_err()
+    {
         return Outcome {
             failure: Some("the agent stopped before it could run".to_string()),
             ..Outcome::default()

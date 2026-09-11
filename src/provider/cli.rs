@@ -7,6 +7,7 @@
 
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Mutex;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -23,8 +24,8 @@ const MAX_STDERR: usize = 1_500;
 #[derive(Debug, Clone)]
 pub struct CliSpec {
     pub bin: String,
-    /// Argument templates. `{prompt}`, `{model}` and `{workspace}` are
-    /// substituted, each into its own argument.
+    /// Argument templates. `{prompt}`, `{model}`, `{workspace}` and `{session}`
+    /// are substituted, each into its own argument.
     pub args: Vec<String>,
     /// Added only when a model is configured.
     pub model_args: Vec<String>,
@@ -33,34 +34,124 @@ pub struct CliSpec {
     pub approve_args: Vec<String>,
     /// Added after everything else, for CLIs that want the directory spelled out.
     pub workdir_args: Vec<String>,
+    /// Flags that open a session under an id spill chooses, with `{session}`
+    /// substituted. Empty for a CLI that mints its own id.
+    pub session_args: Vec<String>,
+    /// Flags that continue the session spill is following, with `{session}`
+    /// substituted.
+    ///
+    /// Empty means "this tier cannot continue a session", which switches the
+    /// whole mechanism off: the CLI is then handed the full transcript on every
+    /// turn, exactly as before.
+    pub resume_args: Vec<String>,
     pub approve_all: bool,
     pub model: Option<String>,
     pub dialect: Dialect,
+}
+
+impl CliSpec {
+    /// Whether this tier continues a session across turns at all.
+    pub fn continues_sessions(&self) -> bool {
+        !self.resume_args.is_empty()
+    }
+
+    /// Whether the CLI picks its own session id and reports it, rather than
+    /// taking one from us.
+    ///
+    /// A CLI we can continue but cannot name must be the one choosing the id,
+    /// so there is nothing to configure: it follows from the flags.
+    pub fn captures_session(&self) -> bool {
+        self.continues_sessions() && self.session_args.is_empty()
+    }
+}
+
+/// What one call should do about sessions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SessionCall {
+    /// No session: a fresh run, with the whole conversation in the prompt.
+    Fresh,
+    /// Open a session under an id we chose.
+    Open(String),
+    /// Continue an existing session, so only the new turn is sent.
+    Continue(String),
 }
 
 pub struct CliProvider {
     display: String,
     spec: CliSpec,
     workspace: PathBuf,
+    /// The session this tier is following, once it has one.
+    ///
+    /// Behind a lock because `Provider::stream` takes `&self` and a tier is
+    /// shared. It is only ever held for a read or a write, never across an
+    /// await.
+    session: Mutex<Option<String>>,
 }
 
 impl CliProvider {
     pub fn new(display: impl Into<String>, spec: CliSpec, workspace: PathBuf) -> Self {
+        let session = Mutex::new(None);
         Self {
             display: display.into(),
             spec,
             workspace,
+            session,
         }
     }
 
-    fn build_args(&self, prompt: &str) -> Vec<String> {
+    /// Decide, and record, which session this call runs under.
+    fn plan_session(&self) -> SessionCall {
+        if !self.spec.continues_sessions() {
+            return SessionCall::Fresh;
+        }
+
+        let existing = self
+            .session
+            .lock()
+            .map(|slot| (*slot).clone())
+            .unwrap_or_default();
+
+        match existing {
+            Some(id) => SessionCall::Continue(id),
+            // No session yet. If we can name one, do; otherwise the CLI picks
+            // its own and we pick it up from the output.
+            None if !self.spec.session_args.is_empty() => {
+                let id = uuid::Uuid::new_v4().to_string();
+                // The flags are already built with this id, so the session
+                // exists as far as the next call is concerned.
+                if let Ok(mut slot) = self.session.lock() {
+                    *slot = Some(id.clone());
+                }
+                SessionCall::Open(id)
+            }
+            None => SessionCall::Fresh,
+        }
+    }
+
+    /// Follow whichever session the CLI says it actually ran, when it mints its
+    /// own rather than taking ours.
+    fn note_session(&self, summary: &TurnSummary) {
+        let Some(id) = summary.session_id.as_deref() else {
+            return;
+        };
+        if let Ok(mut slot) = self.session.lock() {
+            *slot = Some(id.to_string());
+        }
+    }
+
+    fn build_args(&self, prompt: &str, session: &SessionCall) -> Vec<String> {
         let workspace = self.workspace.display().to_string();
         let model = self.spec.model.as_deref().unwrap_or_default();
+        let session_id = match session {
+            SessionCall::Fresh => "",
+            SessionCall::Open(id) | SessionCall::Continue(id) => id,
+        };
 
         let substitute = |arg: &str| {
             arg.replace("{prompt}", prompt)
                 .replace("{workspace}", &workspace)
                 .replace("{model}", model)
+                .replace("{session}", session_id)
         };
 
         let mut args: Vec<String> = self.spec.args.iter().map(|a| substitute(a)).collect();
@@ -68,6 +159,15 @@ impl CliProvider {
             args.extend(self.spec.model_args.iter().map(|a| substitute(a)));
         }
         args.extend(self.spec.extra_args.iter().map(|a| substitute(a)));
+        match session {
+            SessionCall::Fresh => {}
+            SessionCall::Open(_) => {
+                args.extend(self.spec.session_args.iter().map(|a| substitute(a)));
+            }
+            SessionCall::Continue(_) => {
+                args.extend(self.spec.resume_args.iter().map(|a| substitute(a)));
+            }
+        }
         if self.spec.approve_all {
             args.extend(self.spec.approve_args.iter().map(|a| substitute(a)));
         }
@@ -88,8 +188,16 @@ impl Provider for CliProvider {
         events: UnboundedSender<StreamEvent>,
     ) -> Result<TurnSummary, ProviderError> {
         let bin = self.spec.bin.clone();
-        let prompt = render_prompt(&request.messages);
-        let args = self.build_args(&prompt);
+        let session = self.plan_session();
+        // A continued session already holds everything up to this turn, so
+        // resending the transcript would duplicate the whole conversation in
+        // the CLI's context and be billed again on every turn.
+        let prompt = match &session {
+            SessionCall::Continue(_) => last_user_turn(&request.messages)
+                .unwrap_or_else(|| render_prompt(&request.messages)),
+            _ => render_prompt(&request.messages),
+        };
+        let args = self.build_args(&prompt, &session);
 
         let mut child = Command::new(&bin)
             .args(&args)
@@ -174,7 +282,17 @@ impl Provider for CliProvider {
             });
         }
 
+        if self.spec.captures_session() {
+            self.note_session(&summary);
+        }
+
         Ok(summary)
+    }
+
+    fn forget_session(&self) {
+        if let Ok(mut slot) = self.session.lock() {
+            *slot = None;
+        }
     }
 }
 
@@ -215,6 +333,23 @@ pub fn on_path(bin: &str) -> bool {
                 .iter()
                 .any(|extension| directory.join(format!("{bin}.{extension}")).is_file())
     })
+}
+
+/// The newest user turn, which is all a continued session needs.
+///
+/// Everything before it is already in the CLI's own history, so sending it
+/// again would duplicate the conversation rather than extend it.
+///
+/// This is sound because a CLI tier answers in a single call: it runs its own
+/// tool loop and hands no tool calls back, so a turn never makes a second
+/// request that would need the same user message sent again.
+fn last_user_turn(messages: &[ChatMessage]) -> Option<String> {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.role == Role::User)
+        .map(|message| message.content.clone())
+        .filter(|content| !content.trim().is_empty())
 }
 
 /// A CLI takes one prompt, so the conversation is flattened into it.
@@ -301,9 +436,21 @@ mod tests {
             extra_args: Vec::new(),
             approve_args: vec!["--yolo".to_string()],
             workdir_args: Vec::new(),
+            session_args: Vec::new(),
+            resume_args: Vec::new(),
             approve_all: false,
             model: None,
             dialect,
+        }
+    }
+
+    /// A tier that lets us name the session, like grok: `-s` to open, `-r` to
+    /// resume.
+    fn minting_spec(body: &str) -> CliSpec {
+        CliSpec {
+            session_args: vec!["-s".to_string(), "{session}".to_string()],
+            resume_args: vec!["-r".to_string(), "{session}".to_string()],
+            ..spec(body, Dialect::Plain)
         }
     }
 
@@ -484,6 +631,188 @@ mod tests {
         );
     }
 
+    /// A body that reports the session flags it was given and the prompt it was
+    /// handed: with `sh -c body <prompt> <flags…>`, the prompt is `$0` and the
+    /// flags land in `$1` and `$2`.
+    fn echo_body() -> &'static str {
+        r#"printf '%s|%s|%s\n' "$1" "$2" "$0""#
+    }
+
+    fn conversation(question: &str) -> Vec<ChatMessage> {
+        vec![ChatMessage::system("be brief"), ChatMessage::user(question)]
+    }
+
+    async fn turn(provider: &CliProvider, messages: Vec<ChatMessage>) -> TurnSummary {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        provider
+            .stream(
+                ChatRequest {
+                    model: "test-model".to_string(),
+                    messages,
+                    tools: Vec::new(),
+                },
+                tx,
+            )
+            .await
+            .expect("the turn should succeed")
+    }
+
+    /// The next turn, as spill would send it: with the CLI already holding the
+    /// earlier exchange in its own session.
+    fn follow_up(question: &str) -> Vec<ChatMessage> {
+        let mut messages = conversation("first question");
+        messages.push(ChatMessage::assistant("first answer", Vec::new()));
+        messages.push(ChatMessage::user(question));
+        messages
+    }
+
+    #[test]
+    fn session_continuity_follows_from_the_flags() {
+        let mut spec = spec("echo hi", Dialect::Plain);
+        assert!(
+            !spec.continues_sessions(),
+            "off unless a preset asks for it"
+        );
+
+        spec.resume_args = vec!["-r".to_string(), "{session}".to_string()];
+        assert!(spec.continues_sessions());
+        assert!(
+            spec.captures_session(),
+            "with no way to name a session, the CLI must be naming it"
+        );
+
+        spec.session_args = vec!["-s".to_string(), "{session}".to_string()];
+        assert!(spec.continues_sessions());
+        assert!(!spec.captures_session(), "it takes the id we give it");
+    }
+
+    #[test]
+    fn opening_and_resuming_are_mutually_exclusive() {
+        let mut spec = minting_spec("echo hi");
+        spec.approve_all = true;
+        spec.approve_args = vec!["--yolo".to_string()];
+        spec.workdir_args = vec!["--cwd".to_string(), "{workspace}".to_string()];
+        let provider = CliProvider::new("x", spec, PathBuf::from("/tmp"));
+
+        assert_eq!(
+            provider.build_args("hi", &SessionCall::Open("abc".to_string())),
+            vec![
+                "-c", "echo hi", "hi", "-s", "abc", "--yolo", "--cwd", "/tmp"
+            ]
+        );
+        assert_eq!(
+            provider.build_args("hi", &SessionCall::Continue("abc".to_string())),
+            vec![
+                "-c", "echo hi", "hi", "-r", "abc", "--yolo", "--cwd", "/tmp"
+            ]
+        );
+        assert_eq!(
+            provider.build_args("hi", &SessionCall::Fresh),
+            vec!["-c", "echo hi", "hi", "--yolo", "--cwd", "/tmp"],
+            "a fresh call carries no session flags at all"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_we_name_is_opened_once_and_then_resumed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = provider(minting_spec(echo_body()), dir.path());
+
+        let first = turn(&provider, conversation("first question")).await;
+        let opened: Vec<&str> = first.text.split('|').collect();
+        assert_eq!(opened[0], "-s", "the first call opens a session");
+        assert!(
+            uuid::Uuid::parse_str(opened[1]).is_ok(),
+            "the id we hand over must be a UUID: {}",
+            opened[1]
+        );
+        assert!(opened[2].contains("first question"), "{}", opened[2]);
+
+        let resumed: Vec<String> = turn(&provider, follow_up("second question"))
+            .await
+            .text
+            .split('|')
+            .map(str::to_string)
+            .collect();
+
+        assert_eq!(resumed[0], "-r", "the second call resumes");
+        assert_eq!(resumed[1], opened[1], "it resumes the session it opened");
+        assert_eq!(
+            resumed[2], "second question",
+            "only the new turn goes out, not the whole transcript again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_the_cli_names_is_captured_and_then_resumed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // The shape a real `cmd -p --output-format json` run has: the id arrives
+        // on the first frame, and `--session <id>` continues that transcript.
+        let body = r#"
+            if [ -z "$2" ]; then
+              printf '%s\n' '{"type":"event","event":{"type":"run_start","sessionId":"sess-123"}}' '{"type":"result","subtype":"success","stopReason":"end_turn","finalText":"first answer"}'
+            else
+              printf '{"type":"result","subtype":"success","sessionId":"%s","stopReason":"end_turn","finalText":"session=%s prompt=%s"}\n' "$2" "$2" "$0"
+            fi
+        "#;
+        let mut spec = spec(body, Dialect::CommandCode);
+        spec.resume_args = vec!["--session".to_string(), "{session}".to_string()];
+        let provider = provider(spec, dir.path());
+
+        let first = turn(&provider, conversation("first question")).await;
+        assert_eq!(first.text, "first answer");
+
+        let second = turn(&provider, follow_up("second question")).await;
+        assert_eq!(
+            second.text, "session=sess-123 prompt=second question",
+            "the captured id should be resumed, with only the new turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn forgetting_a_session_makes_the_next_turn_start_over() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = provider(minting_spec(echo_body()), dir.path());
+
+        let first = turn(&provider, conversation("first question")).await;
+        let abandoned = first.text.split('|').nth(1).expect("an id").to_string();
+
+        // What the chain does when this tier's turn is thrown away.
+        provider.forget_session();
+
+        let after: Vec<String> = turn(&provider, follow_up("second question"))
+            .await
+            .text
+            .split('|')
+            .map(str::to_string)
+            .collect();
+
+        assert_eq!(after[0], "-s", "it should open a session, not resume one");
+        assert_ne!(
+            after[1], abandoned,
+            "the discarded session must not be reused"
+        );
+        assert!(
+            after[2].contains("first question"),
+            "the transcript goes out again: {}",
+            after[2]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tier_with_no_session_flags_sends_the_whole_transcript() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = provider(spec(echo_body(), Dialect::Plain), dir.path());
+
+        let _ = turn(&provider, conversation("first question")).await;
+        let second = turn(&provider, follow_up("second question")).await;
+        let parts: Vec<&str> = second.text.split('|').collect();
+
+        assert_eq!(parts[0], "", "no session flags are invented");
+        assert!(parts[2].contains("first question"), "{}", parts[2]);
+        assert!(parts[2].contains("second question"), "{}", parts[2]);
+    }
+
     #[test]
     fn model_arguments_are_added_only_when_a_model_is_set() {
         let workspace = PathBuf::from("/tmp");
@@ -494,13 +823,15 @@ mod tests {
             extra_args: vec!["--output-format".to_string(), "streaming-json".to_string()],
             approve_args: vec!["--always-approve".to_string()],
             workdir_args: vec!["--cwd".to_string(), "{workspace}".to_string()],
+            session_args: Vec::new(),
+            resume_args: Vec::new(),
             approve_all: false,
             model: None,
             dialect: Dialect::Grok,
         };
 
         let provider = CliProvider::new("grok", spec.clone(), workspace.clone());
-        let args = provider.build_args("hello");
+        let args = provider.build_args("hello", &SessionCall::Fresh);
         assert_eq!(
             args,
             vec![
@@ -515,7 +846,7 @@ mod tests {
 
         spec.model = Some("grok-4.6".to_string());
         let provider = CliProvider::new("grok", spec.clone(), workspace.clone());
-        let args = provider.build_args("hello");
+        let args = provider.build_args("hello", &SessionCall::Fresh);
         assert_eq!(
             args,
             vec![
@@ -541,12 +872,14 @@ mod tests {
             extra_args: vec!["--output-format".to_string(), "json".to_string()],
             approve_args: vec!["--yolo".to_string()],
             workdir_args: Vec::new(),
+            session_args: Vec::new(),
+            resume_args: Vec::new(),
             approve_all: true,
             model: None,
             dialect: Dialect::CommandCode,
         };
 
-        let args = CliProvider::new("cmd", spec, workspace).build_args("hi");
+        let args = CliProvider::new("cmd", spec, workspace).build_args("hi", &SessionCall::Fresh);
         assert!(args.contains(&"--yolo".to_string()), "{args:?}");
     }
 
@@ -560,12 +893,15 @@ mod tests {
             extra_args: Vec::new(),
             approve_args: Vec::new(),
             workdir_args: Vec::new(),
+            session_args: Vec::new(),
+            resume_args: Vec::new(),
             approve_all: false,
             model: None,
             dialect: Dialect::Plain,
         };
 
-        let args = CliProvider::new("cmd", spec, workspace).build_args("a; rm -rf /tmp/x");
+        let args = CliProvider::new("cmd", spec, workspace)
+            .build_args("a; rm -rf /tmp/x", &SessionCall::Fresh);
         // The dangerous text stays inside one argument.
         assert_eq!(args, vec!["-p", "a; rm -rf /tmp/x"]);
     }

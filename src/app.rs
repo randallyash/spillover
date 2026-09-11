@@ -7,7 +7,17 @@ use tokio::sync::oneshot;
 use crate::agent::AgentEvent;
 use crate::agent::approval::{ApprovalRequest, Decision};
 use crate::agent::first_line;
-use crate::config::{Config, Tier};
+use crate::agent::{Command, Mode};
+use crate::commands::{self, Input};
+use crate::config::Config;
+
+/// How many turns of token history the session panel keeps for its sparkline.
+const HISTORY: usize = 48;
+
+/// How long the rail flashes a tier that was just spilled past, in redraws. At
+/// the event loop's 90ms tick this is a little under a second: long enough to
+/// catch the eye at the moment it matters, short enough not to become noise.
+const FLASH_TICKS: u64 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -61,16 +71,62 @@ pub struct App {
     pub scroll_back: u16,
     pub should_quit: bool,
     /// Where a prompt goes, once a tier is available to answer it.
-    commands: Option<UnboundedSender<String>>,
+    commands: Option<UnboundedSender<Command>>,
     /// Index of the assistant message currently being streamed into.
     streaming: Option<usize>,
+    /// Index of the notice for a tool that is still running. The transcript puts
+    /// a spinner here instead of the arrow it was written with.
+    pub running: Option<usize>,
     pub approval: Option<PendingApproval>,
     pub busy: bool,
+
+    /// Whether the fallback policy keeps the lower tier. Held here as well as in
+    /// the chain because the session panel draws it.
+    pub sticky: bool,
+    /// What a turn is allowed to do. The agent enforces it; this copy is so the
+    /// interface can say which mode is active.
+    pub mode: Mode,
+    /// Per-tier totals, so `/cost` can attribute the session rather than only
+    /// sum it. Keyed by the tier's label, in first-seen order.
+    pub usage_by_tier: Vec<(String, crate::provider::Usage)>,
+    /// Which command the menu has highlighted.
+    pub menu_index: usize,
+    /// Whether the help overlay is up.
+    pub help: bool,
+
+    /// Redraw counter, advanced by the event loop's timer. Drives the spinner
+    /// and the streaming caret, the only two things here that move by
+    /// themselves.
+    pub tick: u64,
+    /// The tick a tier was last spilled past on, so the rail can draw attention
+    /// to the move for a moment rather than only recording it.
+    pub escalated_at: Option<u64>,
+    /// The configured tiers, under the label the agent reports them by, so an
+    /// escalation can be matched back to a position in the rail. Empty until
+    /// the agent is attached.
+    pub tier_labels: Vec<String>,
+    /// Which tier is answering, as an index into `tier_labels`.
+    pub active_tier: usize,
+    /// Which tiers were spilled past, aligned with `tier_labels`.
+    pub tier_failed: Vec<bool>,
+    /// Token totals for the session, summed across every tier and turn. This is
+    /// what a fallback actually costs, which is otherwise invisible.
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    /// Input tokens for each completed turn, oldest first, capped. The session
+    /// panel draws these as a sparkline, which is the only place the shape of a
+    /// session's cost is visible rather than just its total.
+    pub usage_history: Vec<u64>,
+    /// User turns completed.
+    pub turns: u32,
 }
 
 impl App {
     pub fn new(config: Config) -> Self {
         let messages = vec![Message::system(welcome(&config))];
+        let sticky = config.general.sticky_fallback;
         Self {
             config,
             messages,
@@ -79,30 +135,133 @@ impl App {
             should_quit: false,
             commands: None,
             streaming: None,
+            running: None,
             approval: None,
             busy: false,
+            sticky,
+            mode: Mode::default(),
+            usage_by_tier: Vec::new(),
+            menu_index: 0,
+            help: false,
+            tick: 0,
+            escalated_at: None,
+            tier_labels: Vec::new(),
+            active_tier: 0,
+            tier_failed: Vec::new(),
+            tokens_in: 0,
+            tokens_out: 0,
+            cache_read: 0,
+            cache_write: 0,
+            usage_history: Vec::new(),
+            turns: 0,
         }
     }
 
     /// Connect to a running agent, so prompts have somewhere to go.
+    ///
+    /// The tier labels are taken structurally rather than joined into a
+    /// sentence, because the header rail needs to know which one is active and
+    /// which have been spilled past.
     pub fn attach(
         &mut self,
-        commands: UnboundedSender<String>,
-        tiers_in_order: &str,
+        commands: UnboundedSender<Command>,
+        tier_labels: &[String],
         warning: Option<String>,
     ) {
         self.commands = Some(commands);
-        self.messages.push(Message::system(format!(
-            "tiers, in order: {tiers_in_order}. File writes and shell commands will ask before \
-             they run."
-        )));
+        self.tier_labels = tier_labels.to_vec();
+        self.tier_failed = vec![false; tier_labels.len()];
+        self.active_tier = 0;
         if let Some(warning) = warning {
             self.messages.push(Message::system(warning));
         }
     }
 
-    pub fn tiers(&self) -> &[Tier] {
-        &self.config.tiers
+    /// Where a tier sits in the configured chain.
+    pub fn tier_index(&self, label: &str) -> Option<usize> {
+        self.tier_labels.iter().position(|known| known == label)
+    }
+
+    /// Note that a tier was spilled past.
+    pub fn fail_tier(&mut self, label: &str) {
+        if let Some(index) = self.tier_index(label) {
+            if let Some(failed) = self.tier_failed.get_mut(index) {
+                *failed = true;
+            }
+        }
+    }
+
+    /// Follow the chain down to the tier now answering.
+    pub fn activate_tier(&mut self, label: &str) {
+        if let Some(index) = self.tier_index(label) {
+            self.active_tier = index;
+        }
+    }
+
+    /// Add one turn's tokens to the session totals, and to the tier that spent
+    /// them.
+    ///
+    /// Cache counts are summed as reported and never subtracted from the input
+    /// figure: whether they are included in it differs by provider.
+    pub fn record_usage_on(&mut self, tier: Option<&str>, usage: &crate::provider::Usage) {
+        self.tokens_in = self.tokens_in.saturating_add(usage.prompt_tokens);
+        self.tokens_out = self.tokens_out.saturating_add(usage.completion_tokens);
+        self.cache_read = self.cache_read.saturating_add(usage.cache_read_tokens);
+        self.cache_write = self.cache_write.saturating_add(usage.cache_write_tokens);
+
+        self.usage_history.push(usage.prompt_tokens);
+        // Keep only what the sparkline can show, so a long session does not grow
+        // this without bound.
+        if self.usage_history.len() > HISTORY {
+            self.usage_history.remove(0);
+        }
+
+        if let Some(tier) = tier {
+            match self
+                .usage_by_tier
+                .iter_mut()
+                .find(|(known, _)| known == tier)
+            {
+                Some((_, total)) => {
+                    total.prompt_tokens = total.prompt_tokens.saturating_add(usage.prompt_tokens);
+                    total.completion_tokens = total
+                        .completion_tokens
+                        .saturating_add(usage.completion_tokens);
+                    total.cache_read_tokens = total
+                        .cache_read_tokens
+                        .saturating_add(usage.cache_read_tokens);
+                    total.cache_write_tokens = total
+                        .cache_write_tokens
+                        .saturating_add(usage.cache_write_tokens);
+                }
+                None => self.usage_by_tier.push((tier.to_string(), *usage)),
+            }
+        }
+    }
+
+    /// Add one turn's tokens to the session totals, with no tier to attribute
+    /// them to.
+    #[cfg(test)]
+    pub fn record_usage(&mut self, usage: &crate::provider::Usage) {
+        self.record_usage_on(None, usage);
+    }
+
+    /// Whether a tier was spilled past a moment ago, so the rail can flash the
+    /// move. Time here is the redraw counter, which only runs during a turn —
+    /// exactly the window an escalation happens in.
+    pub fn recently_escalated(&self) -> bool {
+        matches!(self.escalated_at, Some(at) if self.tick.saturating_sub(at) < FLASH_TICKS)
+    }
+
+    /// The tier now answering, by name, if the agent is attached.
+    pub fn active_tier_name(&self) -> Option<&str> {
+        self.tier_labels.get(self.active_tier).map(String::as_str)
+    }
+
+    /// The message currently being streamed into, if any. The transcript puts
+    /// its caret here.
+    pub fn streaming_index(&self) -> Option<usize> {
+        self.streaming
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
@@ -133,19 +292,119 @@ impl App {
             return;
         }
 
+        // The help overlay is dismissed by anything, so it can never trap
+        // someone who opened it by accident.
+        if self.help {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Enter => {
+                    self.help = false;
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // The command menu owns the arrow keys and tab while it is open, so
+        // those keys navigate it instead of scrolling the transcript.
+        if self.menu_open() {
+            match key.code {
+                KeyCode::Up => {
+                    self.menu_index = self.menu_index.saturating_sub(1);
+                    return;
+                }
+                KeyCode::Down => {
+                    let last = self.menu_matches().len().saturating_sub(1);
+                    self.menu_index = (self.menu_index + 1).min(last);
+                    return;
+                }
+                KeyCode::Tab => {
+                    self.complete_command();
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        // Shift+Tab toggles the mode, which is where the hand goes for it after
+        // any other agent. Bare Tab does the same whenever the menu is not using
+        // it, since there is nothing to indent in a prompt.
+        if matches!(key.code, KeyCode::BackTab | KeyCode::Tab) {
+            self.toggle_mode();
+            return;
+        }
+
         match key.code {
-            KeyCode::Esc => self.should_quit = true,
+            KeyCode::Esc => {
+                // A half-typed command is cancelled rather than quitting, which
+                // is what Esc means everywhere else.
+                if self.input.starts_with('/') {
+                    self.input.clear();
+                } else {
+                    self.should_quit = true;
+                }
+            }
             KeyCode::Enter => self.submit(),
             KeyCode::Backspace => {
                 self.input.pop();
+                self.menu_index = 0;
             }
-            KeyCode::Char(ch) => self.input.push(ch),
+            KeyCode::Char('?') if self.input.is_empty() => self.help = true,
+            KeyCode::Char(ch) => {
+                self.input.push(ch);
+                // A new prefix means the old highlight is meaningless.
+                self.menu_index = 0;
+            }
             KeyCode::Up => self.scroll_back = self.scroll_back.saturating_add(1),
             KeyCode::Down => self.scroll_back = self.scroll_back.saturating_sub(1),
             KeyCode::PageUp => self.scroll_back = self.scroll_back.saturating_add(10),
             KeyCode::PageDown => self.scroll_back = self.scroll_back.saturating_sub(10),
             _ => {}
         }
+    }
+
+    /// Whether the slash menu should be on screen.
+    pub fn menu_open(&self) -> bool {
+        commands::completion_prefix(&self.input).is_some() && !self.menu_matches().is_empty()
+    }
+
+    /// Switch between building and planning.
+    ///
+    /// The interface does not change a mode the agent cannot be told about: with
+    /// no agent there is nothing to enforce it, and showing a read-only badge
+    /// over a mode that nothing is honouring would be a lie.
+    fn toggle_mode(&mut self) {
+        let next = self.mode.toggled();
+        let sent = matches!(&self.commands, Some(commands) if commands.send(Command::SetMode(next)).is_ok());
+        if sent {
+            self.mode = next;
+        } else {
+            self.messages.push(Message::system(
+                "no agent is running, so the mode was not changed",
+            ));
+        }
+    }
+
+    /// The commands matching what has been typed.
+    pub fn menu_matches(&self) -> Vec<&'static commands::Spec> {
+        match commands::completion_prefix(&self.input) {
+            Some(prefix) => commands::matching(prefix),
+            None => Vec::new(),
+        }
+    }
+
+    /// Put the highlighted command into the prompt line.
+    fn complete_command(&mut self) {
+        let matches = self.menu_matches();
+        let Some(spec) = matches.get(self.menu_index.min(matches.len().saturating_sub(1))) else {
+            return;
+        };
+        // A trailing space is offered only where there is an argument to type,
+        // so Enter on a no-argument command runs it straight away.
+        self.input = match spec.arg {
+            commands::Arg::None => format!("/{}", spec.name),
+            _ => format!("/{} ", spec.name),
+        };
+        self.menu_index = 0;
     }
 
     fn answer_approval(&mut self, approve: bool) {
@@ -174,6 +433,7 @@ impl App {
             AgentEvent::Text(chunk) => {
                 // Consecutive chunks belong to the same message; anything else
                 // in between (a tool, a notice) starts a new one.
+                self.running = None;
                 let index = match self.streaming {
                     Some(index) => index,
                     None => {
@@ -193,35 +453,45 @@ impl App {
                     "→ {name}  {}",
                     first_line(&preview)
                 )));
+                // The transcript spins this one until its result lands.
+                self.running = Some(self.messages.len() - 1);
             }
             AgentEvent::ToolFinished { name, ok, summary } => {
                 self.streaming = None;
+                self.running = None;
                 let mark = if ok { "✓" } else { "✗" };
                 self.messages
                     .push(Message::system(format!("{mark} {name}  {summary}")));
             }
             AgentEvent::Denied { tool } => {
                 self.streaming = None;
+                self.running = None;
                 self.messages
                     .push(Message::system(format!("✗ {tool} — you declined")));
             }
             AgentEvent::Notice(message) => {
                 self.streaming = None;
+                self.running = None;
                 self.messages.push(Message::system(message));
             }
             AgentEvent::Finished { stop_reason, usage } => {
                 self.streaming = None;
+                self.running = None;
                 self.busy = false;
+                // The flash belongs to the turn that was running; once it is
+                // over, the move is history rather than news.
+                self.escalated_at = None;
                 if stop_reason.as_deref() == Some("length") {
                     self.messages.push(Message::system(
-                        "the model hit its output limit, so this answer is incomplete",
+                        "! the model hit its output limit, so this answer is incomplete",
                     ));
                 }
                 if let Some(usage) = usage {
-                    self.messages.push(Message::system(format!(
-                        "tokens: {} in, {} out",
-                        usage.prompt_tokens, usage.completion_tokens
-                    )));
+                    // The rail already follows every escalation, so the tier
+                    // answering is known here without the agent having to say.
+                    let tier = self.active_tier_name().map(str::to_string);
+                    self.record_usage_on(tier.as_deref(), &usage);
+                    self.messages.push(Message::system(usage_line(&usage)));
                 }
             }
             AgentEvent::Escalated { from, to, reason } => {
@@ -229,13 +499,19 @@ impl App {
                 // continue from, so it must not sit in the transcript as though
                 // it were an answer.
                 self.discard_streaming_message();
+                self.running = None;
+                self.fail_tier(&from);
+                self.activate_tier(&to);
+                self.escalated_at = Some(self.tick);
                 self.messages.push(Message::system(format!(
                     "✗ {from} {reason} — spilling over to {to}"
                 )));
             }
             AgentEvent::Exhausted { reason } => {
                 self.streaming = None;
+                self.running = None;
                 self.busy = false;
+                self.escalated_at = None;
                 self.messages
                     .push(Message::system(format!("✗ no tier could answer: {reason}")));
             }
@@ -262,6 +538,16 @@ impl App {
         if text.is_empty() {
             return;
         }
+
+        // A command is not a turn: most of them work while the model is busy,
+        // and the ones that cannot say so themselves.
+        if let Input::Command { name, argument } = commands::parse(&text) {
+            self.input.clear();
+            self.menu_index = 0;
+            self.run_command(&name, &argument);
+            return;
+        }
+
         if self.busy {
             self.messages.push(Message::system(
                 "still working on the previous message; wait for it to finish",
@@ -279,7 +565,7 @@ impl App {
             return;
         };
 
-        if commands.send(text.clone()).is_err() {
+        if commands.send(Command::Prompt(text.clone())).is_err() {
             self.messages
                 .push(Message::system("the agent is no longer running"));
             return;
@@ -288,9 +574,217 @@ impl App {
         self.input.clear();
         self.streaming = None;
         self.busy = true;
+        self.turns = self.turns.saturating_add(1);
         self.messages.push(Message::user(text));
         self.scroll_back = 0;
     }
+
+    /// Act on a slash command.
+    ///
+    /// The ones whose state lives in the render loop are answered here; the rest
+    /// are handed to the agent, which owns the chain and the conversation.
+    fn run_command(&mut self, name: &str, argument: &str) {
+        // Anything with nowhere to go is reported rather than dropped.
+        let send = |app: &mut App, command: Command| match &app.commands {
+            Some(commands) if commands.send(command).is_ok() => true,
+            _ => {
+                app.messages.push(Message::system(
+                    "no agent is running, so that command had nowhere to go",
+                ));
+                false
+            }
+        };
+
+        match name {
+            "help" => self.help = true,
+
+            "quit" => self.should_quit = true,
+
+            "tier" if argument.is_empty() => {
+                // No argument means "show me", which the rail and panel already
+                // do — so say what the numbering is and what can be typed.
+                self.messages.push(Message::system(self.describe_tiers()));
+            }
+            "tier" => {
+                let query = argument.trim();
+                let command = if query == "auto" {
+                    Command::SetTier(None)
+                } else {
+                    Command::SetTier(Some(query.to_string()))
+                };
+                send(self, command);
+            }
+
+            "sticky" => match argument.trim().to_lowercase().as_str() {
+                "on" | "true" | "yes" => {
+                    self.sticky = true;
+                    send(self, Command::SetSticky(true));
+                }
+                "off" | "false" | "no" => {
+                    self.sticky = false;
+                    send(self, Command::SetSticky(false));
+                }
+                other => {
+                    let complaint = if other.is_empty() {
+                        "usage: /sticky <on|off>".to_string()
+                    } else {
+                        format!("/sticky takes on or off, not {other:?}")
+                    };
+                    self.messages.push(Message::system(complaint));
+                }
+            },
+
+            "cost" => self.messages.push(Message::system(self.describe_cost())),
+
+            // These need the chain or the conversation, which the agent owns.
+            "escalate" => {
+                send(self, Command::Escalate);
+            }
+            "retry" => {
+                let tier = argument.trim();
+                send(
+                    self,
+                    Command::Retry {
+                        tier: (!tier.is_empty()).then(|| tier.to_string()),
+                    },
+                );
+                // A retry re-runs a turn, so the interface is busy again.
+                self.busy = true;
+            }
+            "drop" => {
+                send(self, Command::Drop);
+            }
+            "compact" => {
+                send(self, Command::Compact);
+            }
+            "clear" => {
+                send(self, Command::Clear);
+                // The transcript is the interface's own copy, so it is cleared
+                // here too; the agent's history goes with the command.
+                self.messages.clear();
+                self.running = None;
+                self.streaming = None;
+                self.usage_by_tier.clear();
+                self.turns = 0;
+                self.usage_history.clear();
+                self.tokens_in = 0;
+                self.tokens_out = 0;
+                self.cache_read = 0;
+                self.cache_write = 0;
+                self.scroll_back = 0;
+            }
+            "context" => {
+                send(self, Command::Context);
+            }
+
+            // `commands::parse` only produces names from the catalogue, so this
+            // is unreachable; it is a message rather than a panic because a
+            // future catalogue edit should not be able to crash the app.
+            other => self.messages.push(Message::system(format!(
+                "there is no command called {other:?} — try /help"
+            ))),
+        }
+    }
+
+    /// The chain as the user can address it.
+    fn describe_tiers(&self) -> String {
+        if self.tier_labels.is_empty() {
+            return "no tiers are attached yet".to_string();
+        }
+
+        let mut out = String::from("tiers, in the order they are tried:\n");
+        for (index, label) in self.tier_labels.iter().enumerate() {
+            let mark = if index == self.active_tier {
+                "←"
+            } else {
+                " "
+            };
+            let state = if self.tier_failed.get(index).copied().unwrap_or(false) {
+                " (spilled past)"
+            } else {
+                ""
+            };
+            out.push_str(&format!(
+                "  {} {}{state} {mark}\n",
+                index + 1,
+                crate::fallback::tier_name(label)
+            ));
+        }
+        out.push_str(
+            "\n/tier <name|number> chooses one, /tier auto returns to the configured order.",
+        );
+        out
+    }
+
+    /// Where the session's tokens went, tier by tier.
+    fn describe_cost(&self) -> String {
+        if self.usage_by_tier.is_empty() {
+            return "nothing has been spent yet".to_string();
+        }
+
+        let mut out = String::from("tokens by tier, this session:\n");
+        for (label, usage) in &self.usage_by_tier {
+            out.push_str(&format!(
+                "  {}: {} in, {} out",
+                crate::fallback::tier_name(label),
+                crate::text::thousands(usage.prompt_tokens),
+                crate::text::thousands(usage.completion_tokens)
+            ));
+            // Cache figures only when a provider reports them, so a tier with
+            // no cache does not get a line of zeros to explain away.
+            if usage.cache_read_tokens > 0 || usage.cache_write_tokens > 0 {
+                out.push_str(&format!(
+                    " · {} cached, {} written",
+                    crate::text::thousands(usage.cache_read_tokens),
+                    crate::text::thousands(usage.cache_write_tokens)
+                ));
+            }
+            out.push('\n');
+        }
+
+        out.push_str(&format!(
+            "\ntotal: {} in, {} out · {} cached",
+            crate::text::thousands(self.tokens_in),
+            crate::text::thousands(self.tokens_out),
+            crate::text::thousands(self.cache_read)
+        ));
+        // The point of attributing cost to a tier is comparing them, so say so.
+        if self.usage_by_tier.len() > 1 {
+            out.push_str(
+                "\na cross-tier fallback is a cache miss no design can avoid, which is why the \
+                 same prompt costs more on the tier it spills to.",
+            );
+        }
+        out
+    }
+}
+
+/// One line of token accounting for the transcript.
+///
+/// Cache figures are shown only when a provider reports them, so a tier with no
+/// cache reads the same as it always did. The numbers are grouped the same way
+/// the session panel groups them, because both are on screen at once and a
+/// figure that reads "15360" in one place and "15,360" in the other looks like
+/// two different numbers.
+fn usage_line(usage: &crate::provider::Usage) -> String {
+    let mut line = format!(
+        "tokens: {} in, {} out",
+        crate::text::thousands(usage.prompt_tokens),
+        crate::text::thousands(usage.completion_tokens)
+    );
+    if usage.cache_read_tokens > 0 {
+        line.push_str(&format!(
+            " · {} cached",
+            crate::text::thousands(usage.cache_read_tokens)
+        ));
+    }
+    if usage.cache_write_tokens > 0 {
+        line.push_str(&format!(
+            " · {} written to cache",
+            crate::text::thousands(usage.cache_write_tokens)
+        ));
+    }
+    line
 }
 
 fn welcome(config: &Config) -> String {
@@ -299,50 +793,24 @@ fn welcome(config: &Config) -> String {
          down the list when the active tier stalls or repeats itself.",
     );
 
-    text.push_str(&format!(
-        "\n\nworkspace  {}\nfallback   {}",
-        config.general.workspace,
-        if config.general.sticky_fallback {
-            "sticky — stays on the lower tier for the rest of the session"
-        } else {
-            "per turn — tries the first tier again on the next message"
-        }
-    ));
+    // Only what nothing else on screen says. The chain, the tier answering, the
+    // workspace and the fallback policy are all in the header and the session
+    // panel, so repeating them here would show the same two facts twice on the
+    // first screen. What the panel cannot fit is the explanation of what the
+    // policy *means*:
+    text.push_str(if config.general.sticky_fallback {
+        "\n\nOnce a tier fails, spill stays on the lower tier for the rest of the session."
+    } else {
+        "\n\nAfter a tier fails, spill tries the first tier again on your next message."
+    });
 
     if config.tiers.is_empty() {
         text.push_str(
             "\n\nNo tiers are configured yet. Copy config.example.toml to \
              ~/.config/spill/config.toml and point the first tier at a local server.",
         );
-        return text;
     }
 
-    text.push_str("\n\nTiers, in order:");
-    for (index, tier) in config.tiers.iter().enumerate() {
-        text.push_str(&format!(
-            "\n  {}. {} [{}]",
-            index + 1,
-            tier.display_name(),
-            tier.kind
-        ));
-
-        let target = match tier.model.as_deref().filter(|model| !model.is_empty()) {
-            Some(model) => model.to_string(),
-            None => tier
-                .base_url
-                .clone()
-                .or_else(|| tier.preset.clone())
-                .unwrap_or_else(|| "no target set".to_string()),
-        };
-        text.push_str(&format!("  ·  {target}"));
-
-        if let Some(var) = tier.api_key_env.as_deref() {
-            text.push_str(&format!("  ·  key from ${var}"));
-        }
-        if tier.approve_all {
-            text.push_str("  ·  runs without confirmation");
-        }
-    }
     text
 }
 
@@ -443,7 +911,7 @@ mod tests {
     }
 
     #[test]
-    fn welcome_summarizes_the_configured_tiers() {
+    fn welcome_states_what_the_header_cannot_show() {
         let config = Config::parse(
             std::path::Path::new("test.toml"),
             r#"
@@ -462,27 +930,26 @@ mod tests {
             id = "grok"
             kind = "cli"
             preset = "grok"
-            api_key_env = "GROK_TOKEN"
             approve_all = true
             "#,
         )
         .expect("config should parse");
 
         let text = welcome(&config);
-        assert!(text.contains("/work"), "shows the workspace: {text}");
         assert!(
-            text.contains("per turn"),
-            "shows the fallback policy: {text}"
+            text.contains("first tier again"),
+            "it explains what a per-turn policy means: {text}"
         );
-        assert!(text.contains("Local model"), "names tier 1: {text}");
-        assert!(text.contains("qwen3-coder"), "shows the model: {text}");
+        // The chain, the workspace and the policy's own value are all drawn in
+        // the header and the session panel, so repeating them here would put the
+        // same facts on screen twice.
         assert!(
-            text.contains("key from $GROK_TOKEN"),
-            "names the key variable: {text}"
+            !text.contains("Local model"),
+            "the header carries the chain now: {text}"
         );
         assert!(
-            text.contains("runs without confirmation"),
-            "warns about approve_all: {text}"
+            !text.contains("/work"),
+            "the session panel carries the workspace: {text}"
         );
     }
 
@@ -492,10 +959,38 @@ mod tests {
         assert!(text.contains("No tiers are configured yet"), "got: {text}");
     }
 
-    fn attached_app() -> (App, tokio::sync::mpsc::UnboundedReceiver<String>) {
+    #[test]
+    fn welcome_explains_whichever_fallback_policy_is_set() {
+        let mut sticky = Config::default();
+        sticky.general.sticky_fallback = true;
+        assert!(
+            welcome(&sticky).contains("stays on the lower tier"),
+            "{}",
+            welcome(&sticky)
+        );
+
+        let mut per_turn = Config::default();
+        per_turn.general.sticky_fallback = false;
+        assert!(
+            welcome(&per_turn).contains("first tier again"),
+            "{}",
+            welcome(&per_turn)
+        );
+    }
+
+    #[test]
+    fn welcome_leaves_the_workspace_to_the_session_panel() {
+        let mut config = Config::default();
+        config.general.workspace = "/somewhere".to_string();
+        // The panel shows it whenever the panel exists, and on a terminal too
+        // narrow for one the user has just configured this path themselves.
+        assert!(!welcome(&config).contains("/somewhere"));
+    }
+
+    fn attached_app() -> (App, tokio::sync::mpsc::UnboundedReceiver<Command>) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = new_app();
-        app.attach(tx, "Local model", None);
+        app.attach(tx, &["Local model".to_string()], None);
         (app, rx)
     }
 
@@ -513,7 +1008,7 @@ mod tests {
 
         assert_eq!(
             commands.try_recv().expect("the prompt should be sent"),
-            "hello there"
+            Command::Prompt("hello there".to_string())
         );
         assert!(app.input.is_empty());
         assert!(app.busy);
@@ -673,6 +1168,7 @@ mod tests {
             usage: Some(crate::provider::Usage {
                 prompt_tokens: 120,
                 completion_tokens: 45,
+                ..Default::default()
             }),
         });
 
@@ -680,6 +1176,46 @@ mod tests {
             app.messages
                 .last()
                 .is_some_and(|m| m.text.contains("120 in, 45 out"))
+        );
+    }
+
+    #[test]
+    fn cache_hits_are_shown_alongside_the_token_counts() {
+        let mut app = new_app();
+        app.handle_agent_event(AgentEvent::Finished {
+            stop_reason: Some("end_turn".to_string()),
+            usage: Some(crate::provider::Usage {
+                prompt_tokens: 15360,
+                completion_tokens: 2,
+                cache_read_tokens: 7424,
+                cache_write_tokens: 0,
+            }),
+        });
+
+        let line = &app.messages.last().expect("a message").text;
+        assert!(line.contains("15,360 in, 2 out"), "{line}");
+        assert!(line.contains("7,424 cached"), "{line}");
+        assert!(
+            !line.contains("written"),
+            "a zero cache write should not be mentioned: {line}"
+        );
+    }
+
+    #[test]
+    fn a_tier_with_no_cache_reads_exactly_as_before() {
+        let mut app = new_app();
+        app.handle_agent_event(AgentEvent::Finished {
+            stop_reason: Some("end_turn".to_string()),
+            usage: Some(crate::provider::Usage {
+                prompt_tokens: 10,
+                completion_tokens: 2,
+                ..Default::default()
+            }),
+        });
+
+        assert_eq!(
+            app.messages.last().expect("a message").text,
+            "tokens: 10 in, 2 out"
         );
     }
 
@@ -771,12 +1307,19 @@ mod tests {
     }
 
     #[test]
-    fn attaching_lists_the_chain_and_names_the_active_tier() {
+    fn attaching_takes_the_chain_for_the_rail() {
         let (app, _commands) = attached_app();
+
+        assert_eq!(app.tier_labels, vec!["Local model".to_string()]);
+        assert_eq!(app.active_tier, 0, "the top tier answers first");
+        assert_eq!(app.tier_failed, vec![false]);
+        assert_eq!(app.active_tier_name(), Some("Local model"));
+        // The chain is drawn in the header, so it is not also said in prose.
         assert!(
-            app.messages
+            !app.messages
                 .iter()
-                .any(|m| m.text.contains("tiers, in order: Local model"))
+                .any(|m| m.text.contains("tiers, in order")),
+            "the rail carries this now"
         );
     }
 
@@ -786,7 +1329,7 @@ mod tests {
         let mut app = new_app();
         app.attach(
             tx,
-            "Local model",
+            &["Local model".to_string()],
             Some("not in the chain yet: grok (cli)".to_string()),
         );
 
@@ -794,6 +1337,502 @@ mod tests {
             app.messages
                 .iter()
                 .any(|m| m.text.contains("not in the chain yet: grok (cli)"))
+        );
+    }
+
+    #[test]
+    fn escalating_moves_the_rail_down_the_chain() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = new_app();
+        app.attach(
+            tx,
+            &[
+                "Local".to_string(),
+                "DeepSeek".to_string(),
+                "Grok".to_string(),
+            ],
+            None,
+        );
+
+        app.handle_agent_event(AgentEvent::Escalated {
+            from: "Local".to_string(),
+            to: "DeepSeek".to_string(),
+            reason: "repeated itself 4 times".to_string(),
+        });
+
+        assert_eq!(app.active_tier, 1);
+        assert_eq!(app.tier_failed, vec![true, false, false]);
+        assert_eq!(app.active_tier_name(), Some("DeepSeek"));
+
+        // A second spill continues down rather than jumping back up.
+        app.handle_agent_event(AgentEvent::Escalated {
+            from: "DeepSeek".to_string(),
+            to: "Grok".to_string(),
+            reason: "went quiet".to_string(),
+        });
+        assert_eq!(app.active_tier, 2);
+        assert_eq!(app.tier_failed, vec![true, true, false]);
+    }
+
+    #[test]
+    fn a_label_the_chain_does_not_know_does_not_move_the_rail() {
+        // Labels come from the same source as the chain, so this should not
+        // happen; if it ever does, the rail holds rather than pointing at the
+        // wrong tier.
+        let (mut app, _commands) = attached_app();
+        app.handle_agent_event(AgentEvent::Escalated {
+            from: "Local model".to_string(),
+            to: "Somewhere else".to_string(),
+            reason: "unknown".to_string(),
+        });
+
+        assert_eq!(app.active_tier, 0);
+        assert_eq!(app.active_tier_name(), Some("Local model"));
+    }
+
+    #[test]
+    fn an_escalation_flashes_briefly_and_then_settles() {
+        let (mut app, _commands) = attached_app();
+        app.handle_agent_event(AgentEvent::Escalated {
+            from: "Local model".to_string(),
+            to: "Local model".to_string(),
+            reason: "repeated itself".to_string(),
+        });
+        assert!(
+            app.recently_escalated(),
+            "the move should be marked at once"
+        );
+
+        app.tick += FLASH_TICKS;
+        assert!(
+            !app.recently_escalated(),
+            "the flash must not outstay its welcome"
+        );
+    }
+
+    #[test]
+    fn finishing_a_turn_ends_the_flash() {
+        let (mut app, _commands) = attached_app();
+        app.handle_agent_event(AgentEvent::Escalated {
+            from: "Local model".to_string(),
+            to: "Local model".to_string(),
+            reason: "repeated itself".to_string(),
+        });
+        assert!(app.recently_escalated());
+
+        // The flash belongs to the turn; once it is over, the move is history.
+        app.handle_agent_event(AgentEvent::Finished {
+            stop_reason: Some("end_turn".to_string()),
+            usage: None,
+        });
+        assert!(!app.recently_escalated());
+    }
+
+    #[test]
+    fn the_usage_history_keeps_only_the_recent_turns() {
+        let mut app = new_app();
+        for turn in 0..(HISTORY as u64 + 30) {
+            app.record_usage(&crate::provider::Usage {
+                prompt_tokens: turn,
+                ..Default::default()
+            });
+        }
+
+        assert_eq!(app.usage_history.len(), HISTORY);
+        assert_eq!(
+            *app.usage_history.last().expect("the newest turn"),
+            HISTORY as u64 + 29,
+            "the oldest are dropped, not the newest"
+        );
+    }
+
+    #[test]
+    fn a_turn_is_counted_when_it_is_sent() {
+        let (mut app, _commands) = attached_app();
+        assert_eq!(app.turns, 0);
+
+        type_and_send(&mut app, "hello");
+        assert_eq!(app.turns, 1);
+
+        type_and_send(&mut app, "again");
+        assert_eq!(app.turns, 1, "a refused prompt is not a turn");
+    }
+
+    #[test]
+    fn token_totals_accumulate_across_turns() {
+        let (mut app, _commands) = attached_app();
+        let turn = crate::provider::Usage {
+            prompt_tokens: 15_360,
+            completion_tokens: 2,
+            cache_read_tokens: 7_424,
+            cache_write_tokens: 0,
+        };
+
+        app.handle_agent_event(AgentEvent::Finished {
+            stop_reason: Some("end_turn".to_string()),
+            usage: Some(turn),
+        });
+        app.handle_agent_event(AgentEvent::Finished {
+            stop_reason: Some("end_turn".to_string()),
+            usage: Some(turn),
+        });
+
+        assert_eq!(app.tokens_in, 30_720);
+        assert_eq!(app.tokens_out, 4);
+        assert_eq!(app.cache_read, 14_848);
+        assert_eq!(app.cache_write, 0);
+    }
+
+    // ---- slash commands ---------------------------------------------------
+
+    fn last_message(app: &App) -> &str {
+        app.messages.last().map(|m| m.text.as_str()).unwrap_or("")
+    }
+
+    #[test]
+    fn a_command_is_never_sent_to_the_model_as_a_prompt() {
+        let (mut app, mut commands) = attached_app();
+        type_and_send(&mut app, "/cost");
+
+        assert!(
+            commands.try_recv().is_err(),
+            "a command is not a turn and must not reach the agent"
+        );
+        assert!(!app.busy, "it does not start a turn either");
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.text.contains("nothing has been spent")),
+            "{:?}",
+            app.messages.iter().map(|m| &m.text).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_slash_that_is_not_a_command_still_reaches_the_model() {
+        // A question about a path is a question, not an instruction.
+        let (mut app, mut commands) = attached_app();
+        type_and_send(&mut app, "/usr/local/bin is on my path");
+
+        assert_eq!(
+            commands.try_recv().expect("a prompt"),
+            Command::Prompt("/usr/local/bin is on my path".to_string())
+        );
+        assert!(app.busy);
+    }
+
+    #[test]
+    fn the_commands_with_nowhere_else_to_live_are_forwarded() {
+        let cases: &[(&str, Command)] = &[
+            ("/escalate", Command::Escalate),
+            ("/drop", Command::Drop),
+            ("/compact", Command::Compact),
+            ("/context", Command::Context),
+            ("/clear", Command::Clear),
+            ("/retry", Command::Retry { tier: None }),
+            (
+                "/retry 2",
+                Command::Retry {
+                    tier: Some("2".to_string()),
+                },
+            ),
+            ("/tier Grok", Command::SetTier(Some("Grok".to_string()))),
+            ("/tier auto", Command::SetTier(None)),
+            ("/sticky off", Command::SetSticky(false)),
+        ];
+
+        for (typed, expected) in cases {
+            let (mut app, mut commands) = attached_app();
+            type_and_send(&mut app, typed);
+
+            assert_eq!(
+                commands.try_recv().ok(),
+                Some(expected.clone()),
+                "{typed} forwarded the wrong command"
+            );
+        }
+    }
+
+    #[test]
+    fn sticky_records_its_own_state_and_refuses_nonsense() {
+        let (mut app, _commands) = attached_app();
+        assert!(app.sticky, "sticky is the default");
+
+        type_and_send(&mut app, "/sticky off");
+        assert!(!app.sticky);
+
+        type_and_send(&mut app, "/sticky on");
+        assert!(app.sticky);
+
+        type_and_send(&mut app, "/sticky maybe");
+        assert!(app.sticky, "a bad argument must not change anything");
+        assert!(
+            last_message(&app).contains("on or off"),
+            "{}",
+            last_message(&app)
+        );
+
+        // The bare form explains itself rather than guessing.
+        type_and_send(&mut app, "/sticky");
+        assert!(
+            last_message(&app).contains("usage"),
+            "{}",
+            last_message(&app)
+        );
+    }
+
+    #[test]
+    fn tier_with_no_argument_lists_the_chain() {
+        let (mut app, _commands) = attached_app();
+        type_and_send(&mut app, "/tier");
+
+        let said = last_message(&app);
+        assert!(
+            said.contains("1 Local model"),
+            "the number and name: {said}"
+        );
+        assert!(said.contains("/tier auto"), "and how to undo it: {said}");
+    }
+
+    #[test]
+    fn help_opens_with_the_question_mark_and_closes_with_escape() {
+        let mut app = new_app();
+        app.handle_key(press(KeyCode::Char('?')));
+        assert!(app.help);
+
+        app.handle_key(press(KeyCode::Esc));
+        assert!(!app.help);
+        assert!(!app.should_quit, "closing help must not quit");
+    }
+
+    #[test]
+    fn help_also_opens_from_the_command() {
+        let mut app = new_app();
+        type_and_send(&mut app, "/help");
+        assert!(app.help);
+    }
+
+    #[test]
+    fn escape_cancels_a_half_typed_command_rather_than_quitting() {
+        let mut app = new_app();
+        for ch in "/tie".chars() {
+            app.handle_key(press(KeyCode::Char(ch)));
+        }
+        app.handle_key(press(KeyCode::Esc));
+
+        assert!(app.input.is_empty(), "the command should be abandoned");
+        assert!(!app.should_quit, "but the app should stay");
+    }
+
+    #[test]
+    fn the_menu_opens_on_a_slash_and_tab_completes_the_highlighted_command() {
+        let mut app = new_app();
+        app.handle_key(press(KeyCode::Char('/')));
+        assert!(app.menu_open(), "a lone slash opens the menu");
+
+        // Narrow to tier, then take it. It takes an argument, so a space is
+        // offered and the menu closes behind it.
+        for ch in "tie".chars() {
+            app.handle_key(press(KeyCode::Char(ch)));
+        }
+        app.handle_key(press(KeyCode::Tab));
+        assert_eq!(app.input, "/tier ", "an argument is awaited");
+        assert!(!app.menu_open(), "the menu closes on a space");
+
+        // A command with no argument is completed without the trailing space,
+        // so enter runs it rather than waiting for input.
+        app.input = "/cos".to_string();
+        app.handle_key(press(KeyCode::Tab));
+        assert_eq!(app.input, "/cost");
+    }
+
+    #[test]
+    fn an_unknown_prefix_shows_no_menu() {
+        let mut app = new_app();
+        for ch in "/zzz".chars() {
+            app.handle_key(press(KeyCode::Char(ch)));
+        }
+        assert!(!app.menu_open());
+    }
+
+    #[test]
+    fn clear_empties_the_transcript_and_the_session_totals() {
+        let (mut app, _commands) = attached_app();
+        app.messages.push(Message::assistant("an answer"));
+        app.turns = 4;
+        app.record_usage(&crate::provider::Usage {
+            prompt_tokens: 100,
+            ..Default::default()
+        });
+
+        type_and_send(&mut app, "/clear");
+
+        // The transcript is the interface's own copy, so it goes at once. The
+        // agent's confirmation arrives as a notice in a real run, which is the
+        // next thing to land.
+        assert!(app.messages.is_empty(), "{:?}", app.messages.len());
+        assert_eq!(app.turns, 0);
+        assert_eq!(app.tokens_in, 0, "the cost of the old session is gone");
+        assert!(app.usage_by_tier.is_empty());
+
+        app.handle_agent_event(AgentEvent::Notice("conversation cleared".to_string()));
+        assert_eq!(app.messages.len(), 1);
+        assert!(last_message(&app).contains("cleared"));
+    }
+
+    #[test]
+    fn cost_attributes_the_session_to_the_tiers_that_spent_it() {
+        let (mut app, _commands) = attached_app();
+        app.tier_labels = vec!["Local".to_string(), "DeepSeek V4 Flash".to_string()];
+        app.attach(
+            tokio::sync::mpsc::unbounded_channel().0,
+            &app.tier_labels.clone(),
+            None,
+        );
+
+        app.record_usage_on(
+            Some("Local"),
+            &crate::provider::Usage {
+                prompt_tokens: 1_000,
+                completion_tokens: 10,
+                ..Default::default()
+            },
+        );
+        app.record_usage_on(
+            Some("DeepSeek V4 Flash"),
+            &crate::provider::Usage {
+                prompt_tokens: 15_360,
+                completion_tokens: 2,
+                cache_read_tokens: 7_424,
+                ..Default::default()
+            },
+        );
+
+        type_and_send(&mut app, "/cost");
+        let said = last_message(&app);
+
+        assert!(said.contains("Local: 1,000 in, 10 out"), "{said}");
+        assert!(
+            said.contains("DeepSeek V4 Flash: 15,360 in, 2 out"),
+            "{said}"
+        );
+        assert!(said.contains("7,424 cached"), "{said}");
+        assert!(said.contains("total: 16,360 in"), "{said}");
+        // A tier with no cache must not get a line of zeros.
+        let local_line = said
+            .lines()
+            .find(|line| line.contains("Local:"))
+            .expect("the local line");
+        assert!(!local_line.contains("cached"), "{local_line}");
+    }
+
+    #[test]
+    fn a_command_that_needs_an_agent_is_refused_when_there_is_none() {
+        // No tiers attached, so there is nothing to forward to.
+        let mut app = new_app();
+        type_and_send(&mut app, "/compact");
+
+        assert!(
+            last_message(&app).contains("nowhere to go"),
+            "{}",
+            last_message(&app)
+        );
+    }
+
+    // ---- modes ------------------------------------------------------------
+
+    fn shift_tab() -> KeyEvent {
+        KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)
+    }
+
+    #[test]
+    fn shift_tab_toggles_the_mode_and_tells_the_agent() {
+        let (mut app, mut commands) = attached_app();
+        assert_eq!(app.mode, Mode::Build, "build is where it starts");
+
+        app.handle_key(shift_tab());
+
+        assert_eq!(app.mode, Mode::Plan);
+        assert_eq!(
+            commands.try_recv().expect("the mode should be sent"),
+            Command::SetMode(Mode::Plan)
+        );
+
+        app.handle_key(shift_tab());
+        assert_eq!(app.mode, Mode::Build);
+        assert_eq!(
+            commands.try_recv().expect("the mode should be sent back"),
+            Command::SetMode(Mode::Build)
+        );
+    }
+
+    #[test]
+    fn bare_tab_toggles_the_mode_when_no_command_is_being_typed() {
+        // Tab is what the user asked for; Shift+Tab is what the hand does. Both
+        // work, and neither is swallowed by the other.
+        let (mut app, mut commands) = attached_app();
+        app.handle_key(press(KeyCode::Tab));
+
+        assert_eq!(app.mode, Mode::Plan);
+        assert_eq!(
+            commands.try_recv().expect("the mode should be sent"),
+            Command::SetMode(Mode::Plan)
+        );
+    }
+
+    #[test]
+    fn tab_still_completes_a_command_rather_than_toggling_the_mode() {
+        // The menu owns Tab while it is open, so completion is not lost.
+        let (mut app, mut commands) = attached_app();
+        for ch in "/cos".chars() {
+            app.handle_key(press(KeyCode::Char(ch)));
+        }
+        app.handle_key(press(KeyCode::Tab));
+
+        assert_eq!(app.input, "/cost", "it should have completed");
+        assert_eq!(app.mode, Mode::Build, "and not changed the mode");
+        assert!(commands.try_recv().is_err(), "nothing was sent");
+    }
+
+    #[test]
+    fn a_mode_is_not_changed_when_no_agent_can_be_told_about_it() {
+        // Showing a read-only badge over a mode nothing is enforcing would be a
+        // lie, so with no agent the toggle does nothing but say so.
+        let mut app = new_app();
+        app.handle_key(shift_tab());
+
+        assert_eq!(app.mode, Mode::Build);
+        assert!(
+            last_message(&app).contains("no agent is running"),
+            "{}",
+            last_message(&app)
+        );
+    }
+
+    #[test]
+    fn the_mode_does_not_change_when_the_agent_channel_is_gone() {
+        let (mut app, commands) = attached_app();
+        drop(commands);
+
+        app.handle_key(shift_tab());
+
+        assert_eq!(app.mode, Mode::Build, "a failed send must not change it");
+        assert!(
+            last_message(&app).contains("no agent is running"),
+            "{}",
+            last_message(&app)
+        );
+    }
+
+    #[test]
+    fn plan_mode_is_reported_by_the_agent_as_a_notice() {
+        let (mut app, _commands) = attached_app();
+        app.handle_agent_event(AgentEvent::Notice("plan mode: it can read".to_string()));
+
+        assert!(
+            last_message(&app).contains("plan mode"),
+            "{}",
+            last_message(&app)
         );
     }
 }

@@ -4,6 +4,138 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Build and plan modes, switched with `Shift+Tab` (or `Tab` when no command is
+  being typed). Plan mode is read-only, and that is enforced in three places
+  rather than requested once: the write tools are never offered to the model, a
+  call for one is refused before a preview is even computed, and the system
+  prompt says plainly that those tools do not exist for this turn. Withholding
+  the offer is a courtesy to a well-behaved model; the refusal is the guarantee,
+  and a test asks for a file in plan mode only to check the disk. The system
+  prompt is swapped along with the mode, since it is the first message of the
+  session and a stale one would leave a read-only turn being told about approval
+  prompts. The mode is written on the prompt box, in the warning colour, because
+  it is what pressing enter will mean; the footer offers the one key that leaves
+  it.
+- Session continuity for CLI tiers. `grok` and `command-code` now keep their own
+  conversation across turns: the first turn opens a session — grok is handed a
+  UUID of ours, `cmd` chooses its own and spill reads it back out of what it
+  prints — and every turn after that continues it and sends only the new message.
+  Before this, every turn flattened the entire transcript into the prompt and
+  re-sent it, so a long session paid for the whole conversation again on each
+  turn. Measured against a real `cmd` run, that is also a fixed ~15k tokens of the
+  CLI's own harness on top of whatever we send, every single time. Any other CLI
+  can be set up the same way with `session_args` and `resume_args`, both taking
+  `{session}`; leaving them off is the previous behaviour exactly, and is what
+  every other preset still does.
+- A CLI tier whose turn was discarded on escalation has its session forgotten, so
+  neither the next tier nor that tier on a later turn can resume a conversation
+  holding output that was thrown away.
+- Cache token counts are kept instead of being parsed past and dropped:
+  `cacheReadTokens` / `cacheWriteTokens` (Command Code), the Anthropic pair, and
+  OpenAI's nested `prompt_tokens_details.cached_tokens`. They appear in the
+  transcript as `tokens: 15360 in, 2 out · 7424 cached`, and in
+  `spill -p --output-format json`. Whether those tokens are included in the input
+  count differs by provider, so the two are reported as they arrived and never
+  added together. A cross-tier fallback is a cache miss that no amount of
+  plumbing can avoid — caches are per provider — but the cost of it is now
+  visible rather than guessed at.
+- `src/provider/fixtures/cmd-stream.jsonl`: a real 30-frame
+  `cmd -p --output-format json` run, recorded verbatim and parsed end to end by
+  the test suite. It pins the frames no documentation describes — the `run_end`
+  state dump that must be passed over, the thinking deltas that must never reach
+  the transcript as answer text, the `sessionId` to resume with, and the cache
+  counts on the result line.
+- The model's prose is rendered as markdown rather than shown with its markers
+  intact. Headings lose their hashes and take weight, `**bold**` and `*italic*`
+  become weight rather than punctuation, inline code is styled and stripped of
+  its backticks, and a fenced block becomes a framed box with its language on the
+  top edge and its lines ruled down the side. Bullets become dots with a hanging
+  indent, quotes get a bar, and `---` draws a rule. Two rules keep it honest: a
+  marker with no closing partner is left as literal text (so a half-streamed
+  `**bold` never flips the rest of the line), and an unterminated fence stays
+  open to the end rather than flickering between two shapes mid-answer.
+- A tool that is still running is marked by a spinner in its own line, so the
+  transcript says whether the work has finished rather than only that it began.
+  The line becomes a history entry with an arrow once the result lands.
+- A tier that was just spilled past has its mark reversed for a beat, so the one
+  event the whole program exists for is not lost in a wall of grey text. The rail
+  also carries a state word at the far right — `working` with a spinner in flight,
+  `ready` at rest — which gives the header a right edge instead of trailing off.
+- Slash commands, and a menu that lists them as you type. `?` opens the same list
+  beside every keybinding, which is the help surface the interface was missing.
+  The set is deliberately small and about this program rather than the
+  conversation: a command earns its place only if it has no other affordance.
+  - The chain: `/tier` shows it, `/tier <name|number>` answers from one tier until
+    told otherwise, `/tier auto` hands control back to the fallback policy,
+    `/escalate` spills to the next tier without waiting for a stall, `/retry [tier]`
+    sends the last turn again, `/drop` discards the active tier's own conversation.
+  - The policy and the cost: `/sticky on|off`, `/cost` (tokens and cache reads,
+    attributed per tier rather than only totalled), and `/context` (what actually
+    goes out on each turn).
+  - The conversation: `/compact`, `/clear`, `/help`, `/quit`.
+  Choosing a tier by hand outranks the fallback policy, so it survives the next
+  message even on a per-turn chain; a tier that then fails releases the choice
+  rather than insisting on it. A slash only means a command at the start of a line
+  and only for a name we know, so a question about `/usr/local` is still a
+  question, and `//` starts a message with a literal slash.
+- `/compact`, and compaction as part of spilling over. Earlier turns are replaced
+  by a short ledger of what happened — including which tools ran and how they went,
+  because the side effects of a discarded conversation are still real. It is
+  deterministic rather than a model summary: it costs nothing, it works while the
+  active tier is misbehaving, and it cannot degrade into the weak model
+  paraphrasing the evidence it was too weak to use. It declines to act when the
+  ledger would be larger than what it replaces, so compaction can never grow the
+  thing it is compacting. Because the history changes shape, every tier's own
+  session is dropped with it, so nothing resumes a conversation that no longer
+  exists in that form. When a tier is abandoned and the session has grown past a
+  few turns, this happens by itself, so the incoming tier's cold read is small.
+
+### Changed
+
+- The interface is composed for the work rather than boxed off. The tier chain is now a
+  status rail across the top, with the answering tier drawn as a filled block, tiers that
+  were spilled past marked with a cross, and a state word at the far right that spins
+  while a turn is in flight. The rail shortens tier names when the chain does not fit,
+  then falls back to the answering tier and its position, so it degrades instead of
+  clipping.
+- The transcript renders the model's markdown, and its lines are wrapped for the
+  scrollbar's column when one is needed: previously the transcript was wrapped for the
+  full width and then drawn into one column less, which clipped the last cell of any line
+  that reached the edge.
+- `NO_COLOR` is honored. Monochrome is not a degraded mode here: every state is carried by
+  a glyph, a border, or a weight, and the monochrome theme is tested to keep all six
+  tier/outcome states distinguishable without a single color.
+- On terminals 104 columns or wider, a session panel shows the chain as a row per tier
+  with its own state, the fallback policy, the workspace, and the session's token and
+  cache totals, with a sparkline of per-turn spend beneath them so the shape of a
+  session's cost is visible and not only its total. On a narrower terminal the
+  conversation takes that space and the active tier moves down to the footer instead.
+- The prompt box leads with a `❯` mark, so the place to type reads as a command line
+  rather than as text that happens to sit in a box. It still grows with what is typed, up
+  to five lines, and dims while a model is working.
+- A terminal smaller than 46 × 12 gets a message saying what it needs, rather than a
+  garbled layout.
+- The approval modal is shaped by what the tools actually emit, which is three different
+  things: `edit_file` shows a real before/after with `-` and `+` lines in red and green,
+  `run_shell` styles the command as a command, and `write_file` shows its one sentence.
+  A command dressed up as a diff would misrepresent what is about to happen.
+- Tool outcomes in the transcript are colored by their own glyph — `✓` green, `✗` red,
+  `!` amber — so the color is a second reading of the same signal rather than the only
+  one.
+- The welcome message no longer lists the tiers, their models and their keys. The rail
+  shows the chain and its state, and the startup notices already report an unset key or a
+  missing binary, so the same information was being stated three times on first run.
+- `Theme` is a complete set of named roles rather than seven colors reused: identity,
+  transcript, structure, states, the chain, markdown, the diff, and the panel's
+  sparkline each have their own, and the fields nothing used were deleted rather than
+  kept to make the palette look more considered than it is. The accent stays rationed to
+  the wordmark, the answering tier, the user's own turn, the caret and the keys; a test
+  fails if a heading or a section label starts wearing it.
+
 ## [0.1.0] - 2026-09-10
 
 First release. Everything below is new.

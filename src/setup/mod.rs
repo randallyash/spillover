@@ -668,6 +668,10 @@ fn make_tier(
         extra_args: Vec::new(),
         approve_args: Vec::new(),
         workdir_args: Vec::new(),
+        // Session flags come from the preset, which is what makes continuity
+        // work without the wizard knowing anything about it.
+        session_args: Vec::new(),
+        resume_args: Vec::new(),
         dialect: None,
         // Unattended runs are never something setup turns on for you.
         approve_all: false,

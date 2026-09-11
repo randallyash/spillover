@@ -21,6 +21,101 @@ use crate::session::{ChatMessage, Session, ToolCall};
 /// tools without concluding cannot spin forever.
 pub const DEFAULT_MAX_STEPS: usize = 12;
 
+/// How many recent user turns compaction leaves intact.
+///
+/// Enough that the model still knows what is being worked on, few enough that
+/// the frontier's cold prefix stays small. Only older turns are folded away.
+pub const KEEP_TURNS: usize = 3;
+
+/// Below this many user turns there is nothing worth compacting, so an
+/// escalation does not churn the history of a short session.
+const COMPACT_ABOVE_TURNS: usize = KEEP_TURNS + 2;
+
+/// What a turn is allowed to do.
+///
+/// Two modes, because there are two things a person wants from an agent: work
+/// it out, or do it. Plan is read-only, and that is a promise kept in three
+/// places rather than one — the write tools are not offered, a call for one is
+/// refused anyway, and the system prompt says why. A read-only mode that relies
+/// on the model choosing to behave is not read-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mode {
+    /// Everything the agent can do, with approval as configured.
+    #[default]
+    Build,
+    /// Reading, searching, and thinking. Nothing is changed.
+    Plan,
+}
+
+impl Mode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Build => "build",
+            Self::Plan => "plan",
+        }
+    }
+
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Build => Self::Plan,
+            Self::Plan => Self::Build,
+        }
+    }
+
+    /// The ceiling on what a turn in this mode may touch.
+    pub fn risk_ceiling(self) -> Risk {
+        match self {
+            Self::Build => Risk::Write,
+            Self::Plan => Risk::Read,
+        }
+    }
+
+    pub fn is_read_only(self) -> bool {
+        self.risk_ceiling() == Risk::Read
+    }
+
+    /// The system prompt for this mode.
+    ///
+    /// Plan mode needs its own prompt rather than a sentence appended to the
+    /// usual one: the usual prompt explains that writes need approval, which is
+    /// the wrong thing to teach a turn that has no writes to approve.
+    pub fn system_prompt(self, workspace: &std::path::Path) -> String {
+        match self {
+            Self::Build => build_prompt(workspace),
+            Self::Plan => plan_prompt(workspace),
+        }
+    }
+}
+
+/// What the interface asks the agent to do.
+///
+/// Most of these exist because the state they touch lives with the agent — the
+/// chain and the conversation — and cannot be reached from the render loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Command {
+    /// An ordinary message, and a turn.
+    Prompt(String),
+    /// Change what a turn is allowed to do.
+    SetMode(Mode),
+    /// Move to the next tier now, and stay there.
+    Escalate,
+    /// Send the last turn again, optionally on a named tier.
+    Retry { tier: Option<String> },
+    /// Forget the active tier's own conversation.
+    Drop,
+    /// Use this tier until told otherwise. `None` hands control back to the
+    /// fallback policy.
+    SetTier(Option<String>),
+    /// Change whether a spill keeps the lower tier.
+    SetSticky(bool),
+    /// Fold earlier turns into a ledger.
+    Compact,
+    /// Start the conversation over.
+    Clear,
+    /// Report what is being sent each turn.
+    Context,
+}
+
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     /// Assistant text to append to the transcript.
@@ -59,35 +154,306 @@ pub struct AgentConfig {
     pub max_steps: usize,
 }
 
-/// Start the agent task. Send user prompts on the returned sender; the returned
+/// The conversation and the chain, plus what it takes to run the last turn
+/// again.
+struct Loop {
+    session: Session,
+    chain: FallbackChain,
+    /// What a turn is allowed to do. Held here rather than sent with each
+    /// prompt, because the system prompt has to change with it and the session
+    /// is what carries the system prompt.
+    mode: Mode,
+    /// The turn most recently started, so it can be retried.
+    last: Option<LastTurn>,
+}
+
+#[derive(Clone)]
+struct LastTurn {
+    prompt: String,
+    /// The session length before the turn was added, so a retry can put the
+    /// conversation back exactly as it was.
+    checkpoint: usize,
+}
+
+/// Start the agent task. Send commands on the returned sender; the returned
 /// receiver carries everything the agent wants shown.
 pub fn spawn(
     config: AgentConfig,
-    mut chain: FallbackChain,
+    chain: FallbackChain,
     registry: Arc<Registry>,
     approver: Arc<dyn Approver>,
-) -> (UnboundedSender<String>, UnboundedReceiver<AgentEvent>) {
-    let (command_tx, mut command_rx) = mpsc::unbounded_channel::<String>();
+) -> (UnboundedSender<Command>, UnboundedReceiver<AgentEvent>) {
+    let (command_tx, mut command_rx) = mpsc::unbounded_channel::<Command>();
     let (event_tx, event_rx) = mpsc::unbounded_channel::<AgentEvent>();
 
     tokio::spawn(async move {
-        let mut session = Session::with_system_prompt(system_prompt(&config.workspace));
+        let mut state = Loop {
+            session: Session::with_system_prompt(Mode::default().system_prompt(&config.workspace)),
+            chain,
+            mode: Mode::default(),
+            last: None,
+        };
+
         // A closed command channel means the app is shutting down.
-        while let Some(prompt) = command_rx.recv().await {
-            run_turn(
-                &config,
-                &mut chain,
-                &registry,
-                &approver,
-                &event_tx,
-                &mut session,
-                prompt,
+        while let Some(command) = command_rx.recv().await {
+            handle_command(
+                &config, &registry, &approver, &event_tx, &mut state, command,
             )
             .await;
         }
     });
 
     (command_tx, event_rx)
+}
+
+/// Act on one thing the interface asked for.
+async fn handle_command(
+    config: &AgentConfig,
+    registry: &Arc<Registry>,
+    approver: &Arc<dyn Approver>,
+    events: &UnboundedSender<AgentEvent>,
+    state: &mut Loop,
+    command: Command,
+) {
+    match command {
+        Command::Prompt(prompt) => {
+            let checkpoint = state.session.messages().len();
+            state.last = Some(LastTurn {
+                prompt: prompt.clone(),
+                checkpoint,
+            });
+            run_turn(
+                config,
+                &mut state.chain,
+                state.mode,
+                registry,
+                approver,
+                events,
+                &mut state.session,
+                prompt,
+            )
+            .await;
+        }
+
+        Command::SetMode(mode) => {
+            state.mode = mode;
+            // The system prompt is the first message of the session, so changing
+            // the mode means changing it. Leaving the old one in place would
+            // have a read-only turn still being told about approval prompts.
+            if let Some(first) = state.session.messages().first() {
+                if first.role == crate::session::Role::System {
+                    state
+                        .session
+                        .replace_system_prompt(mode.system_prompt(&config.workspace));
+                }
+            }
+            let _ = events.send(AgentEvent::Notice(match mode {
+                Mode::Plan => "plan mode: it can read and search, but nothing will be changed. \
+                              You will get a plan rather than an edit."
+                    .to_string(),
+                Mode::Build => "build mode: it can write files and run commands again, asking \
+                                first unless the tier is set to run unattended."
+                    .to_string(),
+            }));
+        }
+
+        Command::Escalate => {
+            // Escalating from the last tier has nowhere to go, which is worth
+            // saying rather than silently doing nothing.
+            let stepped = state.chain.escalate().map(|tier| tier.label.clone());
+            match stepped {
+                Some(label) => {
+                    let index = state.chain.active_index();
+                    let total = state.chain.len();
+                    // A hand-issued escalation is a choice, not a fallback, so
+                    // it is pinned: otherwise a per-turn chain would snap back
+                    // to the top on the next message and the command would look
+                    // broken.
+                    state.chain.pin(index);
+                    let _ = events.send(AgentEvent::Notice(format!(
+                        "moving to {label} ({} of {total}) — it will answer from here",
+                        index + 1
+                    )));
+                }
+                None => {
+                    let _ = events.send(AgentEvent::Notice(
+                        "already on the last tier in the chain, so there is nowhere to spill to"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+
+        Command::Retry { tier } => {
+            let Some(last) = state.last.clone() else {
+                let _ = events.send(AgentEvent::Notice(
+                    "there is no turn to retry yet".to_string(),
+                ));
+                return;
+            };
+
+            if let Some(query) = tier {
+                match state.chain.resolve(&query) {
+                    Some(index) => {
+                        state.chain.pin(index);
+                    }
+                    None => {
+                        let _ = events.send(AgentEvent::Notice(format!(
+                            "no tier matches {query:?}. The chain is: {}",
+                            describe_chain(&state.chain)
+                        )));
+                        return;
+                    }
+                }
+            }
+
+            // Put the conversation back the way it was before that turn, so the
+            // retry does not stack a second copy of it on top of the first.
+            state.session.truncate(last.checkpoint);
+            // If the tier holding the turn is a CLI, its own copy must go too.
+            state.chain.forget_sessions();
+
+            let _ = events.send(AgentEvent::Notice(format!(
+                "retrying the last turn on {}",
+                state.chain.active().label
+            )));
+            run_turn(
+                config,
+                &mut state.chain,
+                state.mode,
+                registry,
+                approver,
+                events,
+                &mut state.session,
+                last.prompt,
+            )
+            .await;
+        }
+
+        Command::Drop => {
+            let tier = state.chain.active();
+            tier.provider.forget_session();
+            let _ = events.send(AgentEvent::Notice(format!(
+                "{} will start a fresh conversation on its next turn",
+                tier.label
+            )));
+        }
+
+        Command::SetTier(tier) => match tier {
+            None => {
+                state.chain.unpin();
+                state.chain.begin_turn();
+                let _ = events.send(AgentEvent::Notice(format!(
+                    "back to the configured order — {} answers next",
+                    state.chain.active().label
+                )));
+            }
+            Some(query) => match state.chain.resolve(&query) {
+                Some(index) => {
+                    let label = state.chain.pin(index).map(|tier| tier.label.clone());
+                    let _ = events.send(AgentEvent::Notice(format!(
+                        "{} will answer from here, until you say /tier auto",
+                        label.unwrap_or_default()
+                    )));
+                }
+                None => {
+                    let _ = events.send(AgentEvent::Notice(format!(
+                        "no tier matches {query:?}. The chain is: {}",
+                        describe_chain(&state.chain)
+                    )));
+                }
+            },
+        },
+
+        Command::SetSticky(on) => {
+            state.chain.set_sticky(on);
+            let _ = events.send(AgentEvent::Notice(if on {
+                "a spill will stay on the lower tier for the rest of the session".to_string()
+            } else {
+                "the top tier will be retried on each new message".to_string()
+            }));
+        }
+
+        Command::Compact => {
+            let report = state.session.compact(KEEP_TURNS);
+            let summary = report.summary();
+            if report.happened() {
+                // The conversation the CLI tiers were holding no longer exists
+                // in that form, so none of them may resume it.
+                state.chain.forget_sessions();
+                let _ = events.send(AgentEvent::Notice(format!(
+                    "{summary}\nEvery tier's own session was dropped, so the next call re-reads \
+                     the compacted history once and then continues from there."
+                )));
+            } else {
+                let _ = events.send(AgentEvent::Notice(summary));
+            }
+        }
+
+        Command::Clear => {
+            state.session.reset();
+            state.last = None;
+            state.chain.forget_sessions();
+            let _ = events.send(AgentEvent::Notice(
+                "conversation cleared; the tiers are unchanged".to_string(),
+            ));
+        }
+
+        Command::Context => {
+            let _ = events.send(AgentEvent::Notice(describe_context(
+                &state.session,
+                &state.chain,
+            )));
+        }
+    }
+}
+
+/// What a `/tier` or `/retry` message shows when a name does not match.
+fn describe_chain(chain: &FallbackChain) -> String {
+    chain
+        .labels()
+        .iter()
+        .enumerate()
+        .map(|(index, label)| format!("{} {}", index + 1, crate::fallback::tier_name(label)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// What `/context` reports: what actually goes out on each turn.
+fn describe_context(session: &Session, chain: &FallbackChain) -> String {
+    let messages = session.messages();
+    let characters: usize = messages.iter().map(|m| m.content.len()).sum();
+    let tools = messages
+        .iter()
+        .map(|message| message.tool_calls.len())
+        .sum::<usize>();
+    let active = chain.active();
+
+    // An estimate, and said as one: the real figure depends on the tokenizer,
+    // which is the provider's business.
+    let estimate = characters / 4;
+
+    let mut out = format!(
+        "conversation: {} message{} (~{characters} characters, roughly {estimate} tokens)\n\
+         tool calls in history: {tools}",
+        messages.len(),
+        if messages.len() == 1 { "" } else { "s" }
+    );
+
+    // Which tiers actually pay for it, which is not the same for each kind.
+    out.push_str(&format!(
+        "\nanswering tier: {} ({})",
+        active.label, active.model
+    ));
+    out.push_str(if chain.sticky() {
+        "\nfallback: sticky"
+    } else {
+        "\nfallback: per turn"
+    });
+    if chain.is_pinned() {
+        out.push_str("\na tier was chosen by hand: /tier auto returns to the configured order");
+    }
+    out
 }
 
 /// What one tier made of a turn.
@@ -109,6 +475,7 @@ enum Attempt {
 async fn run_turn(
     config: &AgentConfig,
     chain: &mut FallbackChain,
+    mode: Mode,
     registry: &Arc<Registry>,
     approver: &Arc<dyn Approver>,
     events: &UnboundedSender<AgentEvent>,
@@ -121,14 +488,18 @@ async fn run_turn(
 
     loop {
         let tier = chain.active();
-        let outcome = try_tier(config, tier, registry, approver, events, session).await;
+        let outcome = try_tier(config, tier, mode, registry, approver, events, session).await;
 
         match outcome {
             Attempt::Answered => return,
             Attempt::Stuck(reason) => {
                 let from = tier.label.clone();
+                let abandoned = Arc::clone(&tier.provider);
                 // Throw the failed attempt away before another model reads it.
                 session.truncate(checkpoint);
+                // A CLI tier may be holding a session that contains the output
+                // just discarded, so it must not be resumed.
+                abandoned.forget_session();
 
                 match chain.escalate() {
                     Some(next) => {
@@ -137,6 +508,7 @@ async fn run_turn(
                             to: next.label.clone(),
                             reason: reason.summary(),
                         });
+                        compact_before_falling(session, chain, events);
                     }
                     None => {
                         let _ = events.send(AgentEvent::Exhausted {
@@ -150,16 +522,56 @@ async fn run_turn(
     }
 }
 
+/// Shrink the history when a tier is about to be abandoned, so the tier that
+/// takes over does not open with a large cold read.
+///
+/// A fallback is a cache miss whatever we do — caches are per provider — so the
+/// only lever is making the thing being re-read small. Compaction is deliberately
+/// not attempted on a short session: the churn would cost more than it saved.
+fn compact_before_falling(
+    session: &mut Session,
+    chain: &FallbackChain,
+    events: &UnboundedSender<AgentEvent>,
+) {
+    let turns = session
+        .messages()
+        .iter()
+        .filter(|message| message.role == crate::session::Role::User)
+        .count();
+    if turns <= COMPACT_ABOVE_TURNS {
+        return;
+    }
+
+    let report = session.compact(KEEP_TURNS);
+    if !report.happened() {
+        return;
+    }
+
+    // The other tiers are holding conversations in their own sessions; after
+    // the history changed shape, resuming one would continue a transcript that
+    // no longer matches.
+    chain.forget_sessions();
+    let _ = events.send(AgentEvent::Notice(format!(
+        "compacted {} earlier turn{} so the next tier starts from a smaller history",
+        report.dropped_turns,
+        if report.dropped_turns == 1 { "" } else { "s" }
+    )));
+}
+
 /// Give one tier the turn, up to the step limit.
 async fn try_tier(
     config: &AgentConfig,
     tier: &Tier,
+    mode: Mode,
     registry: &Arc<Registry>,
     approver: &Arc<dyn Approver>,
     events: &UnboundedSender<AgentEvent>,
     session: &mut Session,
 ) -> Attempt {
-    let tools = registry.specs();
+    // A read-only turn is not offered the tools that could change anything. The
+    // refusal in `run_tool` is what makes that a guarantee; this is what stops a
+    // cooperative model from wasting turns on calls that would be refused.
+    let tools = registry.specs_permitting(mode.risk_ceiling());
     let mut watchdog = Watchdog::new(&tier.limits);
     let mut progress = ProgressDetector::new(tier.limits.max_repeat_run as usize);
 
@@ -189,7 +601,8 @@ async fn try_tier(
         }
 
         for call in summary.tool_calls.clone() {
-            let outcome = run_tool(registry, approver, &config.workspace, &call, events).await;
+            let outcome =
+                run_tool(mode, registry, approver, &config.workspace, &call, events).await;
             if let Some(reason) = progress.record(&call.name, &call.arguments, !outcome.is_error) {
                 return Attempt::Stuck(reason);
             }
@@ -289,21 +702,48 @@ fn observe(
 }
 
 async fn run_tool(
+    mode: Mode,
     registry: &Arc<Registry>,
     approver: &Arc<dyn Approver>,
     workspace: &std::path::Path,
     call: &ToolCall,
     events: &UnboundedSender<AgentEvent>,
 ) -> ToolOutcome {
+    let offered = || -> Vec<String> {
+        registry
+            .specs_permitting(mode.risk_ceiling())
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect()
+    };
+
     let Some(tool) = registry.get(&call.name) else {
         let message = format!(
             "there is no tool called {:?}. Available tools: {}",
             call.name,
-            registry.names().join(", ")
+            offered().join(", ")
         );
         let _ = events.send(AgentEvent::Notice(message.clone()));
         return ToolOutcome::error(message);
     };
+
+    // The guarantee. Withholding these from the tool list is the polite version
+    // of this check; a model that names one anyway — hallucinating a tool name,
+    // or carrying a habit from build mode — is stopped here, before a preview is
+    // even computed, so nothing about the call can touch the disk.
+    if !mode.risk_ceiling().permits(tool.risk()) {
+        let message = format!(
+            "{} is not available in plan mode, which is read-only. Nothing has been changed. \
+             Read and search as much as you need, then reply with the plan instead of carrying \
+             it out.",
+            call.name
+        );
+        let _ = events.send(AgentEvent::Notice(format!(
+            "✗ {} was refused — plan mode is read-only",
+            call.name
+        )));
+        return ToolOutcome::error(message);
+    }
 
     let arguments: serde_json::Value = match serde_json::from_str(&call.arguments) {
         Ok(arguments) => arguments,
@@ -362,7 +802,7 @@ pub fn first_line(content: &str) -> String {
     }
 }
 
-fn system_prompt(workspace: &std::path::Path) -> String {
+fn build_prompt(workspace: &std::path::Path) -> String {
     format!(
         "You are spill, a coding agent working in the user's terminal. The workspace is {}.\n\n\
          Inspect before you change: read a file before editing it, and search for a path rather \
@@ -372,6 +812,30 @@ fn system_prompt(workspace: &std::path::Path) -> String {
          about to do and why. When a tool returns an error, read it and correct yourself rather \
          than repeating the same call.\n\n\
          Keep final answers short and concrete.",
+        workspace.display()
+    )
+}
+
+/// The system prompt for a read-only turn.
+///
+/// It says plainly that the write tools are not merely discouraged but absent,
+/// because a model told only "do not change anything" tends to announce changes
+/// it did not make, and one that discovers the absence for itself tends to spend
+/// turns trying.
+fn plan_prompt(workspace: &std::path::Path) -> String {
+    format!(
+        "You are spill, a coding agent working in the user's terminal. The workspace is {}.\n\n\
+         You are in PLAN MODE. This turn is read-only: you can read files, list directories, \
+         search and glob, and that is all. write_file, edit_file and run_shell do not exist for \
+         you right now, and asking for one is refused. Nothing you do can change anything.\n\n\
+         Investigate as much as you need — read the relevant files, follow the code, check how \
+         the thing is used elsewhere — and then answer with a plan rather than a change:\n\n\
+         - what you would change, file by file, and why\n\
+         - the order to do it in, and what depends on what\n\
+         - anything you would need to check, or would want the user to decide, first\n\n\
+         Be specific enough that the plan could be carried out without asking you again. Never \
+         say you have made a change, because you have not: report what you found and what you \
+         would do. The user returns to build mode when they are ready for you to act.",
         workspace.display()
     )
 }
@@ -477,6 +941,7 @@ mod tests {
             }],
             stop_reason: Some("tool_calls".to_string()),
             usage: None,
+            session_id: None,
         }
     }
 
@@ -509,6 +974,11 @@ mod tests {
 
     /// Collect events until the turn ends, failing rather than hanging.
     async fn drain(mut rx: UnboundedReceiver<AgentEvent>) -> Vec<AgentEvent> {
+        drain_from(&mut rx).await
+    }
+
+    /// The same, over a borrow, for a test that needs the receiver again after.
+    async fn drain_from(rx: &mut UnboundedReceiver<AgentEvent>) -> Vec<AgentEvent> {
         let mut events = Vec::new();
         loop {
             let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
@@ -541,7 +1011,8 @@ mod tests {
             Arc::new(Registry::with_default_tools()),
             approver,
         );
-        tx.send(prompt.to_string()).expect("send prompt");
+        tx.send(Command::Prompt(prompt.to_string()))
+            .expect("send prompt");
 
         (drain(rx).await, provider)
     }
@@ -780,7 +1251,7 @@ mod tests {
             Arc::new(Registry::with_default_tools()),
             Arc::new(AlwaysApprove::default()),
         );
-        tx.send("hello".to_string()).expect("send");
+        tx.send(Command::Prompt("hello".to_string())).expect("send");
 
         let events = drain(rx).await;
         match events.last() {
@@ -810,7 +1281,8 @@ mod tests {
             Arc::new(Registry::with_default_tools()),
             Arc::new(AlwaysApprove::default()),
         );
-        tx.send("loop please".to_string()).expect("send");
+        tx.send(Command::Prompt("loop please".to_string()))
+            .expect("send");
 
         let events = drain(rx).await;
         match events.last() {
@@ -831,8 +1303,10 @@ mod tests {
             usage: Some(Usage {
                 prompt_tokens: 10,
                 completion_tokens: 4,
+                ..Default::default()
             }),
             tool_calls: Vec::new(),
+            session_id: None,
         };
 
         let (events, _provider) = run_one(
@@ -856,9 +1330,51 @@ mod tests {
     }
 
     #[test]
-    fn the_system_prompt_names_the_workspace() {
-        let prompt = system_prompt(std::path::Path::new("/tmp/example"));
-        assert!(prompt.contains("/tmp/example"), "{prompt}");
+    fn the_system_prompt_names_the_workspace_in_both_modes() {
+        let workspace = std::path::Path::new("/tmp/example");
+        for mode in [Mode::Build, Mode::Plan] {
+            let prompt = mode.system_prompt(workspace);
+            assert!(prompt.contains("/tmp/example"), "{prompt}");
+        }
+    }
+
+    #[test]
+    fn plan_mode_says_it_cannot_change_anything_and_build_mode_explains_approval() {
+        let workspace = std::path::Path::new("/tmp/example");
+
+        let plan = Mode::Plan.system_prompt(workspace);
+        assert!(plan.contains("PLAN MODE"), "{plan}");
+        assert!(
+            plan.contains("write_file"),
+            "it should name what it cannot use: {plan}"
+        );
+        assert!(
+            plan.contains("Never say you have made a change"),
+            "the failure mode to head off: {plan}"
+        );
+        assert!(
+            !plan.contains("need the user's approval"),
+            "approval is the wrong thing to teach a turn with no writes to approve: {plan}"
+        );
+
+        let build = Mode::Build.system_prompt(workspace);
+        assert!(build.contains("approval"), "{build}");
+        assert!(!build.contains("PLAN MODE"), "{build}");
+    }
+
+    #[test]
+    fn the_mode_toggles_and_carries_its_own_ceiling() {
+        assert_eq!(Mode::default(), Mode::Build);
+        assert_eq!(Mode::Build.toggled(), Mode::Plan);
+        assert_eq!(Mode::Plan.toggled(), Mode::Build);
+
+        assert_eq!(Mode::Build.label(), "build");
+        assert_eq!(Mode::Plan.label(), "plan");
+
+        assert_eq!(Mode::Build.risk_ceiling(), Risk::Write);
+        assert_eq!(Mode::Plan.risk_ceiling(), Risk::Read);
+        assert!(!Mode::Build.is_read_only());
+        assert!(Mode::Plan.is_read_only());
     }
 
     #[test]
@@ -934,7 +1450,8 @@ mod tests {
             Arc::new(Registry::with_default_tools()),
             Arc::new(AlwaysApprove::default()),
         );
-        tx.send("do the thing".to_string()).expect("send");
+        tx.send(Command::Prompt("do the thing".to_string()))
+            .expect("send");
         let events = drain(rx).await;
 
         let (from, to, reason) = escalation(&events).expect("a looping tier should escalate");
@@ -977,7 +1494,8 @@ mod tests {
             Arc::new(Registry::with_default_tools()),
             Arc::new(AlwaysApprove::default()),
         );
-        tx.send("are you there".to_string()).expect("send");
+        tx.send(Command::Prompt("are you there".to_string()))
+            .expect("send");
         let events = drain(rx).await;
 
         let (_, to, reason) = escalation(&events).expect("a hung tier should escalate");
@@ -1004,7 +1522,7 @@ mod tests {
             Arc::new(Registry::with_default_tools()),
             Arc::new(AlwaysApprove::default()),
         );
-        tx.send("hello".to_string()).expect("send");
+        tx.send(Command::Prompt("hello".to_string())).expect("send");
         let events = drain(rx).await;
 
         let (_, to, reason) = escalation(&events).expect("a failed tier should escalate");
@@ -1039,7 +1557,8 @@ mod tests {
             Arc::new(Registry::with_default_tools()),
             Arc::new(AlwaysApprove::default()),
         );
-        tx.send("read it".to_string()).expect("send");
+        tx.send(Command::Prompt("read it".to_string()))
+            .expect("send");
         let events = drain(rx).await;
 
         let (_, _, reason) = escalation(&events).expect("a tool loop should escalate");
@@ -1069,7 +1588,7 @@ mod tests {
             Arc::new(Registry::with_default_tools()),
             Arc::new(AlwaysApprove::default()),
         );
-        tx.send("go".to_string()).expect("send");
+        tx.send(Command::Prompt("go".to_string())).expect("send");
         let events = drain(rx).await;
 
         assert!(
@@ -1082,5 +1601,562 @@ mod tests {
             }
             other => panic!("expected exhaustion, got {other:?}"),
         }
+    }
+
+    // ---- commands ---------------------------------------------------------
+
+    /// Answers at once, and counts everything it was asked to do. Stands in for
+    /// a CLI tier, which is the only kind with a session to forget.
+    struct Quiet {
+        forgotten: std::sync::atomic::AtomicUsize,
+        requests: std::sync::atomic::AtomicUsize,
+        answer: String,
+    }
+
+    impl Quiet {
+        fn new(answer: &str) -> Arc<Self> {
+            Arc::new(Self {
+                forgotten: std::sync::atomic::AtomicUsize::new(0),
+                requests: std::sync::atomic::AtomicUsize::new(0),
+                answer: answer.to_string(),
+            })
+        }
+
+        fn forgotten(&self) -> usize {
+            self.forgotten.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn requests(&self) -> usize {
+            self.requests.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl Provider for Quiet {
+        fn describe(&self) -> String {
+            "quiet".to_string()
+        }
+
+        async fn stream(
+            &self,
+            _request: ChatRequest,
+            events: UnboundedSender<StreamEvent>,
+        ) -> Result<TurnSummary, ProviderError> {
+            self.requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = events.send(StreamEvent::Text(self.answer.clone()));
+            Ok(TurnSummary {
+                text: self.answer.clone(),
+                stop_reason: Some("end_turn".to_string()),
+                ..TurnSummary::default()
+            })
+        }
+
+        fn forget_session(&self) {
+            self.forgotten
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Collect whatever the agent emits, stopping once it goes quiet.
+    ///
+    /// Most commands answer with a notice and no turn, so there is no terminal
+    /// event to wait for.
+    async fn collect(rx: &mut UnboundedReceiver<AgentEvent>) -> Vec<AgentEvent> {
+        let mut out = Vec::new();
+        while let Ok(Some(event)) = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await
+        {
+            out.push(event);
+        }
+        out
+    }
+
+    fn notices(events: &[AgentEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Notice(message) => Some(message.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Two tiers whose providers can be inspected afterwards.
+    fn two_tiers() -> (Vec<Tier>, Arc<Quiet>, Arc<Quiet>) {
+        let first = Quiet::new("first answer");
+        let second = Quiet::new("second answer");
+        let tiers = vec![
+            Tier {
+                label: "Local (http://10.0.0.1:1234/v1)".to_string(),
+                model: "m0".to_string(),
+                provider: first.clone(),
+                limits: Limits::default(),
+            },
+            Tier {
+                label: "DeepSeek V4 Flash".to_string(),
+                model: "m1".to_string(),
+                provider: second.clone(),
+                limits: Limits::default(),
+            },
+        ];
+        (tiers, first, second)
+    }
+
+    fn loop_over(
+        dir: &std::path::Path,
+        chain: FallbackChain,
+    ) -> (UnboundedSender<Command>, UnboundedReceiver<AgentEvent>) {
+        spawn(
+            config(dir, DEFAULT_MAX_STEPS),
+            chain,
+            Arc::new(Registry::with_default_tools()),
+            Arc::new(AlwaysApprove::default()),
+        )
+    }
+
+    fn one_tier(answer: &str) -> (FallbackChain, Arc<Quiet>) {
+        let provider = Quiet::new(answer);
+        let chain = FallbackChain::new(
+            vec![Tier {
+                label: "Only".to_string(),
+                model: "a-model".to_string(),
+                provider: provider.clone(),
+                limits: Limits::default(),
+            }],
+            true,
+        )
+        .expect("a chain");
+        (chain, provider)
+    }
+
+    #[tokio::test]
+    async fn escalate_moves_down_and_stays_there() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (tiers, _first, second) = two_tiers();
+        // Per-turn, so the pin is the only thing that can hold it down.
+        let chain = FallbackChain::new(tiers, false).expect("a chain");
+        let (tx, mut rx) = loop_over(dir.path(), chain);
+
+        tx.send(Command::Escalate).expect("send");
+        let events = collect(&mut rx).await;
+        assert!(
+            notices(&events)
+                .iter()
+                .any(|note| note.contains("DeepSeek")),
+            "{:?}",
+            notices(&events)
+        );
+
+        tx.send(Command::Prompt("hello".to_string())).expect("send");
+        let events = collect(&mut rx).await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Text(t) if t == "second answer")),
+            "the hand-picked tier should have answered: {events:?}"
+        );
+        assert_eq!(second.requests(), 1);
+    }
+
+    #[tokio::test]
+    async fn escalating_from_the_last_tier_says_so() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (chain, _provider) = one_tier("only");
+        let (tx, mut rx) = loop_over(dir.path(), chain);
+
+        tx.send(Command::Escalate).expect("send");
+        let events = collect(&mut rx).await;
+
+        assert!(
+            notices(&events)
+                .iter()
+                .any(|note| note.contains("nowhere to spill")),
+            "{:?}",
+            notices(&events)
+        );
+    }
+
+    #[tokio::test]
+    async fn choosing_a_tier_by_name_works_and_a_bad_name_lists_the_chain() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (tiers, _first, second) = two_tiers();
+        let chain = FallbackChain::new(tiers, true).expect("a chain");
+        let (tx, mut rx) = loop_over(dir.path(), chain);
+
+        tx.send(Command::SetTier(Some("deepseek".to_string())))
+            .expect("send");
+        let events = collect(&mut rx).await;
+        assert!(
+            notices(&events).iter().any(|n| n.contains("DeepSeek")),
+            "{:?}",
+            notices(&events)
+        );
+
+        tx.send(Command::Prompt("hello".to_string())).expect("send");
+        let _ = collect(&mut rx).await;
+        assert_eq!(second.requests(), 1, "the named tier should have answered");
+
+        // A name that matches nothing is reported with the chain, not guessed at.
+        tx.send(Command::SetTier(Some("nope".to_string())))
+            .expect("send");
+        let events = collect(&mut rx).await;
+        let said = notices(&events).join(" ");
+        assert!(said.contains("no tier matches"), "{said}");
+        assert!(
+            said.contains("DeepSeek"),
+            "it should say what the chain is: {said}"
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_forgets_only_the_tier_that_is_answering() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (tiers, first, second) = two_tiers();
+        let chain = FallbackChain::new(tiers, true).expect("a chain");
+        let (tx, mut rx) = loop_over(dir.path(), chain);
+
+        tx.send(Command::Drop).expect("send");
+        let events = collect(&mut rx).await;
+
+        assert_eq!(first.forgotten(), 1, "the active tier's session must go");
+        assert_eq!(second.forgotten(), 0, "the others are untouched");
+        assert!(
+            notices(&events).iter().any(|n| n.contains("fresh")),
+            "{:?}",
+            notices(&events)
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_forgets_every_session_because_the_history_changed_shape() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Long answers, so there is genuinely something to compact.
+        let long = "a thorough explanation of the matter ".repeat(12);
+        let (tiers, _first, _second) = two_tiers();
+        let tiers: Vec<Tier> = tiers
+            .into_iter()
+            .map(|tier| Tier {
+                label: tier.label,
+                model: tier.model,
+                provider: Quiet::new(&long),
+                limits: tier.limits,
+            })
+            .collect();
+        let chain = FallbackChain::new(tiers, true).expect("a chain");
+        let (tx, mut rx) = loop_over(dir.path(), chain);
+
+        for turn in 0..6 {
+            tx.send(Command::Prompt(format!("question {turn}")))
+                .expect("send");
+            let _ = collect(&mut rx).await;
+        }
+
+        tx.send(Command::Compact).expect("send");
+        let events = collect(&mut rx).await;
+        let said = notices(&events).join(" ");
+        assert!(said.contains("compacted"), "{said}");
+        assert!(
+            said.contains("dropped"),
+            "it should say the sessions went too: {said}"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_re_runs_the_last_turn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (chain, provider) = one_tier("an answer");
+        let (tx, mut rx) = loop_over(dir.path(), chain);
+
+        tx.send(Command::Prompt("do the thing".to_string()))
+            .expect("send");
+        let _ = collect(&mut rx).await;
+        assert_eq!(provider.requests(), 1);
+
+        tx.send(Command::Retry { tier: None }).expect("send");
+        let events = collect(&mut rx).await;
+
+        assert_eq!(provider.requests(), 2, "the turn should run again");
+        assert!(
+            notices(&events).iter().any(|n| n.contains("retrying")),
+            "{:?}",
+            notices(&events)
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_without_a_turn_says_there_is_nothing_to_retry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (chain, _provider) = one_tier("x");
+        let (tx, mut rx) = loop_over(dir.path(), chain);
+
+        tx.send(Command::Retry { tier: None }).expect("send");
+        let events = collect(&mut rx).await;
+
+        assert!(
+            notices(&events)
+                .iter()
+                .any(|n| n.contains("no turn to retry")),
+            "{:?}",
+            notices(&events)
+        );
+    }
+
+    #[tokio::test]
+    async fn sticky_can_be_changed_at_runtime() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (chain, _provider) = one_tier("x");
+        let (tx, mut rx) = loop_over(dir.path(), chain);
+
+        tx.send(Command::SetSticky(false)).expect("send");
+        let events = collect(&mut rx).await;
+        assert!(
+            notices(&events).iter().any(|n| n.contains("top tier")),
+            "{:?}",
+            notices(&events)
+        );
+
+        tx.send(Command::SetSticky(true)).expect("send");
+        let events = collect(&mut rx).await;
+        assert!(
+            notices(&events)
+                .iter()
+                .any(|n| n.contains("rest of the session")),
+            "{:?}",
+            notices(&events)
+        );
+    }
+
+    #[tokio::test]
+    async fn context_reports_what_is_being_sent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (chain, _provider) = one_tier("an answer");
+        let (tx, mut rx) = loop_over(dir.path(), chain);
+
+        tx.send(Command::Prompt("first".to_string())).expect("send");
+        let _ = collect(&mut rx).await;
+
+        tx.send(Command::Context).expect("send");
+        let events = collect(&mut rx).await;
+        let said = notices(&events).join("\n");
+
+        assert!(said.contains("conversation:"), "{said}");
+        assert!(said.contains("a-model"), "it should name the tier: {said}");
+        assert!(said.contains("sticky"), "and the policy: {said}");
+    }
+
+    #[tokio::test]
+    async fn clear_resets_the_conversation_and_the_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (chain, provider) = one_tier("an answer");
+        let (tx, mut rx) = loop_over(dir.path(), chain);
+
+        tx.send(Command::Prompt("something".to_string()))
+            .expect("send");
+        let _ = collect(&mut rx).await;
+
+        tx.send(Command::Clear).expect("send");
+        let events = collect(&mut rx).await;
+        assert!(
+            notices(&events).iter().any(|n| n.contains("cleared")),
+            "{:?}",
+            notices(&events)
+        );
+        assert!(provider.forgotten() >= 1, "the session must be dropped");
+
+        // The next turn starts a fresh conversation, so the old prompt is gone.
+        tx.send(Command::Context).expect("send");
+        let events = collect(&mut rx).await;
+        let said = notices(&events).join("\n");
+        assert!(
+            said.contains("conversation: 1 message"),
+            "only the system prompt should remain: {said}"
+        );
+    }
+
+    // ---- modes ------------------------------------------------------------
+
+    /// The names offered to the model on a given request.
+    fn offered(request: &ChatRequest) -> Vec<String> {
+        request.tools.iter().map(|spec| spec.name.clone()).collect()
+    }
+
+    #[tokio::test]
+    async fn plan_mode_is_not_offered_the_tools_that_can_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = ScriptedProvider::new(vec![answer("here is a plan")]);
+        let (tx, rx) = spawn(
+            config(dir.path(), DEFAULT_MAX_STEPS),
+            single_tier(provider.clone()),
+            Arc::new(Registry::with_default_tools()),
+            Arc::new(AlwaysApprove::default()),
+        );
+
+        tx.send(Command::SetMode(Mode::Plan)).expect("send");
+        tx.send(Command::Prompt("plan the change".to_string()))
+            .expect("send");
+        let _ = drain(rx).await;
+
+        let names = offered(&provider.request(0));
+        for absent in ["write_file", "edit_file", "run_shell"] {
+            assert!(
+                !names.contains(&absent.to_string()),
+                "{absent} must not be on the table in plan mode: {names:?}"
+            );
+        }
+        for present in ["read_file", "list_dir", "glob", "grep"] {
+            assert!(
+                names.contains(&present.to_string()),
+                "{present} should still be offered: {names:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_mode_refuses_a_write_the_model_asked_for_anyway() {
+        // The guarantee, not the courtesy: a model that names a write tool that
+        // was never offered — hallucinating it, or carrying a habit from build
+        // mode — must not be able to touch the disk.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = ScriptedProvider::new(vec![
+            calls_tool("write_file", r#"{"path":"written.txt","content":"hi"}"#),
+            answer("understood"),
+        ]);
+        let approver = Arc::new(AlwaysApprove::default());
+        let (tx, rx) = spawn(
+            config(dir.path(), DEFAULT_MAX_STEPS),
+            single_tier(provider.clone()),
+            Arc::new(Registry::with_default_tools()),
+            approver.clone(),
+        );
+
+        tx.send(Command::SetMode(Mode::Plan)).expect("send");
+        tx.send(Command::Prompt("write that file".to_string()))
+            .expect("send");
+        let events = drain(rx).await;
+
+        assert!(
+            !dir.path().join("written.txt").exists(),
+            "a refused write must not reach the disk"
+        );
+        assert!(
+            notices(&events)
+                .iter()
+                .any(|note| note.contains("plan mode is read-only")),
+            "the refusal should be visible: {:?}",
+            notices(&events)
+        );
+        assert!(
+            approver.asked.lock().expect("lock").is_empty(),
+            "there is nothing to approve in a read-only mode, so nobody should be asked"
+        );
+
+        // And the model is told why, in terms it can act on.
+        let second = provider.request(1);
+        let tool_message = second
+            .messages
+            .iter()
+            .find(|message| message.role == crate::session::Role::Tool)
+            .expect("the refusal should be fed back");
+        assert!(
+            tool_message.content.contains("not available in plan mode"),
+            "{}",
+            tool_message.content
+        );
+        assert!(
+            tool_message.content.contains("reply with the plan"),
+            "it should point somewhere useful: {}",
+            tool_message.content
+        );
+    }
+
+    #[tokio::test]
+    async fn build_mode_still_allows_a_write_after_approval() {
+        // The other half of the guarantee: leaving plan mode really does restore
+        // the ability to change things.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = ScriptedProvider::new(vec![
+            calls_tool("write_file", r#"{"path":"written.txt","content":"hi"}"#),
+            answer("wrote it"),
+        ]);
+        let (tx, rx) = spawn(
+            config(dir.path(), DEFAULT_MAX_STEPS),
+            single_tier(provider.clone()),
+            Arc::new(Registry::with_default_tools()),
+            Arc::new(AlwaysApprove::default()),
+        );
+
+        // Plan, then straight back to build.
+        tx.send(Command::SetMode(Mode::Plan)).expect("send");
+        tx.send(Command::SetMode(Mode::Build)).expect("send");
+        tx.send(Command::Prompt("write that file".to_string()))
+            .expect("send");
+        let _ = drain(rx).await;
+
+        assert!(
+            dir.path().join("written.txt").exists(),
+            "build mode should have written the file"
+        );
+        assert!(
+            offered(&provider.request(0)).contains(&"write_file".to_string()),
+            "the write tool should be offered again"
+        );
+    }
+
+    #[tokio::test]
+    async fn switching_mode_swaps_the_system_prompt_the_tier_receives() {
+        // The prompt is the first message of the session, so a stale one would
+        // leave a read-only turn being told about approval prompts.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = ScriptedProvider::new(vec![answer("ok"), answer("ok")]);
+        let (tx, mut rx) = spawn(
+            config(dir.path(), DEFAULT_MAX_STEPS),
+            single_tier(provider.clone()),
+            Arc::new(Registry::with_default_tools()),
+            Arc::new(AlwaysApprove::default()),
+        );
+
+        tx.send(Command::Prompt("first".to_string())).expect("send");
+        let _ = drain_from(&mut rx).await;
+        assert!(
+            !provider.request(0).messages[0]
+                .content
+                .contains("PLAN MODE"),
+            "build is the default"
+        );
+
+        tx.send(Command::SetMode(Mode::Plan)).expect("send");
+        tx.send(Command::Prompt("second".to_string()))
+            .expect("send");
+        let _ = drain_from(&mut rx).await;
+
+        let first_message = &provider.request(1).messages[0];
+        assert_eq!(first_message.role, crate::session::Role::System);
+        assert!(
+            first_message.content.contains("PLAN MODE"),
+            "the system prompt should have changed with the mode: {}",
+            first_message.content
+        );
+    }
+
+    #[tokio::test]
+    async fn switching_mode_says_which_mode_is_now_active() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = ScriptedProvider::new(Vec::new());
+        let (tx, mut rx) = spawn(
+            config(dir.path(), DEFAULT_MAX_STEPS),
+            single_tier(provider),
+            Arc::new(Registry::with_default_tools()),
+            Arc::new(AlwaysApprove::default()),
+        );
+
+        tx.send(Command::SetMode(Mode::Plan)).expect("send");
+        let events = collect(&mut rx).await;
+        let said = notices(&events).join(" ");
+        assert!(said.contains("nothing will be changed"), "{said}");
+
+        tx.send(Command::SetMode(Mode::Build)).expect("send");
+        let events = collect(&mut rx).await;
+        let said = notices(&events).join(" ");
+        assert!(said.contains("write files"), "{said}");
     }
 }
