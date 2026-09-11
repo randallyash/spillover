@@ -13,6 +13,7 @@ mod preset;
 mod provider;
 mod session;
 mod setup;
+mod spawn;
 mod text;
 mod tiers;
 mod ui;

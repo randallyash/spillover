@@ -11,7 +11,6 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::provider::dialect::{Dialect, parser_for};
@@ -199,7 +198,7 @@ impl Provider for CliProvider {
         };
         let args = self.build_args(&prompt, &session);
 
-        let mut child = Command::new(&bin)
+        let mut child = crate::spawn::delegated_cli(&bin)
             .args(&args)
             .current_dir(&self.workspace)
             // A CLI that decides to prompt would otherwise wait forever.

@@ -162,6 +162,16 @@ and it is driven through plain text output, which is what nearly every agent CLI
 prints by default. Full configuration is in
 [`config.example.toml`](config.example.toml).
 
+A `cli` tier signs in for itself, so spill **removes the model credentials it knows
+about** (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `XAI_API_KEY`, `GEMINI_API_KEY` and
+their siblings) from the CLI's environment. Otherwise a key exported for one of your
+own endpoint tiers would quietly take precedence over the CLI's login and bill a
+different account — which matters most for exactly the presets that promise a login,
+like `grok` reading your SuperGrok subscription. Nothing else about the environment is
+touched, and `run_shell` is left alone, since that runs your command and should see
+what your shell would. If any of those variables are set, spill says so at startup
+rather than letting the removal be invisible.
+
 A `cli` tier can also **keep its own conversation between turns**. The shipped
 `grok` and `command-code` presets do this already: the first turn opens a session,
 and every turn after that continues it and sends only the new message — rather
@@ -327,13 +337,14 @@ text that happens to sit in a box.
 
 ## Keyboard
 
-`Enter` send · `Shift+Tab` switch mode · `Esc` stop or quit · `PageUp` / `PageDown` scroll
+`Enter` send · `Shift+Tab` switch mode · `Esc` stop or quit · `Ctrl-C` quit · `PageUp` / `PageDown` scroll
 
 `Esc` does the nearest thing first: it stops a turn that is running, and only quits
 when there is nothing to stop. Stopping is not spilling over — the model you chose
 stays the model you chose, the work done so far stays in the conversation, and nothing
 half-written reaches the transcript. It also stops a tool that is running: a build or a
-test is killed rather than waited out.
+test is killed rather than waited out. `Ctrl-C` always quits, from anywhere, including
+the approval prompt and the help overlay.
 
 Before anything that can change your files, a prompt appears showing exactly what it
 will do. `y` runs it, `n` skips it — and the model is told it was declined, so it can

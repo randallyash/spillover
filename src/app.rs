@@ -295,6 +295,18 @@ impl App {
             return;
         }
 
+        // Ctrl-C quits from anywhere, before anything else can claim it. The
+        // approval modal and the help overlay both swallow every key they do not
+        // use, which left the universal way out dead in exactly the two places
+        // someone might want it: a modal asking about a change they do not
+        // understand, and an overlay they opened by accident.
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d'))
+        {
+            self.should_quit = true;
+            return;
+        }
+
         // While the agent is asking, the keys belong to the modal: the answer
         // keys answer it, and the arrows read a preview that does not fit.
         if self.approval.is_some() {
@@ -311,13 +323,6 @@ impl App {
                 KeyCode::PageDown => self.scroll_approval(APPROVAL_PAGE),
                 _ => {}
             }
-            return;
-        }
-
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d'))
-        {
-            self.should_quit = true;
             return;
         }
 
@@ -733,12 +738,16 @@ impl App {
 
             "sticky" => match argument.trim().to_lowercase().as_str() {
                 "on" | "true" | "yes" => {
-                    self.sticky = true;
-                    send(self, Command::SetSticky(true));
+                    // Recorded only once the chain has actually been told, so the
+                    // session panel cannot report a policy that is not in effect.
+                    if send(self, Command::SetSticky(true)) {
+                        self.sticky = true;
+                    }
                 }
                 "off" | "false" | "no" => {
-                    self.sticky = false;
-                    send(self, Command::SetSticky(false));
+                    if send(self, Command::SetSticky(false)) {
+                        self.sticky = false;
+                    }
                 }
                 other => {
                     let complaint = if other.is_empty() {
@@ -758,14 +767,19 @@ impl App {
             }
             "retry" => {
                 let tier = argument.trim();
-                send(
+                // Busy only if the retry actually went somewhere. Setting it
+                // regardless left the app waiting on a turn that was never
+                // started: every later prompt was refused with "still working",
+                // and there was no turn left to finish or cancel, so it never
+                // recovered.
+                if send(
                     self,
                     Command::Retry {
                         tier: (!tier.is_empty()).then(|| tier.to_string()),
                     },
-                );
-                // A retry re-runs a turn, so the interface is busy again.
-                self.busy = true;
+                ) {
+                    self.busy = true;
+                }
             }
             "drop" => {
                 send(self, Command::Drop);
@@ -774,20 +788,24 @@ impl App {
                 send(self, Command::Compact);
             }
             "clear" => {
-                send(self, Command::Clear);
                 // The transcript is the interface's own copy, so it is cleared
-                // here too; the agent's history goes with the command.
-                self.messages.clear();
-                self.running = None;
-                self.streaming = None;
-                self.usage_by_tier.clear();
-                self.turns = 0;
-                self.usage_history.clear();
-                self.tokens_in = 0;
-                self.tokens_out = 0;
-                self.cache_read = 0;
-                self.cache_write = 0;
-                self.scroll_back = 0;
+                // here too — but only once the agent has taken the command.
+                // Clearing regardless wiped the very message explaining that
+                // nothing had been cleared, leaving a blank screen and no reason
+                // for it.
+                if send(self, Command::Clear) {
+                    self.messages.clear();
+                    self.running = None;
+                    self.streaming = None;
+                    self.usage_by_tier.clear();
+                    self.turns = 0;
+                    self.usage_history.clear();
+                    self.tokens_in = 0;
+                    self.tokens_out = 0;
+                    self.cache_read = 0;
+                    self.cache_write = 0;
+                    self.scroll_back = 0;
+                }
             }
             "context" => {
                 send(self, Command::Context);
@@ -1855,6 +1873,116 @@ mod tests {
             last_message(&app).contains("nowhere to go"),
             "{}",
             last_message(&app)
+        );
+    }
+
+    #[test]
+    fn retry_with_no_agent_does_not_wedge_the_app() {
+        // `busy` is what gates the next prompt, so setting it with nothing
+        // running left the app refusing every later message with "still
+        // working" — and there was no turn left to finish or cancel, so it
+        // never recovered.
+        let mut app = new_app();
+        type_and_send(&mut app, "/retry");
+
+        assert!(!app.busy, "nothing was started, so nothing is running");
+        assert!(
+            last_message(&app).contains("nowhere to go"),
+            "{}",
+            last_message(&app)
+        );
+
+        // The proof that it is not wedged: a prompt still gets through to the
+        // point of being sent, rather than being refused as busy.
+        type_and_send(&mut app, "hello");
+        assert!(
+            last_message(&app).contains("no tier is available"),
+            "the app is still refusing prompts: {}",
+            last_message(&app)
+        );
+        assert!(!app.busy);
+    }
+
+    #[test]
+    fn sticky_with_no_agent_reports_the_policy_that_is_actually_in_effect() {
+        let mut app = new_app();
+        assert!(app.sticky, "sticky is the default");
+
+        type_and_send(&mut app, "/sticky off");
+
+        assert!(
+            app.sticky,
+            "the chain was never told, so the panel must not claim otherwise"
+        );
+        assert!(
+            last_message(&app).contains("nowhere to go"),
+            "{}",
+            last_message(&app)
+        );
+    }
+
+    #[test]
+    fn clear_with_no_agent_leaves_the_transcript_alone() {
+        // Clearing regardless wiped the very message explaining that nothing had
+        // been cleared, leaving a blank screen and no reason for it.
+        let mut app = new_app();
+        let before = app.messages.len();
+
+        type_and_send(&mut app, "/clear");
+
+        assert_eq!(app.messages.len(), before + 1, "only the explanation");
+        assert!(
+            last_message(&app).contains("nowhere to go"),
+            "{}",
+            last_message(&app)
+        );
+    }
+
+    #[test]
+    fn ctrl_c_quits_even_while_a_tool_waits() {
+        // The modal swallows every key it does not use, so the universal way out
+        // was dead in the one place someone might most want it: a change they do
+        // not understand.
+        let mut app = new_app();
+        let (reply, _answer) = oneshot::channel();
+        app.set_approval(ApprovalRequest {
+            tool: "write_file".to_string(),
+            preview: "create a.txt".to_string(),
+            reply,
+        });
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+        assert!(app.should_quit, "the way out must not be swallowed");
+    }
+
+    #[test]
+    fn ctrl_c_quits_even_with_the_help_overlay_open() {
+        let mut app = new_app();
+        app.help = true;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn escape_still_denies_a_tool_rather_than_quitting() {
+        // Ctrl-C leaving the modal must not have cost Esc its meaning there.
+        let mut app = new_app();
+        let (reply, mut answer) = oneshot::channel();
+        app.set_approval(ApprovalRequest {
+            tool: "write_file".to_string(),
+            preview: "create a.txt".to_string(),
+            reply,
+        });
+
+        app.handle_key(press(KeyCode::Esc));
+
+        assert_eq!(answer.try_recv().expect("an answer"), Decision::Deny);
+        assert!(
+            !app.should_quit,
+            "Esc in the modal answers it, it does not quit"
         );
     }
 

@@ -8,6 +8,31 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- `Ctrl-C` quits from anywhere again. The approval prompt and the help overlay
+  both swallow every key they do not use, and the check for `Ctrl-C` sat below
+  them, so the universal way out was dead in exactly the two places someone might
+  most want it: a modal asking about a change they do not understand, and an
+  overlay they opened by accident. `Esc` still answers the modal rather than
+  quitting; the two keys now mean two different things.
+- `/retry` no longer wedges the program. It marked the app busy whether or not
+  the command had anywhere to go, so with no agent running every later prompt was
+  refused with "still working" and there was no turn left to finish or cancel — it
+  never recovered. `/sticky` had the same shape of bug: it recorded a policy the
+  chain had never been told about, so the session panel could report one that was
+  not in effect. `/clear` cleared the transcript regardless, which wiped the very
+  message explaining that nothing had been cleared. All three now commit their
+  local state only once the agent has taken the command.
+- A delegated CLI no longer inherits spill's model credentials. A `cli` tier hands
+  the turn to a harness that signs in for itself, and several of those prefer an
+  API key from the environment over the login they hold — so a key exported for
+  one of spill's own endpoint tiers would quietly take precedence and bill a
+  different account. The `xai` endpoint preset reads `XAI_API_KEY`, so a user with
+  that configured beside a `grok` tier had exported exactly the variable that
+  would redirect the CLI away from SuperGrok. Those variables are now removed from
+  a delegated CLI's environment, everything else is inherited untouched,
+  `run_shell` is deliberately left alone, and startup names the variables it
+  removed so the removal is never the invisible cause of a CLI that cannot find
+  its key.
 - `Esc` stops a turn instead of quitting the program. It used to kill the whole
   session, which meant a model forty seconds into a bad answer left no way out
   but losing the conversation. Stopping is deliberately not the same as spilling

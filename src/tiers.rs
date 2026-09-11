@@ -52,6 +52,26 @@ pub fn notes(library: &Library, config: &Config) -> Vec<String> {
         }
     }
 
+    // A delegated CLI signs in for itself, so a model credential in this
+    // environment would only redirect its billing. Saying so, once, means the
+    // removal is never the invisible cause of a CLI that cannot find its key.
+    let delegated: Vec<&str> = config
+        .tiers
+        .iter()
+        .filter(|tier| tier.kind == TierKind::Cli)
+        .map(|tier| tier.display_name())
+        .collect();
+    let credentials = crate::spawn::inherited_credentials();
+    if !delegated.is_empty() && !credentials.is_empty() {
+        notes.push(format!(
+            "{} sign in for themselves and are given their own credentials, so spill removes {} \
+             from their environment rather than let a key meant for another tier change which \
+             account is billed",
+            delegated.join(", "),
+            credentials.join(", ")
+        ));
+    }
+
     // Running a model without its own guardrails is worth saying out loud.
     let unattended: Vec<&str> = config
         .tiers
