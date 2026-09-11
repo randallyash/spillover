@@ -504,9 +504,6 @@ Not yet:
 - Windows `winget` and `scoop` manifests.
 - `spill setup` offers hosted endpoints but does not yet validate a model id that was
   typed by hand rather than picked from the list.
-- The Grok tier is written and its session flags are verified, but it could not be
-  exercised end to end here: every `grok` call on this machine answers
-  `402 Payment Required — usage balance exhausted`.
 
 ## License
 
