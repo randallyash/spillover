@@ -2,6 +2,7 @@
 //! results back, and repeat until the model answers without asking for one.
 
 pub mod approval;
+pub mod consult;
 pub mod tools;
 
 use std::path::PathBuf;
@@ -206,6 +207,20 @@ pub enum AgentEvent {
     /// The user stopped the turn. The tier is named so the transcript can say
     /// where it was stopped, not just that it was.
     Cancelled { tier: String },
+    /// The driver was stuck and asked the tier below it a narrow question,
+    /// rather than handing the turn over.
+    Consulted {
+        driver: String,
+        consultant: String,
+        /// One line for the transcript: what the consult was about.
+        about: String,
+        /// Which consult this was within the turn, and the cap.
+        nth: u32,
+        of: u32,
+        /// What the consultant spent, so it is billed to the tier that spent it
+        /// rather than to the driver.
+        usage: Option<Usage>,
+    },
     /// Every tier was tried and none of them produced an answer.
     Exhausted { reason: String },
 }
@@ -561,10 +576,16 @@ async fn run_turn(
     let checkpoint = session.messages().len();
     // A cancel from a previous turn must not stop this one.
     config.cancel.arm();
+    // Consults spent within this turn, and what each one said. Both are
+    // per-turn: the cap exists to bound one stuck episode, and the answers are
+    // only relevant to the consult that follows them.
+    let mut consulted: Vec<consult::Previous> = Vec::new();
 
     loop {
-        let tier = chain.active();
-        let outcome = try_tier(config, tier, mode, registry, approver, events, session).await;
+        let outcome = {
+            let tier = chain.active();
+            try_tier(config, tier, mode, registry, approver, events, session).await
+        };
 
         match outcome {
             Attempt::Answered => return,
@@ -574,19 +595,79 @@ async fn run_turn(
                 // this point is real work, and the same tier will carry on from
                 // it. The half-generated answer was never pushed to the session
                 // (only the finished ones are), so there is nothing to undo.
-                let _ = events.send(AgentEvent::Cancelled {
-                    tier: tier.label.clone(),
-                });
+                let tier = chain.active().label.clone();
+                let _ = events.send(AgentEvent::Cancelled { tier });
                 return;
             }
             Attempt::Stuck(reason) => {
-                let from = tier.label.clone();
-                let abandoned = Arc::clone(&tier.provider);
+                // Read out of the driver before it can be borrowed mutably below.
+                let (from, wants_consult, cap) = {
+                    let tier = chain.active();
+                    (
+                        tier.label.clone(),
+                        tier.consults_when_stuck(),
+                        tier.consults_per_turn,
+                    )
+                };
+
+                // A consult keeps the driver in charge, so it is tried before
+                // handing the turn over. It is only tried when it can succeed:
+                // the tier has to ask for it, there has to be someone below to
+                // ask, and the cap has to have budget left. Any failure falls
+                // through to escalating, which is the path that always
+                // terminates.
+                if wants_consult && (consulted.len() as u32) < cap && chain.consultant().is_some() {
+                    // The evidence is what the failed attempt added, read before
+                    // it is discarded. This is the plan's central point: the
+                    // question is built from what spill already holds, and the
+                    // driver contributes no prose of its own.
+                    let evidence: Vec<ChatMessage> = session.messages()[checkpoint..].to_vec();
+                    let goal = goal_before(session, checkpoint);
+
+                    if let Some(answer) =
+                        try_consult(config, chain, &goal, &reason, &evidence, &consulted, events)
+                            .await
+                    {
+                        let consultant = chain
+                            .consultant()
+                            .map(|tier| tier.label.clone())
+                            .unwrap_or_default();
+
+                        // The failed attempt goes, exactly as it would for an
+                        // escalation: it was the poison. What replaces it is the
+                        // answer, which is short and is the only new context.
+                        session.truncate(checkpoint);
+                        // The driver's CLI session still holds the output just
+                        // discarded, so it must not be resumed either.
+                        chain.active().provider.forget_session();
+                        session.push(ChatMessage::system(consult::injection(
+                            &consultant,
+                            &answer.text,
+                        )));
+
+                        consulted.push(consult::Previous {
+                            consultant: consultant.clone(),
+                            answer: answer.text.clone(),
+                        });
+                        let _ = events.send(AgentEvent::Consulted {
+                            driver: from.clone(),
+                            consultant,
+                            about: answer.about,
+                            nth: consulted.len() as u32,
+                            of: cap,
+                            usage: answer.usage,
+                        });
+
+                        // Back to the same tier, with the answer in hand.
+                        continue;
+                    }
+                }
+
                 // Throw the failed attempt away before another model reads it.
                 session.truncate(checkpoint);
                 // A CLI tier may be holding a session that contains the output
                 // just discarded, so it must not be resumed.
-                abandoned.forget_session();
+                chain.active().provider.forget_session();
 
                 match chain.escalate() {
                     Some(next) => {
@@ -607,6 +688,107 @@ async fn run_turn(
             }
         }
     }
+}
+
+/// The user's own words for this turn.
+///
+/// Found by searching back for the user turn rather than assuming it sits at
+/// `checkpoint - 1`, so a later change to how a turn is opened cannot silently
+/// start sending something else as the goal.
+fn goal_before(session: &Session, checkpoint: usize) -> String {
+    session.messages()[..checkpoint]
+        .iter()
+        .rev()
+        .find(|message| message.role == crate::session::Role::User)
+        .map(|message| message.content.clone())
+        .unwrap_or_default()
+}
+
+/// What a consultant produced, plus what it cost.
+struct Answer {
+    text: String,
+    /// One line for the transcript: why the driver was stuck, which is what the
+    /// consult was about. It does not restate who asked whom — the transcript
+    /// line already carries both names, and saying them three times made the
+    /// message wrap across three rows.
+    about: String,
+    usage: Option<Usage>,
+}
+
+/// Put the stuck driver's question to the tier below it, as a fresh call.
+///
+/// `None` when the consult itself failed or was stopped, which the caller turns
+/// into an escalation: a consult that cannot complete must not strand the turn.
+#[allow(clippy::too_many_arguments)]
+async fn try_consult(
+    config: &AgentConfig,
+    chain: &FallbackChain,
+    goal: &str,
+    reason: &StuckReason,
+    evidence: &[ChatMessage],
+    previous: &[consult::Previous],
+    events: &UnboundedSender<AgentEvent>,
+) -> Option<Answer> {
+    let consultant = chain.consultant()?;
+    let question = consult::build(goal, reason, evidence, previous);
+
+    // No tools. For an `openai` tier that is what makes "the answer is prose"
+    // true rather than hoped for: it has nothing to call, so it must answer, and
+    // the call is one round trip rather than a tool loop. A `cli` tier runs its
+    // own harness and cannot be stripped of its tools this way, which is why the
+    // question asks it plainly not to act.
+    let request = ChatRequest {
+        model: consultant.model.clone(),
+        messages: vec![ChatMessage::user(question.question.clone())],
+        tools: Vec::new(),
+    };
+
+    let mut watchdog = Watchdog::new(&consultant.limits);
+    // The consultant's answer is not the driver's answer, so its text must not
+    // reach the transcript as though the driver had said it. A throwaway channel
+    // is how that is guaranteed: the watchdog still sees every frame, so a
+    // looping consultant is still caught, but the UI hears nothing until the
+    // call is over and reported as a consult.
+    let (discard, _unused) = mpsc::unbounded_channel();
+
+    let summary = match stream_turn(
+        &consultant.provider,
+        request,
+        &discard,
+        &mut watchdog,
+        &config.cancel,
+    )
+    .await
+    {
+        Ok(summary) => summary,
+        Err(reason) => {
+            // Said out loud, because a silent fallback would make consult look
+            // like it simply did nothing.
+            let _ = events.send(AgentEvent::Notice(format!(
+                "{} could not be consulted ({}) — carrying on as if it had not been asked",
+                consultant.label,
+                reason.summary()
+            )));
+            return None;
+        }
+    };
+
+    let text = summary.text.trim().to_string();
+    if text.is_empty() {
+        // An empty answer is not an answer: injecting it would add nothing and
+        // cost context, so the turn escalates instead.
+        let _ = events.send(AgentEvent::Notice(format!(
+            "{} was consulted but said nothing — carrying on as if it had not been asked",
+            consultant.label
+        )));
+        return None;
+    }
+
+    Some(Answer {
+        text,
+        about: reason.summary(),
+        usage: summary.usage,
+    })
 }
 
 /// Shrink the history when a tier is about to be abandoned, so the tier that
@@ -998,7 +1180,7 @@ mod tests {
     use super::*;
     use crate::agent::approval::testing::{AlwaysApprove, AlwaysDeny};
     use crate::agent::tools::Registry;
-    use crate::config::Limits;
+    use crate::config::{Limits, OnStuck};
     use crate::provider::{ProviderError, TurnSummary};
     use async_trait::async_trait;
     use std::collections::VecDeque;
@@ -1130,11 +1312,13 @@ mod tests {
         let tiers = tiers
             .into_iter()
             .enumerate()
-            .map(|(index, (provider, limits))| Tier {
-                label: format!("Tier {index}"),
-                model: format!("model-{index}"),
-                provider,
-                limits,
+            .map(|(index, (provider, limits))| {
+                Tier::new(
+                    format!("Tier {index}"),
+                    format!("model-{index}"),
+                    provider,
+                    limits,
+                )
             })
             .collect();
         FallbackChain::new(tiers, true).expect("at least one tier")
@@ -1854,18 +2038,18 @@ mod tests {
         let first = Quiet::new("first answer");
         let second = Quiet::new("second answer");
         let tiers = vec![
-            Tier {
-                label: "Local (http://10.0.0.1:1234/v1)".to_string(),
-                model: "m0".to_string(),
-                provider: first.clone(),
-                limits: Limits::default(),
-            },
-            Tier {
-                label: "DeepSeek V4 Flash".to_string(),
-                model: "m1".to_string(),
-                provider: second.clone(),
-                limits: Limits::default(),
-            },
+            Tier::new(
+                "Local (http://10.0.0.1:1234/v1)".to_string(),
+                "m0".to_string(),
+                first.clone(),
+                Limits::default(),
+            ),
+            Tier::new(
+                "DeepSeek V4 Flash".to_string(),
+                "m1".to_string(),
+                second.clone(),
+                Limits::default(),
+            ),
         ];
         (tiers, first, second)
     }
@@ -1885,12 +2069,12 @@ mod tests {
     fn one_tier(answer: &str) -> (FallbackChain, Arc<Quiet>) {
         let provider = Quiet::new(answer);
         let chain = FallbackChain::new(
-            vec![Tier {
-                label: "Only".to_string(),
-                model: "a-model".to_string(),
-                provider: provider.clone(),
-                limits: Limits::default(),
-            }],
+            vec![Tier::new(
+                "Only".to_string(),
+                "a-model".to_string(),
+                provider.clone(),
+                Limits::default(),
+            )],
             true,
         )
         .expect("a chain");
@@ -2003,12 +2187,7 @@ mod tests {
         let (tiers, _first, _second) = two_tiers();
         let tiers: Vec<Tier> = tiers
             .into_iter()
-            .map(|tier| Tier {
-                label: tier.label,
-                model: tier.model,
-                provider: Quiet::new(&long),
-                limits: tier.limits,
-            })
+            .map(|tier| Tier::new(tier.label, tier.model, Quiet::new(&long), tier.limits))
             .collect();
         let chain = FallbackChain::new(tiers, true).expect("a chain");
         let (tx, mut rx) = loop_over(dir.path(), chain);
@@ -2377,20 +2556,20 @@ mod tests {
         let (config, cancel) = config_with_cancel(dir.path(), DEFAULT_MAX_STEPS);
         let chain = FallbackChain::new(
             vec![
-                Tier {
-                    label: "Endless".to_string(),
-                    model: "m".to_string(),
-                    provider: Arc::new(Endless {
+                Tier::new(
+                    "Endless".to_string(),
+                    "m".to_string(),
+                    Arc::new(Endless {
                         streamed: std::sync::atomic::AtomicUsize::new(0),
                     }),
-                    limits: Limits::default(),
-                },
-                Tier {
-                    label: "DeepSeek".to_string(),
-                    model: "m".to_string(),
-                    provider: second.clone(),
-                    limits: Limits::default(),
-                },
+                    Limits::default(),
+                ),
+                Tier::new(
+                    "DeepSeek".to_string(),
+                    "m".to_string(),
+                    second.clone(),
+                    Limits::default(),
+                ),
             ],
             true,
         )
@@ -2519,5 +2698,447 @@ mod tests {
                 "call {id} has no result, so this request would be rejected"
             );
         }
+    }
+    // ---- consult ----------------------------------------------------------
+
+    /// A driver that loops, and a consultant that answers.
+    ///
+    /// The driver is given a second turn so it can answer once it has been
+    /// helped, which is what distinguishes a consult from an escalation.
+    fn consultable(
+        consult_cap: u32,
+    ) -> (FallbackChain, Arc<ScriptedProvider>, Arc<ScriptedProvider>) {
+        let driver = ScriptedProvider::new(vec![looping_answer(), answer("recovered")]);
+        let consultant = ScriptedProvider::new(vec![answer("Use a HashMap instead.")]);
+
+        let mut first = Tier::new(
+            "Local".to_string(),
+            "m0".to_string(),
+            driver.clone(),
+            Limits::default(),
+        );
+        first.on_stuck = OnStuck::Consult;
+        first.consults_per_turn = consult_cap;
+
+        let second = Tier::new(
+            "DeepSeek".to_string(),
+            "m1".to_string(),
+            consultant.clone(),
+            Limits::default(),
+        );
+
+        (
+            FallbackChain::new(vec![first, second], true).expect("a chain"),
+            driver,
+            consultant,
+        )
+    }
+
+    fn consulted(events: &[AgentEvent]) -> Vec<(String, String)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Consulted {
+                    driver, consultant, ..
+                } => Some((driver.clone(), consultant.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_stuck_driver_consults_and_then_carries_on_itself() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (chain, driver, consultant) = consultable(2);
+        let (tx, mut rx) = loop_over(dir.path(), chain);
+
+        tx.send(Command::Prompt("make the tests pass".to_string()))
+            .expect("send");
+        let events = drain_from(&mut rx).await;
+
+        // The point of consult: the turn was never handed over.
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Escalated { .. })),
+            "a consult must not escalate: {events:?}"
+        );
+        assert_eq!(
+            consulted(&events),
+            vec![("Local".to_string(), "DeepSeek".to_string())],
+            "{events:?}"
+        );
+        assert!(
+            matches!(events.last(), Some(AgentEvent::Finished { .. })),
+            "the driver should have finished the turn: {:?}",
+            events.last()
+        );
+
+        // Two requests at the driver: the one that looped, and the one after the
+        // advice. One at the consultant.
+        assert_eq!(driver.request_count(), 2);
+        assert_eq!(consultant.request_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_advice_reaches_the_driver_as_context_it_can_act_on() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (chain, driver, _consultant) = consultable(2);
+        let (tx, mut rx) = loop_over(dir.path(), chain);
+
+        tx.send(Command::Prompt("make the tests pass".to_string()))
+            .expect("send");
+        let _ = drain_from(&mut rx).await;
+
+        let after = driver.request(1);
+        let injected = after
+            .messages
+            .iter()
+            .find(|message| message.content.contains("more capable model"))
+            .expect("the advice should be in the driver's history");
+
+        assert!(
+            injected.content.contains("Use a HashMap instead."),
+            "{}",
+            injected.content
+        );
+        assert!(
+            injected.content.contains("advice, not a report of work"),
+            "the driver must not think the work is already done: {}",
+            injected.content
+        );
+    }
+
+    #[tokio::test]
+    async fn the_consultant_is_offered_no_tools_so_it_must_answer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (chain, _driver, consultant) = consultable(2);
+        let (tx, mut rx) = loop_over(dir.path(), chain);
+
+        tx.send(Command::Prompt("go".to_string())).expect("send");
+        let _ = drain_from(&mut rx).await;
+
+        let request = consultant.request(0);
+        assert!(
+            request.tools.is_empty(),
+            "a consultant with tools would act instead of answering: {:?}",
+            request.tools
+        );
+    }
+
+    #[tokio::test]
+    async fn the_question_is_built_from_the_users_words_and_the_raw_reason() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (chain, _driver, consultant) = consultable(2);
+        let (tx, mut rx) = loop_over(dir.path(), chain);
+
+        tx.send(Command::Prompt("make the tests pass".to_string()))
+            .expect("send");
+        let _ = drain_from(&mut rx).await;
+
+        let question = &consultant.request(0).messages[0].content;
+        assert!(
+            question.contains("make the tests pass"),
+            "the goal must be the user's own words: {question}"
+        );
+        assert!(
+            question.contains("repeated the same output"),
+            "the raw reason must be there: {question}"
+        );
+        assert!(
+            question.contains("the same line"),
+            "the looped output is the evidence, so it goes in verbatim: {question}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_consult_is_told_the_first_advice_failed() {
+        // Otherwise the likeliest outcome of consulting twice is paying for the
+        // same advice again.
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let driver = ScriptedProvider::new(vec![
+            looping_answer(),
+            looping_answer(),
+            answer("recovered"),
+        ]);
+        let consultant = ScriptedProvider::new(vec![
+            answer("Try a HashMap."),
+            answer("Then try a BTreeMap."),
+        ]);
+
+        let mut first = Tier::new(
+            "Local".to_string(),
+            "m0".to_string(),
+            driver.clone(),
+            Limits::default(),
+        );
+        first.on_stuck = OnStuck::Consult;
+        first.consults_per_turn = 3;
+        let second = Tier::new(
+            "DeepSeek".to_string(),
+            "m1".to_string(),
+            consultant.clone(),
+            Limits::default(),
+        );
+        let chain = FallbackChain::new(vec![first, second], true).expect("a chain");
+
+        let (tx, mut rx) = loop_over(dir.path(), chain);
+        tx.send(Command::Prompt("go".to_string())).expect("send");
+        let events = drain_from(&mut rx).await;
+
+        assert_eq!(consulted(&events).len(), 2, "{events:?}");
+        let second_question = &consultant.request(1).messages[0].content;
+        assert!(
+            second_question.contains("already been helped"),
+            "{second_question}"
+        );
+        assert!(
+            second_question.contains("Try a HashMap."),
+            "it should know what was already said: {second_question}"
+        );
+        assert!(
+            second_question.contains("Do not repeat that advice"),
+            "{second_question}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_cap_is_what_stops_a_stuck_driver_spinning_the_frontier() {
+        // The whole reason the cap exists: without it a driver in a loop could
+        // ask forever, and every ask is a frontier call.
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Always loops, so nothing but the cap can end it.
+        let driver = Arc::new(ScriptedProvider {
+            turns: Mutex::new(VecDeque::new()),
+            requests: Mutex::new(Vec::new()),
+            fallback: looping_answer(),
+            fail_with: None,
+        });
+        let consultant = ScriptedProvider::new(vec![answer("advice one"), answer("advice two")]);
+
+        let mut first = Tier::new(
+            "Local".to_string(),
+            "m0".to_string(),
+            driver.clone(),
+            Limits::default(),
+        );
+        first.on_stuck = OnStuck::Consult;
+        first.consults_per_turn = 2;
+        let second = Tier::new(
+            "DeepSeek".to_string(),
+            "m1".to_string(),
+            consultant.clone(),
+            Limits::default(),
+        );
+        // Two tiers only, so after the cap the driver escalates into the
+        // consultant and then exhausts.
+        let chain = FallbackChain::new(vec![first, second], true).expect("a chain");
+
+        let (tx, mut rx) = loop_over(dir.path(), chain);
+        tx.send(Command::Prompt("go".to_string())).expect("send");
+        let events = drain_from(&mut rx).await;
+
+        assert_eq!(
+            consulted(&events).len(),
+            2,
+            "it should consult exactly the cap, then stop asking: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Escalated { .. })),
+            "once the budget is spent the turn must escalate: {events:?}"
+        );
+        assert_eq!(
+            consultant.request_count(),
+            3,
+            "twice as a consultant and once as the tier it escalated into"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_consult_that_cannot_complete_escalates_rather_than_stranding_the_turn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A consultant that fails, so the consult cannot complete.
+        let consultant = ScriptedProvider::failing("connection refused");
+        let driver = ScriptedProvider::new(vec![looping_answer(), answer("recovered")]);
+
+        let mut first = Tier::new(
+            "Local".to_string(),
+            "m0".to_string(),
+            driver,
+            Limits::default(),
+        );
+        first.on_stuck = OnStuck::Consult;
+        let second = Tier::new(
+            "DeepSeek".to_string(),
+            "m1".to_string(),
+            consultant,
+            Limits::default(),
+        );
+        let chain = FallbackChain::new(vec![first, second], true).expect("a chain");
+
+        let (tx, mut rx) = loop_over(dir.path(), chain);
+        tx.send(Command::Prompt("go".to_string())).expect("send");
+        let events = drain_from(&mut rx).await;
+
+        assert!(
+            notices(&events)
+                .iter()
+                .any(|note| note.contains("could not be consulted")),
+            "the failure should be visible: {:?}",
+            notices(&events)
+        );
+        assert!(
+            consulted(&events).is_empty(),
+            "a failed consult is not a consult: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Escalated { .. })),
+            "it must fall through to the path that always terminates: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_answer_escalates_rather_than_injecting_nothing() {
+        // An empty injection would cost context and say nothing, so it is not
+        // treated as a successful consult.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let consultant = ScriptedProvider::new(vec![answer("")]);
+        let driver = ScriptedProvider::new(vec![looping_answer(), answer("recovered")]);
+
+        let mut first = Tier::new(
+            "Local".to_string(),
+            "m0".to_string(),
+            driver,
+            Limits::default(),
+        );
+        first.on_stuck = OnStuck::Consult;
+        let second = Tier::new(
+            "DeepSeek".to_string(),
+            "m1".to_string(),
+            consultant,
+            Limits::default(),
+        );
+        let chain = FallbackChain::new(vec![first, second], true).expect("a chain");
+
+        let (tx, mut rx) = loop_over(dir.path(), chain);
+        tx.send(Command::Prompt("go".to_string())).expect("send");
+        let events = drain_from(&mut rx).await;
+
+        assert!(consulted(&events).is_empty(), "{events:?}");
+        assert!(
+            notices(&events)
+                .iter()
+                .any(|note| note.contains("said nothing")),
+            "{:?}",
+            notices(&events)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_driver_with_no_tier_below_it_escalates_instead_of_consulting() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let driver = ScriptedProvider::new(vec![looping_answer(), answer("recovered")]);
+        let mut only = Tier::new(
+            "Local".to_string(),
+            "m0".to_string(),
+            driver,
+            Limits::default(),
+        );
+        only.on_stuck = OnStuck::Consult;
+        let chain = FallbackChain::new(vec![only], true).expect("a chain");
+
+        let (tx, mut rx) = loop_over(dir.path(), chain);
+        tx.send(Command::Prompt("go".to_string())).expect("send");
+        let events = drain_from(&mut rx).await;
+
+        assert!(
+            consulted(&events).is_empty(),
+            "there is nobody to ask: {events:?}"
+        );
+        assert!(
+            matches!(events.last(), Some(AgentEvent::Exhausted { .. })),
+            "with no next tier the turn ends: {:?}",
+            events.last()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_default_policy_still_escalates_and_never_consults() {
+        // Consult is opt-in; nothing about the old behaviour may have changed.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let looping = ScriptedProvider::new(vec![looping_answer()]);
+        let healthy = ScriptedProvider::new(vec![answer("recovered")]);
+
+        let tiers: Vec<(Arc<dyn Provider>, Limits)> =
+            vec![(looping, Limits::default()), (healthy, Limits::default())];
+        let (tx, mut rx) = loop_over(dir.path(), chain_of(tiers));
+
+        tx.send(Command::Prompt("go".to_string())).expect("send");
+        let events = drain_from(&mut rx).await;
+
+        assert!(
+            consulted(&events).is_empty(),
+            "the default tier must not consult: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Escalated { .. })),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_consultants_tokens_are_reported_as_the_consultants() {
+        // `/cost` is the measurement consult exists to inform, so charging the
+        // consultant's tokens to the driver would defeat the point.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let driver = ScriptedProvider::new(vec![looping_answer(), answer("recovered")]);
+        let consultant = ScriptedProvider::new(vec![TurnSummary {
+            text: "Use a HashMap.".to_string(),
+            stop_reason: Some("end_turn".to_string()),
+            usage: Some(Usage {
+                prompt_tokens: 900,
+                completion_tokens: 40,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            }),
+            ..TurnSummary::default()
+        }]);
+
+        let mut first = Tier::new(
+            "Local".to_string(),
+            "m0".to_string(),
+            driver,
+            Limits::default(),
+        );
+        first.on_stuck = OnStuck::Consult;
+        let second = Tier::new(
+            "DeepSeek".to_string(),
+            "m1".to_string(),
+            consultant,
+            Limits::default(),
+        );
+        let chain = FallbackChain::new(vec![first, second], true).expect("a chain");
+
+        let (tx, mut rx) = loop_over(dir.path(), chain);
+        tx.send(Command::Prompt("go".to_string())).expect("send");
+        let events = drain_from(&mut rx).await;
+
+        let usage = events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::Consulted { usage, .. } => *usage,
+                _ => None,
+            })
+            .expect("the consult should report its usage");
+        assert_eq!(usage.prompt_tokens, 900);
+        assert_eq!(usage.completion_tokens, 40);
     }
 }

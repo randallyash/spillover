@@ -61,6 +61,39 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Consulting a tier instead of handing the turn over.** Escalating changes which
+  model you are using for the rest of the session, and makes the bigger one pay for
+  the whole conversation again. `on_stuck = "consult"` on a tier keeps that tier
+  driving and spends the next tier on one narrow question, whose answer comes back
+  as advice.
+
+  What goes in the question is the whole design. It is built from evidence spill
+  already holds — the user's own words, the reason the tier was judged stuck, and
+  the raw tool call with its raw error, or the output that was repeating — and never
+  from a summary written by the model that got stuck, because that model is the one
+  that does not understand the problem. The repeating case had to come from the
+  stuck reason rather than the session: a turn that loops is abandoned before any of
+  it is recorded, so the detector's own sample is the only copy of that evidence.
+
+  The consultant is given no tools, which is what makes "the answer is prose" true
+  for an `openai` endpoint rather than hoped for: it has nothing to call, so it must
+  answer, and the call is one round trip rather than an agent loop. A `cli`
+  consultant runs its own harness and cannot be stripped of its tools this way, so
+  the question asks it plainly not to act and the README says so.
+
+  Consult falls back to escalating rather than insisting: when the per-turn budget
+  is spent, when the consult fails or is stopped, when the answer comes back empty,
+  or when there is no tier below to ask. A stuck turn is therefore never stranded,
+  and a consult can never cost more than the escalation it replaced. The answer is
+  clipped before it enters the driver's history, because it is re-read on every
+  later turn of the session. A second consult is told what the first one said and
+  that it did not work, since the likeliest outcome of asking twice is paying for
+  the same advice again.
+
+  The consultant's tokens are attributed to the consultant rather than to the
+  driving tier, so `/cost` measures the thing the choice between the two modes
+  turns on.
+
 - Build and plan modes, switched with `Shift+Tab` (or `Tab` when no command is
   being typed). Plan mode is read-only, and that is enforced in three places
   rather than requested once: the write tools are never offered to the model, a

@@ -215,6 +215,48 @@ Three things worth knowing:
 - A `cli` tier's **session is dropped** too, so it starts a fresh conversation next
   time rather than resuming one that holds the answer that was thrown away.
 
+### Consulting instead of handing over
+
+Escalating changes which model you are using for the rest of the session: the cheap
+one is abandoned, and the expensive one pays for the whole conversation again. A
+**consult** is the alternative — keep the cheap model driving, and spend the bigger
+one on one narrow question.
+
+```toml
+[[tier]]
+id = "local"
+kind = "openai"
+preset = "lmstudio"
+on_stuck = "consult"      # default is "escalate"
+consults_per_turn = 2     # the default
+```
+
+When that tier gets stuck, the next tier in the chain is asked a question built from
+evidence spill already holds: your own words, the reason the tier was judged stuck, and
+the raw tool call with its raw error — or, when it was repeating itself, the output that
+repeated. Never a summary written by the model that got stuck, because the model that
+got stuck is the one that does not understand the problem. The answer comes back as
+advice, and the same tier carries on with it.
+
+The consultant is given **no tools**, so it cannot act — it has to answer, and the call
+is one round trip rather than an agent loop. That is what makes the answer prose, and it
+is why consult is the cheaper move when the answer is something the driver can act on.
+
+It is not always the right move, so it falls back rather than insisting:
+
+- when the budget for the turn is spent, the turn **escalates** as it always did;
+- if the consult fails, is stopped, or comes back empty, the turn **escalates** too;
+- with no tier below, there is nobody to ask, so it **escalates**.
+
+A stuck turn is therefore never stranded, and consult can never cost more than the
+escalation it replaced.
+
+Two caveats worth stating plainly. A `cli` consultant runs its own harness and brings
+its own tools — spill cannot withhold them the way it can for an `openai` endpoint — so
+the question asks it not to act but cannot guarantee it; use an endpoint as the
+consultant if that matters. And a `cli` tier's consult is still a full agent run, so it
+is not the cheap call that consulting an endpoint is.
+
 ## One-shot use
 
 For scripts and pipelines, `-p` answers one prompt and exits:

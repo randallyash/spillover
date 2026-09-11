@@ -628,6 +628,45 @@ impl App {
                 self.messages
                     .push(Message::system(format!("✗ you stopped {tier}")));
             }
+            AgentEvent::Consulted {
+                driver,
+                consultant,
+                about,
+                nth,
+                of,
+                usage,
+            } => {
+                // The failed attempt is being thrown away in the conversation, so
+                // it has to leave the transcript too. Without this the looped
+                // output that got the tier stuck stays on screen looking like
+                // part of the answer, which is exactly what the rollback exists
+                // to prevent.
+                self.discard_streaming_message();
+                self.streaming = None;
+                self.running = None;
+                // The consultant's tokens belong to the consultant. Charging
+                // them to the active tier would make `/cost` wrong in exactly the
+                // comparison consult exists to inform.
+                if let Some(usage) = usage {
+                    self.record_usage_on(Some(&consultant), &usage);
+                }
+                // Where the consult sits in its budget, so a turn that consulted
+                // twice is not mistaken for one that consulted once.
+                let position = if of > 1 {
+                    format!(" ({nth}/{of})")
+                } else {
+                    String::new()
+                };
+                // Short names, like the rail: the addresses belong in the
+                // session panel. And the reason is stated once — an earlier
+                // version repeated both names and the question inside this one
+                // line, which wrapped across three rows saying one thing.
+                self.messages.push(Message::system(format!(
+                    "! {} consulted {}{position} — {about}",
+                    crate::ui::short_label(&driver),
+                    crate::ui::short_label(&consultant),
+                )));
+            }
             AgentEvent::Exhausted { reason } => {
                 self.streaming = None;
                 self.running = None;
@@ -2311,6 +2350,173 @@ mod tests {
 
         app.handle_key(press(KeyCode::PageUp));
         assert_eq!(app.approval_scroll, 0);
+    }
+
+    // ---- consulting -------------------------------------------------------
+
+    fn consulted_event(usage: Option<crate::provider::Usage>) -> AgentEvent {
+        AgentEvent::Consulted {
+            driver: "Local".to_string(),
+            consultant: "DeepSeek".to_string(),
+            about: "repeated the same output 4 times".to_string(),
+            nth: 1,
+            of: 2,
+            usage,
+        }
+    }
+
+    #[test]
+    fn a_consult_discards_the_attempt_that_got_the_tier_stuck() {
+        // The rollback throws the failed attempt out of the conversation, so it
+        // has to leave the transcript too. Otherwise the looped output that
+        // caused the stall stays on screen looking like part of the answer.
+        let (mut app, _commands, _cancel) = attached_with_cancel();
+        type_and_send(&mut app, "make the tests pass");
+        app.handle_agent_event(AgentEvent::Text("the same line\n".to_string()));
+        app.handle_agent_event(AgentEvent::Text("the same line\n".to_string()));
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.text.contains("the same line")),
+            "the looped output should be streaming before the consult"
+        );
+
+        app.handle_agent_event(consulted_event(None));
+
+        assert!(
+            !app.messages
+                .iter()
+                .any(|m| m.text.contains("the same line")),
+            "the abandoned attempt must not survive as an answer: {:?}",
+            app.messages.iter().map(|m| &m.text).collect::<Vec<_>>()
+        );
+        assert!(
+            last_message(&app).contains("consulted DeepSeek"),
+            "{}",
+            last_message(&app)
+        );
+    }
+
+    #[test]
+    fn the_consult_line_says_each_thing_once_and_uses_short_names() {
+        // An earlier version repeated both names and the question inside a single
+        // line, with full addresses, so it wrapped across three rows saying one
+        // thing. The addresses belong in the session panel.
+        let (mut app, _commands, _cancel) = attached_with_cancel();
+        app.tier_labels = vec![
+            "Looping Local (http://127.0.0.1:8735/v1)".to_string(),
+            "Frontier Helper (http://127.0.0.1:8736/v1)".to_string(),
+        ];
+        type_and_send(&mut app, "go");
+
+        app.handle_agent_event(AgentEvent::Consulted {
+            driver: "Looping Local (http://127.0.0.1:8735/v1)".to_string(),
+            consultant: "Frontier Helper (http://127.0.0.1:8736/v1)".to_string(),
+            about: "repeated the same output 4 times".to_string(),
+            nth: 1,
+            of: 2,
+            usage: None,
+        });
+
+        let line = last_message(&app);
+        assert_eq!(
+            line,
+            "! Looping Local consulted Frontier Helper (1/2) — repeated the same output 4 times",
+            "the message should read as one sentence"
+        );
+        assert!(!line.contains("http://"), "no addresses: {line}");
+        assert_eq!(
+            line.matches("Looping Local").count(),
+            1,
+            "the driver should be named once: {line}"
+        );
+        assert_eq!(
+            line.matches("Frontier Helper").count(),
+            1,
+            "the consultant should be named once: {line}"
+        );
+    }
+
+    #[test]
+    fn a_consult_keeps_the_turn_alive() {
+        // Unlike an escalation, the turn is still running: the driver carries on.
+        let (mut app, _commands, _cancel) = attached_with_cancel();
+        type_and_send(&mut app, "go");
+        assert!(app.busy);
+
+        app.handle_agent_event(consulted_event(None));
+
+        assert!(app.busy, "the driver is still working on the same turn");
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn the_consultants_tokens_are_charged_to_the_consultant() {
+        let (mut app, _commands, _cancel) = attached_with_cancel();
+        app.tier_labels = vec!["Local".to_string(), "DeepSeek".to_string()];
+        type_and_send(&mut app, "go");
+        let _ = app.messages.pop();
+
+        app.handle_agent_event(consulted_event(Some(crate::provider::Usage {
+            prompt_tokens: 900,
+            completion_tokens: 40,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+        })));
+
+        // The active tier is the driver, so charging there would be wrong.
+        let spent = |name: &str| {
+            app.usage_by_tier
+                .iter()
+                .find(|(tier, _)| tier == name)
+                .map(|(_, usage)| usage.prompt_tokens)
+        };
+        assert_eq!(spent("DeepSeek"), Some(900), "{:?}", app.usage_by_tier);
+        assert_eq!(spent("Local"), None, "the driver spent nothing");
+        assert_eq!(app.tokens_in, 900);
+    }
+
+    #[test]
+    fn the_transcript_says_where_the_consult_sits_in_its_budget() {
+        let (mut app, _commands, _cancel) = attached_with_cancel();
+        type_and_send(&mut app, "go");
+
+        app.handle_agent_event(AgentEvent::Consulted {
+            driver: "Local".to_string(),
+            consultant: "DeepSeek".to_string(),
+            about: "repeated the same output 4 times".to_string(),
+            nth: 2,
+            of: 2,
+            usage: None,
+        });
+
+        assert!(
+            last_message(&app).contains("(2/2)"),
+            "a second consult should be distinguishable: {}",
+            last_message(&app)
+        );
+    }
+
+    #[test]
+    fn a_single_consult_does_not_show_a_position() {
+        // "1/1" would be noise when there is only one.
+        let (mut app, _commands, _cancel) = attached_with_cancel();
+        type_and_send(&mut app, "go");
+
+        app.handle_agent_event(AgentEvent::Consulted {
+            driver: "Local".to_string(),
+            consultant: "DeepSeek".to_string(),
+            about: "repeated the same output 4 times".to_string(),
+            nth: 1,
+            of: 1,
+            usage: None,
+        });
+
+        assert!(
+            !last_message(&app).contains("(1/1)"),
+            "{}",
+            last_message(&app)
+        );
     }
 
     #[test]

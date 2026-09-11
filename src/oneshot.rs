@@ -142,6 +142,20 @@ pub async fn run(library: &Library, config: &Config, options: &Options) -> Outco
                 outcome.failure = Some(format!("no tier could answer: {reason}"));
                 break;
             }
+            // A consult is a detour inside a turn, not its end: the driver
+            // carries on, so a pipeline waits for the answer. What the driver
+            // produced *before* being helped is not that answer, though — the
+            // turn was abandoned mid-stream, so only the text after the advice
+            // counts. This is the same rule as an escalation, for the same
+            // reason.
+            AgentEvent::Consulted {
+                driver, consultant, ..
+            } => {
+                outcome.text.clear();
+                outcome
+                    .escalations
+                    .push(format!("{driver} consulted {consultant}"));
+            }
             // Nothing cancels a one-shot run, so this cannot arrive; it is
             // handled as a failure rather than ignored, so a future change that
             // finds a way to cancel would say so rather than return no answer.

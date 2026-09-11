@@ -11,6 +11,13 @@ use crate::provider::dialect::Dialect;
 /// The only configuration schema this build understands.
 const SUPPORTED_SCHEMA: u32 = 1;
 
+/// How many consults a tier gets per turn unless it says otherwise.
+///
+/// One source of truth, because the config default and the programmatic
+/// construction of a tier have to agree: a tier built with a different cap from
+/// the one its config file implies would be a difference nobody could see.
+pub const DEFAULT_CONSULTS_PER_TURN: u32 = 2;
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("could not determine a configuration directory for your platform")]
@@ -119,6 +126,30 @@ impl fmt::Display for TierKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum OnStuck {
+    /// Abandon this tier and hand the whole turn to the next one. The default,
+    /// because it is the behaviour that always works.
+    #[default]
+    Escalate,
+    /// Keep this tier driving, and ask the next one a narrow question about it.
+    ///
+    /// Cheaper in frontier quota — the expensive model answers one question
+    /// instead of inheriting the turn — but it only pays off when the answer is
+    /// something the driver can act on. See `consult.rs`.
+    Consult,
+}
+
+impl fmt::Display for OnStuck {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Escalate => f.write_str("escalate"),
+            Self::Consult => f.write_str("consult"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Tier {
     pub id: String,
@@ -165,8 +196,41 @@ pub struct Tier {
     /// Opt in to running this tier's CLI without its own permission prompts.
     #[serde(default)]
     pub approve_all: bool,
+    /// What happens when this tier gets stuck.
+    #[serde(default)]
+    pub on_stuck: OnStuck,
+    /// How many times this tier may consult within a single turn.
+    ///
+    /// The cap exists for the same reason the step limit does: a driver stuck in
+    /// a loop would otherwise be able to spin the frontier indefinitely, and each
+    /// consult is a frontier call. Once it is spent, the turn escalates, which is
+    /// the behaviour that always terminates.
+    #[serde(
+        default = "default_consults_per_turn",
+        deserialize_with = "consults_per_turn"
+    )]
+    pub consults_per_turn: u32,
     #[serde(default)]
     pub limits: Limits,
+}
+
+/// A missing cap takes the default; a present zero is refused.
+///
+/// Zero would mean "consult is configured but never happens", which is more
+/// likely a mistake than a request. Leaving the key out is how you accept the
+/// default, and `on_stuck = "escalate"` is how you turn consult off.
+fn consults_per_turn<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = u32::deserialize(deserializer)?;
+    if value == 0 {
+        return Err(serde::de::Error::custom(
+            "consults_per_turn = 0 would mean consult never happens; omit it to accept the \
+             default, or use on_stuck = \"escalate\"",
+        ));
+    }
+    Ok(value)
 }
 
 impl Tier {
@@ -222,6 +286,9 @@ fn default_idle_timeout_ms() -> u64 {
 }
 fn default_max_repeat_run() -> u32 {
     4
+}
+fn default_consults_per_turn() -> u32 {
+    DEFAULT_CONSULTS_PER_TURN
 }
 
 /// `~/.config/spill/config.toml` (or the platform equivalent).
@@ -413,6 +480,79 @@ mod tests {
         assert_eq!(config.tiers[0].id, "local");
         assert_eq!(config.tiers[0].kind, TierKind::OpenAi);
         assert_eq!(config.tiers[0].limits.max_repeat_run, 4);
+        // The example documents consult but does not turn it on: the default has
+        // to stay the behaviour that always works.
+        assert_eq!(config.tiers[0].on_stuck, OnStuck::Escalate);
+        assert_eq!(config.tiers[0].consults_per_turn, DEFAULT_CONSULTS_PER_TURN);
+    }
+
+    #[test]
+    fn the_stuck_policy_defaults_to_escalating() {
+        let config = parse(
+            r#"
+            [[tier]]
+            id = "local"
+            kind = "openai"
+            base_url = "http://localhost:1234/v1"
+            "#,
+        )
+        .expect("a tier with no on_stuck should parse");
+        assert_eq!(config.tiers[0].on_stuck, OnStuck::Escalate);
+        assert_eq!(config.tiers[0].consults_per_turn, 2);
+    }
+
+    #[test]
+    fn consult_can_be_turned_on_and_the_cap_set() {
+        let config = parse(
+            r#"
+            [[tier]]
+            id = "local"
+            kind = "openai"
+            base_url = "http://localhost:1234/v1"
+            on_stuck = "consult"
+            consults_per_turn = 5
+            "#,
+        )
+        .expect("consult should parse");
+        assert_eq!(config.tiers[0].on_stuck, OnStuck::Consult);
+        assert_eq!(config.tiers[0].consults_per_turn, 5);
+    }
+
+    #[test]
+    fn a_consult_cap_of_zero_is_refused_with_the_reason() {
+        // Zero would mean "configured but never happens", which is far more
+        // likely a mistake than a request.
+        let err = parse(
+            r#"
+            [[tier]]
+            id = "local"
+            kind = "openai"
+            base_url = "http://localhost:1234/v1"
+            consults_per_turn = 0
+            "#,
+        )
+        .expect_err("zero must be refused");
+        let message = err.to_string();
+        assert!(message.contains("consults_per_turn"), "got: {message}");
+        assert!(
+            message.contains("escalate"),
+            "it should say how to turn consult off: {message}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_stuck_policy_is_a_parse_error() {
+        let err = parse(
+            r#"
+            [[tier]]
+            id = "local"
+            kind = "openai"
+            base_url = "http://localhost:1234/v1"
+            on_stuck = "panic"
+            "#,
+        )
+        .expect_err("an unknown policy must not be silently accepted");
+        assert!(err.to_string().contains("not valid TOML"), "got: {err}");
     }
 
     #[test]

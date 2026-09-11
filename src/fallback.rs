@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::config::Limits;
+use crate::config::{Limits, OnStuck};
 use crate::provider::Provider;
 
 pub struct Tier {
@@ -13,6 +13,39 @@ pub struct Tier {
     pub model: String,
     pub provider: Arc<dyn Provider>,
     pub limits: Limits,
+    /// What happens when this tier is judged stuck.
+    pub on_stuck: OnStuck,
+    /// How many times this tier may consult within one turn.
+    pub consults_per_turn: u32,
+}
+
+impl Tier {
+    /// A tier that escalates when stuck, which is the default policy.
+    ///
+    /// Most construction — the app, `doctor`, and tests — does not care about the
+    /// stuck policy, so this keeps it out of the way of what they do care about.
+    /// A test that does care sets the two fields afterwards, which reads better
+    /// than threading them through every call site.
+    pub fn new(
+        label: impl Into<String>,
+        model: impl Into<String>,
+        provider: Arc<dyn Provider>,
+        limits: Limits,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            model: model.into(),
+            provider,
+            limits,
+            on_stuck: OnStuck::default(),
+            consults_per_turn: crate::config::DEFAULT_CONSULTS_PER_TURN,
+        }
+    }
+
+    /// Whether this tier asks its neighbour for help rather than handing over.
+    pub fn consults_when_stuck(&self) -> bool {
+        self.on_stuck == OnStuck::Consult
+    }
 }
 
 /// A tier label without its parenthetical detail: "Local (http://…)" becomes
@@ -56,6 +89,16 @@ impl FallbackChain {
 
     pub fn active(&self) -> &Tier {
         &self.tiers[self.active]
+    }
+
+    /// The tier to ask when the active one is stuck and consults.
+    ///
+    /// The next tier in the chain, which is the more capable one by the chain's
+    /// own ordering — so consult needs no separate setting for who to ask. The
+    /// active tier itself, which is what `active()` returns, is the last resort:
+    /// with nothing below, there is nobody to consult.
+    pub fn consultant(&self) -> Option<&Tier> {
+        self.tiers.get(self.active + 1)
     }
 
     /// Which tier is answering, as a position in the chain.
@@ -197,12 +240,12 @@ mod tests {
     }
 
     fn tier(id: &str) -> Tier {
-        Tier {
-            label: format!("{id} (stub)"),
-            model: format!("{id}-model"),
-            provider: Arc::new(Stub("stub")),
-            limits: Limits::default(),
-        }
+        Tier::new(
+            format!("{id} (stub)"),
+            format!("{id}-model"),
+            Arc::new(Stub("stub")),
+            Limits::default(),
+        )
     }
 
     fn chain(ids: &[&str], sticky: bool) -> FallbackChain {
@@ -457,11 +500,13 @@ mod tests {
 
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let tiers = (0..3)
-            .map(|index| Tier {
-                label: format!("tier {index}"),
-                model: "m".to_string(),
-                provider: Arc::new(Counting(Arc::clone(&calls))),
-                limits: Limits::default(),
+            .map(|index| {
+                Tier::new(
+                    format!("tier {index}"),
+                    "m".to_string(),
+                    Arc::new(Counting(Arc::clone(&calls))),
+                    Limits::default(),
+                )
             })
             .collect();
 

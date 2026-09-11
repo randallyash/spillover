@@ -12,7 +12,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::config::{Limits, Tier, TierKind};
+use crate::config::{Limits, OnStuck, Tier, TierKind};
 use crate::preset::Library;
 use crate::setup::probe::{Found, Readiness};
 
@@ -675,6 +675,11 @@ fn make_tier(
         dialect: None,
         // Unattended runs are never something setup turns on for you.
         approve_all: false,
+        // The wizard writes the reliable path: hand the turn over when a tier
+        // is stuck. Consult is opt-in by hand, because it is the mode whose
+        // value depends on the model and the answer.
+        on_stuck: OnStuck::default(),
+        consults_per_turn: crate::config::DEFAULT_CONSULTS_PER_TURN,
         limits: Limits::default(),
     }
 }

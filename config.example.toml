@@ -39,6 +39,34 @@ model = ""
 # Reading the key from the environment is only needed for hosted endpoints:
 # api_key_env = "LMSTUDIO_API_KEY"
 
+# What to do when this tier gets stuck. The two choices are genuinely different,
+# and neither is strictly better:
+#
+#   on_stuck = "escalate"  (default) abandon this tier and hand the whole turn to
+#                          the next one. It always works, and it means the cheaper
+#                          model stops being used for the rest of the session.
+#
+#   on_stuck = "consult"   keep this tier driving, and ask the next tier one
+#                          narrow question about what went wrong. The answer comes
+#                          back as advice and the turn carries on here, so a local
+#                          model that needed a nudge keeps doing the work. Costs
+#                          one call to the tier below instead of every remaining
+#                          turn, and the question is built from the evidence spill
+#                          already has — the raw tool call and its raw error, or the
+#                          output that was repeating — never a summary written by
+#                          the model that got stuck.
+#
+# Consult only helps when the answer is something this tier can act on. When the
+# answer has to be "go and look at five more files", escalation is the honest
+# move, so spill falls back to it: when the budget is spent, when the consult
+# fails, or when the answer comes back empty. A turn is never stranded by it.
+#
+# on_stuck = "consult"
+# How many times this tier may consult within one turn. The cap is what stops a
+# model stuck in a loop from spending the frontier indefinitely, and it is why
+# consult cannot make a stuck turn cost more than escalating would.
+# consults_per_turn = 2
+
 [tier.limits]
 # A hung server would otherwise block the session forever.
 first_token_timeout_ms = 30000

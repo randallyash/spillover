@@ -124,12 +124,10 @@ pub async fn build(
 
                 let provider = OpenAiProvider::new(tier.display_name(), settings.base_url, api_key);
                 let label = provider.describe();
-                tiers.push(Tier {
-                    label,
-                    model,
-                    provider: Arc::new(provider),
-                    limits: tier.limits.clone(),
-                });
+                let mut built = Tier::new(label, model, Arc::new(provider), tier.limits.clone());
+                built.on_stuck = tier.on_stuck;
+                built.consults_per_turn = tier.consults_per_turn;
+                tiers.push(built);
             }
             TierKind::Cli => {
                 let spec = cli_spec(library, tier)
@@ -139,12 +137,10 @@ pub async fn build(
                 let model = spec.model.clone().unwrap_or_else(|| tier.id.clone());
                 let provider = CliProvider::new(tier.display_name(), spec, workspace.to_path_buf());
                 let label = provider.describe();
-                tiers.push(Tier {
-                    label,
-                    model,
-                    provider: Arc::new(provider),
-                    limits: tier.limits.clone(),
-                });
+                let mut built = Tier::new(label, model, Arc::new(provider), tier.limits.clone());
+                built.on_stuck = tier.on_stuck;
+                built.consults_per_turn = tier.consults_per_turn;
+                tiers.push(built);
             }
         }
     }
@@ -373,26 +369,26 @@ mod tests {
 
         // Built manually to avoid the async path in a pure test.
         let tiers = vec![
-            crate::fallback::Tier {
-                label: "first".to_string(),
-                model: "m".to_string(),
-                provider: Arc::new(crate::provider::cli::CliProvider::new(
+            crate::fallback::Tier::new(
+                "first".to_string(),
+                "m".to_string(),
+                Arc::new(crate::provider::cli::CliProvider::new(
                     "first",
                     cli_spec(&Library::embedded(), &config.tiers[0]).expect("spec"),
                     std::path::PathBuf::from("/tmp"),
                 )),
-                limits: Default::default(),
-            },
-            crate::fallback::Tier {
-                label: "second".to_string(),
-                model: "m".to_string(),
-                provider: Arc::new(crate::provider::cli::CliProvider::new(
+                Default::default(),
+            ),
+            crate::fallback::Tier::new(
+                "second".to_string(),
+                "m".to_string(),
+                Arc::new(crate::provider::cli::CliProvider::new(
                     "second",
                     cli_spec(&Library::embedded(), &config.tiers[1]).expect("spec"),
                     std::path::PathBuf::from("/tmp"),
                 )),
-                limits: Default::default(),
-            },
+                Default::default(),
+            ),
         ];
 
         let chain = chain(&config, tiers).expect("a chain");
