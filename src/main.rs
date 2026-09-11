@@ -197,6 +197,12 @@ async fn main() {
     std::process::exit(outcome.exit_code());
 }
 
+/// How long the wizard waits for an endpoint to list its models.
+///
+/// The same figure the tier checks use: one round trip to a hosted endpoint,
+/// with room for a slow one.
+const MODELS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// How often the interface redraws while a turn is running.
 ///
 /// Fast enough that the spinner reads as motion rather than as a sequence of
@@ -451,6 +457,11 @@ async fn run_wizard(path: PathBuf) -> io::Result<Option<PathBuf>> {
     let mut fetching_for: Option<String> = None;
     let mut checked: Option<usize> = None;
     let mut confirm_replace = false;
+    // Whether a blocked write has been insisted on. A tier that cannot answer
+    // is worth refusing once — the common case is a typo or a missing key — but
+    // not worth trapping someone whose server is simply not started yet. The
+    // second press is the override.
+    let mut allow_write = false;
     let mut written = None;
 
     loop {
@@ -476,6 +487,8 @@ async fn run_wizard(path: PathBuf) -> io::Result<Option<PathBuf>> {
         let tier_count = wizard.tiers().len();
         if wizard.step == Step::Review && checked != Some(tier_count) {
             checked = Some(tier_count);
+            // A fresh review has not been insisted past, whatever was before.
+            allow_write = false;
             wizard.clear_checks();
             let library = library.clone();
             let tiers = wizard.tiers();
@@ -496,13 +509,31 @@ async fn run_wizard(path: PathBuf) -> io::Result<Option<PathBuf>> {
         if wizard.step != Step::ChooseModel {
             fetching_for = None;
         } else if fetching_for.is_none() {
-            if let Some((id, base_url, key_env)) = wizard.pending_endpoint() {
-                fetching_for = Some(id);
+            // Gated on the wizard's own idea of whether an answer is still
+            // wanted. Without that this asked again the moment each answer
+            // landed, because arriving cleared the in-flight marker while the
+            // step was still open: a request per round trip, and a cursor reset
+            // to the top of the list every time.
+            if let Some((_, base_url, key_env)) = wizard.wants_models() {
+                fetching_for = Some(base_url.clone());
                 let tx = models_tx.clone();
                 tokio::spawn(async move {
                     let key = key_env.as_deref().and_then(|name| std::env::var(name).ok());
-                    let result =
-                        crate::provider::openai::list_models(&base_url, key.as_deref()).await;
+                    // Bounded, like every other probe here. Unbounded, a server
+                    // that accepts the connection and then says nothing left the
+                    // wizard asking forever with no way forward.
+                    let result = tokio::time::timeout(
+                        MODELS_TIMEOUT,
+                        crate::provider::openai::list_models(&base_url, key.as_deref()),
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(format!(
+                            "{} did not answer within {}s",
+                            base_url,
+                            MODELS_TIMEOUT.as_secs()
+                        ))
+                    });
                     let _ = tx.send(result);
                 });
             }
@@ -555,14 +586,33 @@ async fn run_wizard(path: PathBuf) -> io::Result<Option<PathBuf>> {
                                         wizard.step = Step::ChooseOnline;
                                         wizard.clear_checks();
                                         checked = None;
+                                        allow_write = false;
                                     }
                                     _ => {}
                                 },
                                 KeyCode::Char('w') => {
-                                    if path.exists() {
-                                        confirm_replace = true;
-                                    } else {
-                                        write_and_finish(&mut wizard, &path);
+                                    // Refused once while a tier cannot answer. A
+                                    // failed check used to be drawn and nothing
+                                    // more, so a config that could not work was
+                                    // writable — and the README's promise that
+                                    // every choice is checked before anything is
+                                    // written was not true.
+                                    match wizard.write_blocked() {
+                                        Some(blocked) if !allow_write => {
+                                            wizard.problem = Some(format!(
+                                                "{blocked} — press w again to write it anyway"
+                                            ));
+                                            allow_write = true;
+                                        }
+                                        _ => {
+                                            wizard.problem = None;
+                                            allow_write = false;
+                                            if path.exists() {
+                                                confirm_replace = true;
+                                            } else {
+                                                write_and_finish(&mut wizard, &path);
+                                            }
+                                        }
                                     }
                                 }
                                 KeyCode::Esc => wizard.quit = true,
@@ -586,8 +636,11 @@ async fn run_wizard(path: PathBuf) -> io::Result<Option<PathBuf>> {
             },
             models = next_or_pending(&mut models_rx) => match models {
                 Some(result) => {
-                    fetching_for = None;
-                    wizard.models_arrived(result);
+                    // Taken before clearing, so the wizard can tell whose list
+                    // this is and ignore an answer for an endpoint the user has
+                    // since moved away from.
+                    let for_endpoint = fetching_for.take().unwrap_or_default();
+                    wizard.models_arrived(&for_endpoint, result);
                 }
                 None => models_rx = None,
             }

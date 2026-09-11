@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::{Limits, OnStuck, Tier, TierKind};
 use crate::preset::Library;
-use crate::setup::probe::{Found, Readiness};
+use crate::setup::probe::{Found, Readiness, unserved_model};
 
 /// How many online fallbacks the wizard offers, after the local model.
 pub const MAX_ONLINE: usize = 2;
@@ -248,14 +248,20 @@ impl Wizard {
 
     /// The hosted endpoint waiting on a model choice, as its id, address, and
     /// the environment variable its key comes from.
+    ///
+    /// The id returned is the *choice's*, not the preset's. They are the same
+    /// for a shipped preset, but a typed endpoint has no preset and carries an
+    /// empty one — so returning the preset id named the custom endpoint `""` and
+    /// the model list fetched for it was discarded as belonging to someone else,
+    /// leaving the screen asking forever.
     pub fn pending_endpoint(&self) -> Option<(String, String, Option<String>)> {
-        match self.pending.as_ref()?.source.clone() {
+        let choice = self.pending.as_ref()?;
+        match &choice.source {
             Source::Online {
-                preset_id,
                 base_url: Some(base_url),
                 api_key_env,
                 ..
-            } => Some((preset_id, base_url, api_key_env)),
+            } => Some((choice.id.clone(), base_url.clone(), api_key_env.clone())),
             _ => None,
         }
     }
@@ -349,32 +355,94 @@ impl Wizard {
 
     /// The endpoint's models arrived: offer them, or fall back to typing if
     /// there are none to offer.
-    pub fn models_arrived(&mut self, result: Result<Vec<String>, String>) {
-        if self.step != Step::ChooseModel {
-            // The user moved on while this was in flight.
+    pub fn models_arrived(&mut self, endpoint_url: &str, result: Result<Vec<String>, String>) {
+        // The list belongs to the endpoint it was fetched for, identified by its
+        // address. A slow answer landing after the user has moved on would
+        // otherwise be offered as the new endpoint's models — and since this list
+        // is what a typed id is checked against, it would refuse a perfectly good
+        // one. The address rather than the id, because every typed endpoint
+        // shares the one menu-row id, so the id cannot tell two of them apart.
+        let current = self.pending_endpoint().map(|(_, url, _)| url);
+        if current.as_deref() != Some(endpoint_url) {
             return;
         }
+        // Cleared whatever the outcome, so a late answer cannot leave the screen
+        // saying it is still asking.
         self.models_loading = false;
 
         match result {
             Ok(models) if !models.is_empty() => {
+                // Kept even if the user has already started typing, so their id
+                // can still be checked when they commit it.
                 self.models = models;
                 self.model_cursor = 0;
             }
-            Ok(_) => {
+            // Only move the user when they are still waiting on this step: an
+            // answer arriving over their typing must not wipe it.
+            Ok(_) if self.step == Step::ChooseModel => {
                 self.models_problem =
                     Some("this endpoint listed no models, so type the id to use".to_string());
                 self.begin_text();
                 self.step = Step::OnlineModel;
             }
-            Err(message) => {
+            Ok(_) => {}
+            Err(message) if self.step == Step::ChooseModel => {
                 // Not being able to list models is not a dead end; many
                 // endpoints serve chat completions without advertising them.
                 self.models_problem = Some(format!("{message} — type the id to use"));
                 self.begin_text();
                 self.step = Step::OnlineModel;
             }
+            Err(_) => {}
         }
+    }
+
+    /// Why the config cannot be written yet, if it cannot.
+    ///
+    /// The README promises that every choice is checked before anything is
+    /// written. Until now nothing enforced it: a failed check was only drawn, and
+    /// `w` wrote regardless, so a tier that could not answer — a typed model id
+    /// the endpoint does not serve, a CLI that is not installed — reached the
+    /// config and failed on the first turn instead of here.
+    pub fn write_blocked(&self) -> Option<String> {
+        if self.tiers().is_empty() {
+            return Some("no tiers chosen yet, so there is nothing to write".to_string());
+        }
+
+        let checks = &self.checks;
+        // Still checking. Writing now would be writing unchecked, which is the
+        // thing this guard exists to prevent.
+        if checks.is_empty() || checks.iter().any(Option::is_none) {
+            return Some("still checking these tiers — wait for the results".to_string());
+        }
+
+        let failed = checks.iter().flatten().filter(|check| !check.ok).count();
+        if failed > 0 {
+            return Some(format!(
+                "{failed} of {} tiers cannot answer; fix or remove {} before writing",
+                checks.len(),
+                if failed == 1 { "it" } else { "them" }
+            ));
+        }
+
+        None
+    }
+
+    /// The endpoint whose model list still needs asking for, if any.
+    ///
+    /// The only place that decides whether to ask, so the answer cannot be asked
+    /// for repeatedly: once it lands, `models_loading` is false and this stops
+    /// saying yes.
+    ///
+    /// Without that, the wizard re-requested the list on every arrival while the
+    /// model step was open — a request per round trip against the endpoint, and
+    /// a cursor that snapped back to the top each time, which made "type it
+    /// myself" unreachable behind a list that kept re-selecting its first row.
+    pub fn wants_models(&self) -> Option<(String, String, Option<String>)> {
+        if self.step != Step::ChooseModel || !self.models_loading {
+            return None;
+        }
+        self.pending_endpoint()
     }
 
     /// Attach a model to the endpoint being set up and keep it.
@@ -430,6 +498,20 @@ impl Wizard {
                         Some("a hosted endpoint needs a model id to talk to".to_string());
                     return;
                 }
+
+                // Checked against the list this endpoint already gave us, which
+                // is the same list the picker offers — so a mistyped id is
+                // caught here rather than mid-conversation, and it costs no
+                // second request to do it.
+                //
+                // No list means no opinion: the user reaches this step precisely
+                // when the endpoint would not say what it serves, and refusing
+                // then would block a working setup on a guess.
+                if let Some(problem) = unserved_model(&self.models, &typed) {
+                    self.problem = Some(problem);
+                    return;
+                }
+
                 self.accept_model(typed);
             }
             _ => {}
@@ -866,6 +948,17 @@ mod tests {
         );
     }
 
+    /// The endpoint the wizard is asking about right now, so a test can hand its
+    /// answer back under the right key. A late answer for a different endpoint is
+    /// ignored on purpose, so the key has to be the current one — and the key is
+    /// the address, which is what tells two typed endpoints apart.
+    fn asking(wizard: &Wizard) -> String {
+        wizard
+            .pending_endpoint()
+            .map(|(_, url, _)| url)
+            .unwrap_or_default()
+    }
+
     #[test]
     fn a_custom_endpoint_becomes_a_tier_with_no_preset() {
         let mut wizard = at_online();
@@ -880,7 +973,8 @@ mod tests {
             wizard.push_char(ch);
         }
         wizard.commit_text();
-        wizard.models_arrived(Ok(vec!["their-model".to_string()]));
+        let endpoint = asking(&wizard);
+        wizard.models_arrived(&endpoint, Ok(vec!["their-model".to_string()]));
         wizard.confirm();
 
         let tiers = wizard.tiers();
@@ -929,7 +1023,8 @@ mod tests {
             wizard.push_char(ch);
         }
         wizard.commit_text();
-        wizard.models_arrived(Err("no list".to_string()));
+        let endpoint = asking(&wizard);
+        wizard.models_arrived(&endpoint, Err("no list".to_string()));
         for ch in "their-model".chars() {
             wizard.push_char(ch);
         }
@@ -1024,7 +1119,11 @@ mod tests {
     #[test]
     fn picking_an_advertised_model_completes_the_choice() {
         let mut wizard = at_hosted_model();
-        wizard.models_arrived(Ok(vec!["model-a".to_string(), "model-b".to_string()]));
+        let endpoint = asking(&wizard);
+        wizard.models_arrived(
+            &endpoint,
+            Ok(vec!["model-a".to_string(), "model-b".to_string()]),
+        );
 
         assert!(!wizard.models_loading);
         assert_eq!(wizard.models.len(), 2);
@@ -1038,7 +1137,11 @@ mod tests {
     #[test]
     fn a_model_further_down_the_list_can_be_picked() {
         let mut wizard = at_hosted_model();
-        wizard.models_arrived(Ok(vec!["first".to_string(), "second".to_string()]));
+        let endpoint = asking(&wizard);
+        wizard.models_arrived(
+            &endpoint,
+            Ok(vec!["first".to_string(), "second".to_string()]),
+        );
 
         wizard.move_cursor(1);
         wizard.confirm();
@@ -1049,7 +1152,8 @@ mod tests {
     #[test]
     fn the_model_cursor_stops_at_the_type_it_myself_row() {
         let mut wizard = at_hosted_model();
-        wizard.models_arrived(Ok(vec!["only".to_string()]));
+        let endpoint = asking(&wizard);
+        wizard.models_arrived(&endpoint, Ok(vec!["only".to_string()]));
 
         wizard.move_cursor(100);
         // Two rows: the model, then "type it myself".
@@ -1062,27 +1166,246 @@ mod tests {
     #[test]
     fn type_it_myself_falls_through_to_typing() {
         let mut wizard = at_hosted_model();
-        wizard.models_arrived(Ok(vec!["advertised".to_string()]));
+        let endpoint = asking(&wizard);
+        // A long list is exactly why someone types an id instead of scrolling
+        // to it, so the fixture offers several and the user names one.
+        wizard.models_arrived(
+            &endpoint,
+            Ok(vec![
+                "advertised".to_string(),
+                "also-offered".to_string(),
+                "typed-by-hand".to_string(),
+            ]),
+        );
 
-        wizard.move_cursor(1); // the "type it myself" row
+        // The last row is "type it myself", whatever the list length.
+        wizard.move_cursor(100);
         wizard.confirm();
 
         assert_eq!(wizard.step, Step::OnlineModel);
 
-        for ch in "my-own-model".chars() {
+        for ch in "typed-by-hand".chars() {
             wizard.push_char(ch);
         }
         wizard.commit_text();
 
         assert_eq!(wizard.online_chosen.len(), 1);
-        assert_eq!(wizard.tiers()[1].model.as_deref(), Some("my-own-model"));
+        assert_eq!(wizard.tiers()[1].model.as_deref(), Some("typed-by-hand"));
+    }
+
+    #[test]
+    fn a_typed_model_the_endpoint_does_not_serve_is_refused() {
+        // The gap this closes: a hand-typed id that the endpoint does not
+        // serve used to be accepted silently, written into the config, and then
+        // 404 on the first turn of the first conversation.
+        let mut wizard = at_hosted_model();
+        let endpoint = asking(&wizard);
+        wizard.models_arrived(
+            &endpoint,
+            Ok(vec![
+                "deepseek/deepseek-v4-flash".to_string(),
+                "deepseek/deepseek-v4-pro".to_string(),
+            ]),
+        );
+
+        wizard.move_cursor(100);
+        wizard.confirm();
+        assert_eq!(wizard.step, Step::OnlineModel);
+
+        // A transposition, which is what a real typo looks like.
+        for ch in "deepseek/deepseek-v4-falsh".chars() {
+            wizard.push_char(ch);
+        }
+        wizard.commit_text();
+
+        assert_eq!(
+            wizard.step,
+            Step::OnlineModel,
+            "it should not have moved on"
+        );
+        assert!(
+            wizard.online_chosen.is_empty(),
+            "nothing should have been accepted"
+        );
+        let problem = wizard.problem.clone().expect("a reason should be shown");
+        assert!(problem.contains("not among the 2 models"), "{problem}");
+        assert!(
+            problem.contains("deepseek/deepseek-v4-flash"),
+            "a near miss should be named: {problem}"
+        );
+
+        // And the corrected id goes through, so it is a refusal and not a dead
+        // end.
+        for _ in 0.."deepseek/deepseek-v4-falsh".len() {
+            wizard.pop_char();
+        }
+        for ch in "deepseek/deepseek-v4-flash".chars() {
+            wizard.push_char(ch);
+        }
+        wizard.commit_text();
+
+        assert_eq!(wizard.online_chosen.len(), 1);
+        assert_eq!(
+            wizard.tiers()[1].model.as_deref(),
+            Some("deepseek/deepseek-v4-flash")
+        );
+    }
+
+    #[test]
+    fn a_typed_model_is_let_through_when_the_endpoint_listed_nothing() {
+        // An endpoint that will not say what it serves tells us nothing, so
+        // nothing is refused: this step exists precisely for that case, and
+        // guessing here would block a working setup.
+        let mut wizard = at_hosted_model();
+        let endpoint = asking(&wizard);
+        wizard.models_arrived(&endpoint, Err("no list".to_string()));
+        assert_eq!(wizard.step, Step::OnlineModel, "it falls back to typing");
+
+        for ch in "some-model".chars() {
+            wizard.push_char(ch);
+        }
+        wizard.commit_text();
+
+        assert_eq!(
+            wizard.online_chosen.len(),
+            1,
+            "{}",
+            wizard.problem.clone().unwrap_or_default()
+        );
+    }
+
+    #[test]
+    fn a_model_list_is_asked_for_once_and_not_again_when_it_arrives() {
+        // The guard against re-asking forever. Arriving clears `models_loading`,
+        // and this is what then stops saying an answer is still wanted — without
+        // it the wizard asked again the moment each answer landed, for as long as
+        // the model step was open. Against a real endpoint that is a request per
+        // round trip, and every arrival reset the cursor to the top of the list,
+        // which put "type it myself" out of reach.
+        let mut wizard = at_hosted_model();
+
+        let (_, url, _) = wizard
+            .wants_models()
+            .expect("the step should be asking for the list");
+        assert_eq!(url, "https://openrouter.ai/api/v1", "{url}");
+
+        let endpoint = asking(&wizard);
+        wizard.models_arrived(&endpoint, Ok(vec!["a-model".to_string()]));
+
+        assert!(
+            wizard.wants_models().is_none(),
+            "the answer arrived, so it must not ask a second time"
+        );
+    }
+
+    #[test]
+    fn leaving_the_model_step_stops_wanting_the_list() {
+        // Otherwise a fetch would be started for a step the user has left, and
+        // its answer could land on a screen that is no longer asking.
+        let mut wizard = at_hosted_model();
+        assert!(wizard.wants_models().is_some());
+
+        wizard.cancel_step();
+
+        assert!(
+            wizard.wants_models().is_none(),
+            "the step was left, so nothing is wanted"
+        );
+    }
+
+    #[test]
+    fn the_endpoint_identity_matches_what_its_model_list_is_filed_under() {
+        // The key the fetch is filed under has to be the key arrival compares,
+        // or the answer is thrown away as somebody else's — which is what
+        // happened twice here: once when a typed endpoint reported an empty
+        // preset id, and once when the shared menu-row id could not tell two
+        // typed addresses apart.
+        for typed in [false, true] {
+            let mut wizard = at_online();
+            if typed {
+                let custom = wizard
+                    .available_online()
+                    .iter()
+                    .position(|choice| choice.id == CUSTOM_ENDPOINT_ID)
+                    .expect("offered");
+                wizard.move_cursor(custom as isize);
+                wizard.confirm();
+                for ch in "https://gateway.example.com/v1".chars() {
+                    wizard.push_char(ch);
+                }
+                wizard.commit_text();
+            } else {
+                // A shipped endpoint, which does ask for a model.
+                let hosted = wizard
+                    .available_online()
+                    .iter()
+                    .position(|choice| {
+                        matches!(
+                            choice.source,
+                            Source::Online {
+                                kind: TierKind::OpenAi,
+                                ..
+                            }
+                        )
+                    })
+                    .expect("a hosted endpoint is offered");
+                wizard.move_cursor(hosted as isize);
+                wizard.confirm();
+            }
+
+            let key = asking(&wizard);
+            assert!(
+                !key.is_empty(),
+                "the key cannot be empty, or nothing matches"
+            );
+
+            // The answer filed under that key is accepted...
+            let before = wizard.models.len();
+            let endpoint = asking(&wizard);
+            wizard.models_arrived(&endpoint, Ok(vec!["filed-under-this-key".to_string()]));
+            assert_eq!(
+                wizard.models.len(),
+                before + 1,
+                "the answer for the pending endpoint should be taken"
+            );
+
+            // ...and one filed under any other address is not.
+            wizard.models.clear();
+            wizard.models_arrived("http://elsewhere.invalid/v1", Ok(vec!["stale".to_string()]));
+            assert!(
+                wizard.models.is_empty(),
+                "another endpoint's list must not be adopted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_late_model_list_for_another_endpoint_is_ignored() {
+        // A slow answer landing after the user moved on would otherwise be
+        // offered — and checked against — as the wrong endpoint's list.
+        let mut wizard = at_hosted_model();
+        wizard.models_arrived(
+            "http://an-address-the-user-left/v1",
+            Ok(vec!["stale".to_string()]),
+        );
+
+        assert!(
+            wizard.models.is_empty(),
+            "another endpoint's models must not be adopted: {:?}",
+            wizard.models
+        );
     }
 
     #[test]
     fn a_failed_lookup_falls_back_to_typing_with_the_reason() {
         let mut wizard = at_hosted_model();
 
-        wizard.models_arrived(Err("HTTP 401 — check that the key is set".to_string()));
+        let endpoint = asking(&wizard);
+
+        wizard.models_arrived(
+            &endpoint,
+            Err("HTTP 401 — check that the key is set".to_string()),
+        );
 
         // Not a dead end: many endpoints serve chats without listing models.
         assert_eq!(wizard.step, Step::OnlineModel);
@@ -1100,7 +1423,9 @@ mod tests {
     fn an_endpoint_that_lists_nothing_falls_back_to_typing() {
         let mut wizard = at_hosted_model();
 
-        wizard.models_arrived(Ok(Vec::new()));
+        let endpoint = asking(&wizard);
+
+        wizard.models_arrived(&endpoint, Ok(Vec::new()));
 
         assert_eq!(wizard.step, Step::OnlineModel);
         assert!(wizard.models_problem.is_some());
@@ -1112,7 +1437,9 @@ mod tests {
         wizard.cancel_step();
         assert_eq!(wizard.step, Step::ChooseOnline);
 
-        wizard.models_arrived(Ok(vec!["arrived-late".to_string()]));
+        let endpoint = asking(&wizard);
+
+        wizard.models_arrived(&endpoint, Ok(vec!["arrived-late".to_string()]));
 
         assert_eq!(wizard.step, Step::ChooseOnline, "it must not jump back");
         assert!(wizard.models.is_empty());
@@ -1132,13 +1459,124 @@ mod tests {
     #[test]
     fn an_empty_typed_model_id_is_refused_with_a_reason() {
         let mut wizard = at_hosted_model();
-        wizard.models_arrived(Err("no list".to_string()));
+        let endpoint = asking(&wizard);
+        wizard.models_arrived(&endpoint, Err("no list".to_string()));
         assert_eq!(wizard.step, Step::OnlineModel);
 
         wizard.commit_text();
 
         assert_eq!(wizard.step, Step::OnlineModel, "it stays put");
         assert!(wizard.problem.is_some());
+    }
+
+    #[test]
+    fn writing_is_blocked_while_a_tier_cannot_answer() {
+        // The README says every choice is checked before anything is written.
+        // Nothing enforced that: a failed check was drawn and `w` wrote anyway,
+        // so a tier that could never answer reached the config and failed on the
+        // first turn instead of here.
+        let mut wizard = at_online();
+        wizard.confirm();
+        wizard.confirm();
+        assert_eq!(wizard.step, Step::Review);
+
+        // Both of the two tiers that are checked report a problem.
+        wizard.note_check(
+            0,
+            Readiness {
+                ok: false,
+                detail: "could not reach the server".to_string(),
+            },
+        );
+        wizard.note_check(
+            1,
+            Readiness {
+                ok: false,
+                detail: "not installed".to_string(),
+            },
+        );
+
+        let blocked = wizard.write_blocked().expect("it should be blocked");
+        assert!(blocked.contains("2 of 2"), "{blocked}");
+        assert!(
+            blocked.contains("cannot answer"),
+            "it should say why: {blocked}"
+        );
+    }
+
+    #[test]
+    fn writing_is_blocked_while_the_checks_are_still_out() {
+        // Writing before an answer arrives is writing unchecked, which is the
+        // thing the guard exists to prevent.
+        let mut wizard = at_online();
+        wizard.confirm();
+        wizard.confirm();
+
+        let blocked = wizard.write_blocked().expect("it should be blocked");
+        assert!(blocked.contains("still checking"), "{blocked}");
+        assert!(
+            !wizard.write_blocked().is_none(),
+            "and it is not ready, so nothing is written"
+        );
+    }
+
+    #[test]
+    fn writing_is_allowed_once_every_tier_is_ready() {
+        let mut wizard = at_online();
+        wizard.confirm();
+        wizard.confirm();
+
+        for index in 0..wizard.tiers().len() {
+            wizard.note_check(
+                index,
+                Readiness {
+                    ok: true,
+                    detail: "would use a model".to_string(),
+                },
+            );
+        }
+
+        assert!(
+            wizard.write_blocked().is_none(),
+            "nothing is wrong with this config: {:?}",
+            wizard.write_blocked()
+        );
+        assert_eq!(wizard.write_blocked(), None);
+    }
+
+    #[test]
+    fn writing_is_blocked_when_no_tier_was_chosen() {
+        let wizard = Wizard::new(&Library::embedded());
+        let blocked = wizard.write_blocked().expect("there is nothing to write");
+        assert!(blocked.contains("no tiers"), "{blocked}");
+    }
+
+    #[test]
+    fn a_single_failing_tier_is_named_as_one() {
+        let mut wizard = at_online();
+        wizard.confirm();
+        wizard.confirm();
+        wizard.note_check(
+            0,
+            Readiness {
+                ok: true,
+                detail: "fine".to_string(),
+            },
+        );
+        wizard.note_check(
+            1,
+            Readiness {
+                ok: false,
+                detail: "not installed".to_string(),
+            },
+        );
+
+        let blocked = wizard.write_blocked().expect("it should be blocked");
+        assert!(blocked.contains("1 of 2"), "{blocked}");
+        assert!(
+            blocked.contains("fix or remove it before writing"),
+            "one tier reads as singular: {blocked}"
+        );
     }
 
     #[test]
@@ -1253,7 +1691,8 @@ mod tests {
     #[test]
     fn backing_out_of_a_text_step_returns_to_the_list() {
         let mut wizard = at_hosted_model();
-        wizard.models_arrived(Err("no list".to_string()));
+        let endpoint = asking(&wizard);
+        wizard.models_arrived(&endpoint, Err("no list".to_string()));
         assert_eq!(wizard.step, Step::OnlineModel);
 
         wizard.cancel_step();

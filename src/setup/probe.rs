@@ -55,6 +55,83 @@ impl Readiness {
     }
 }
 
+/// Whether an endpoint cannot serve a model id it was asked for.
+///
+/// `None` when it can — or when the endpoint does not say which models it
+/// serves. An endpoint that lists nothing tells us nothing, and refusing there
+/// would block the case this fallback exists for: a gateway that answers chat
+/// completions without advertising its models.
+///
+/// This is the one place the question is answered, so the wizard's text step,
+/// the review screen and `spill doctor` cannot disagree about it.
+pub fn unserved_model(models: &[String], typed: &str) -> Option<String> {
+    if models.is_empty() || models.iter().any(|model| model == typed) {
+        return None;
+    }
+
+    let count = models.len();
+    let noun = if count == 1 { "model" } else { "models" };
+    let named = format!("{typed:?} is not among the {count} {noun} this endpoint lists");
+
+    let near = closest(models, typed);
+    if near.is_empty() {
+        return Some(named);
+    }
+
+    let names: Vec<String> = near.iter().map(|model| format!("{model:?}")).collect();
+    Some(format!("{named} — did you mean {}?", names.join(" or ")))
+}
+
+/// The advertised ids closest to what was typed, best first.
+///
+/// A mistyped model id is nearly always a near miss — a transposition, a
+/// missing separator, the wrong case — so naming a couple of candidates is worth
+/// far more than a bare refusal.
+fn closest(models: &[String], typed: &str) -> Vec<String> {
+    let needle = typed.to_lowercase();
+    let mut scored: Vec<(usize, &String)> = models
+        .iter()
+        .filter_map(|model| {
+            let candidate = model.to_lowercase();
+            let distance = distance(&candidate, &needle);
+            // Only worth naming when it is genuinely close, so a list of
+            // unrelated ids produces no suggestions at all rather than noise.
+            let longest = needle.chars().count().max(candidate.chars().count());
+            (distance * 3 <= longest).then_some((distance, model))
+        })
+        .collect();
+
+    scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.len().cmp(&b.1.len())));
+    scored
+        .into_iter()
+        .take(2)
+        .map(|(_, model)| model.clone())
+        .collect()
+}
+
+/// Levenshtein distance, for "did you mean".
+///
+/// Model ids are short, so the quadratic cost is irrelevant next to saving
+/// someone from a typo that would only surface as a 404 mid-conversation.
+fn distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+
+    let mut previous: Vec<usize> = (0..=b.len()).collect();
+    let mut current = vec![0usize; b.len() + 1];
+
+    for (i, left) in a.iter().enumerate() {
+        current[0] = i + 1;
+        for (j, right) in b.iter().enumerate() {
+            let substitution = previous[j] + usize::from(left != right);
+            current[j + 1] = substitution.min(previous[j + 1] + 1).min(current[j] + 1);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+
+    previous[b.len()]
+}
+
 /// Probe the given local servers, keeping the ones that answered.
 ///
 /// Concurrent, so a machine where nothing is running does not take four
@@ -103,13 +180,23 @@ pub async fn check(library: &Library, tier: &Tier) -> Readiness {
                     settings.base_url
                 )),
                 Ok(Ok(models)) => {
+                    // A configured id the endpoint does not list would 404 on
+                    // the first turn, which is exactly the state a hand-typed
+                    // typo leaves behind. Reporting this as ready — naming the
+                    // bad id as the one that "would be used" — was actively
+                    // misleading, and it let the wizard write a config that
+                    // could not answer.
+                    let configured = tier.model.as_deref().filter(|model| !model.is_empty());
+                    if let Some(configured) = configured {
+                        if let Some(problem) = unserved_model(&models, configured) {
+                            return Readiness::problem(problem);
+                        }
+                    }
+
                     // Name the model that would actually be used: an empty
                     // `model` is resolved at startup, so it is otherwise
                     // invisible until a turn runs.
-                    let chosen = tier
-                        .model
-                        .as_deref()
-                        .filter(|model| !model.is_empty())
+                    let chosen = configured
                         .map(str::to_string)
                         .or_else(|| models.first().cloned());
 
@@ -258,7 +345,7 @@ mod tests {
             &tier(&format!(
                 r#"kind = "openai"
 base_url = "{}/v1"
-model = "m""#,
+model = "a""#,
                 server.url()
             )),
         )
@@ -266,6 +353,38 @@ model = "m""#,
 
         assert!(readiness.ok, "{}", readiness.detail);
         assert!(readiness.detail.contains("2 model"), "{}", readiness.detail);
+    }
+
+    #[tokio::test]
+    async fn checking_an_openai_tier_catches_a_model_it_does_not_serve() {
+        // The endpoint answers and lists its models, but the configured id is
+        // not one of them — the state a hand-typed typo leaves behind. It must
+        // not be reported as ready, because the first turn would 404.
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/v1/models")
+            .with_status(200)
+            .with_body(r#"{"data":[{"id":"deepseek/deepseek-v4-flash"},{"id":"other"}]}"#)
+            .create_async()
+            .await;
+
+        let library = Library::embedded();
+        let readiness = check(
+            &library,
+            &tier(&format!(
+                r#"kind = "openai"
+base_url = "{}/v1"
+model = "deepseek/deepseek-v4-falsh""#,
+                server.url()
+            )),
+        )
+        .await;
+
+        assert!(
+            !readiness.ok,
+            "a model the endpoint does not serve was reported ready: {}",
+            readiness.detail
+        );
     }
 
     #[tokio::test]

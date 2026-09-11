@@ -140,9 +140,13 @@ Three steps, and every choice is checked before anything is written:
    first, since they need no API key: `cmd`, `grok`, `claude`, `gemini`, `copilot`,
    `cursor-agent`, `codex`, `opencode`, `crush`. Then hosted endpoints, and a last
    row for **anything not in that list** — type its address and spill reads the
-   models it serves, so you pick one rather than guessing at an id.
+   models it serves, so you pick one rather than guessing at an id. If you would
+   rather type an id than scroll to it, it is checked against that list, and a
+   near miss is named rather than accepted.
 3. **Review** — each tier is checked and its resolved model named, so a wrong URL or
-   a missing CLI is caught here rather than mid-conversation:
+   a missing CLI is caught here rather than mid-conversation. `w` is refused while
+   any tier cannot answer, because a config that cannot work is worse than no
+   config. Press `w` again to insist, for a server you have not started yet:
 
    ```
    1. LM Studio  (tried first, openai)
@@ -494,16 +498,15 @@ Working today: configuration and validation, the terminal UI, OpenAI-compatible
 streaming with model auto-discovery, the agent loop with seven tools and approval,
 stuck detection and tier escalation, consulting a tier instead of escalating,
 build and plan modes, slash commands, session continuity for CLI tiers, cost
-reporting per tier, delegated CLI tiers, the preset library, the setup wizard,
-zero-config first run, `doctor`, and `-p`.
+reporting per tier, delegated CLI tiers, the preset library, the setup wizard
+(which checks every tier before it will write), zero-config first run, `doctor`,
+and `-p`.
 
 Not yet:
 
 - **The AUR package** is written but not submitted, so `yay -S spill-bin` does not
   work yet.
 - Windows `winget` and `scoop` manifests.
-- `spill setup` offers hosted endpoints but does not yet validate a model id that was
-  typed by hand rather than picked from the list.
 
 ## License
 

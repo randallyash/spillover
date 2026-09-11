@@ -8,6 +8,43 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`spill setup` accepts a model id the endpoint does not serve.** Three gaps
+  stacked into one bad first impression: the text step took any non-empty string,
+  the review check reported a configured id as *ready* without looking for it in
+  the advertised list — naming the typo as the model that "would be used" — and
+  `w` wrote the config anyway, because a failed check was only ever drawn. A
+  hand-typed OpenRouter or xAI id that was one letter off therefore reached the
+  config and 404'd on the first turn of the first conversation. That is the first
+  impression this wizard exists to prevent, and the README already claimed
+  "every choice is checked before anything is written", which was not true.
+
+  A typed id is now checked against the list the endpoint already gave us — the
+  same list the picker offers, so it costs no second request — and a near miss is
+  named: `"deepseek/deepseek-v4-falsh" is not among the 2 models this endpoint
+  lists — did you mean "deepseek/deepseek-v4-flash"?`. The same question is
+  answered in one place, so the text step, the review screen and `spill doctor`
+  cannot disagree about it. An endpoint that lists nothing still refuses nothing:
+  that path exists for a gateway which serves completions without advertising
+  them, and refusing there would block a working setup on a guess.
+
+  `w` is now refused while any tier cannot answer, which is what makes the check
+  a refusal rather than a note — but only the first time. Pressing it again
+  writes the config anyway, because a server you have not started yet is a real
+  reason to save a tier that does not answer right now, and a wizard that cannot
+  be finished is its own bad first impression.
+
+- **The model list was re-requested on every answer.** Arriving cleared the
+  in-flight marker while the model step was still open, so the next loop asked
+  again — a request per round trip against the endpoint for as long as that screen
+  was up, and a cursor reset to the top of the list on every arrival, which put
+  "type it myself" out of reach behind a list that kept re-selecting its first
+  row. Asking is now gated on the wizard's own idea of whether an answer is still
+  wanted.
+
+- The wizard waits at most ten seconds for an endpoint to list its models, like
+  every other probe it makes. Unbounded, a server that accepted the connection
+  and then said nothing left it asking forever with no way forward.
+
 - **Token accounting counted only the last request of a turn.** A turn is not one
   request: it makes one per tool call, and every one of them is billed, so a turn
   that read four files made five requests and reported one. The transcript's
