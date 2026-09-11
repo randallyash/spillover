@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use serde_json::json;
 
-use crate::config::{Config, TierKind};
+use crate::config::{Config, OnStuck, TierKind};
 use crate::preset::{Library, cli_spec, openai_settings};
 use crate::setup::probe;
 
@@ -23,6 +23,12 @@ pub struct TierReport {
     pub reachable: bool,
     pub detail: String,
     pub milliseconds: u128,
+    /// What this tier does when it gets stuck.
+    ///
+    /// Reported because consult is opt-in and its whole argument is that a
+    /// choice was made: a diagnostic that cannot show which tiers consult cannot
+    /// help anyone decide whether it is working.
+    pub on_stuck: OnStuck,
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +86,17 @@ impl Report {
                 tier.milliseconds,
                 width = width
             ));
+            // Only when it is not the default. A line reading "escalate" under
+            // every tier of every ordinary configuration is noise; the whole
+            // reason to print it is that somebody chose something else.
+            if tier.on_stuck != OnStuck::default() {
+                out.push_str(&format!(
+                    "      {:<width$}  on stuck: {}\n",
+                    "",
+                    tier.on_stuck,
+                    width = width
+                ));
+            }
         }
 
         let working = self.tiers.iter().filter(|tier| tier.reachable).count();
@@ -124,6 +141,7 @@ impl Report {
                 "reachable": tier.reachable,
                 "detail": tier.detail,
                 "milliseconds": tier.milliseconds,
+                "onStuck": tier.on_stuck.to_string(),
             })).collect::<Vec<_>>(),
             "notes": self.notes,
         });
@@ -178,6 +196,7 @@ pub async fn diagnose(library: &Library, config: &Config) -> Report {
             reachable: readiness.ok,
             detail,
             milliseconds: elapsed.as_millis(),
+            on_stuck: tier.on_stuck,
         });
     }
 
@@ -219,6 +238,15 @@ mod tests {
                 "could not reach it".to_string()
             },
             milliseconds: 12,
+            on_stuck: OnStuck::default(),
+        }
+    }
+
+    /// The same, consulting when stuck.
+    fn consulting_tier(id: &str) -> TierReport {
+        TierReport {
+            on_stuck: OnStuck::Consult,
+            ..tier(id, true)
         }
     }
 
@@ -442,6 +470,77 @@ mod tests {
         assert_eq!(report.tiers[0].id, "dead");
         assert_eq!(report.tiers[1].id, "shell");
         assert!(report.tiers[1].reachable);
+    }
+
+    #[test]
+    fn a_tier_that_consults_when_stuck_says_so() {
+        // The policy is invisible everywhere else, and consult is opt-in, so a
+        // report that cannot show it cannot help anyone tell whether the choice
+        // took effect.
+        let text = report(vec![tier("local", true), consulting_tier("helper")]).render();
+
+        assert!(text.contains("on stuck: consult"), "{text}");
+        // And named against the tier it belongs to, not floating at the end.
+        let helper = text
+            .lines()
+            .position(|line| line.contains("helper"))
+            .expect("the helper tier");
+        // The header, the detail, then the policy: three lines belong to a tier
+        // whose policy is worth printing.
+        assert!(
+            text.lines()
+                .skip(helper)
+                .take(3)
+                .any(|line| line.contains("on stuck: consult")),
+            "the policy should read as that tier's: {text}"
+        );
+    }
+
+    #[test]
+    fn the_default_policy_is_not_printed_at_all() {
+        // A line reading "escalate" under every tier of every ordinary
+        // configuration is noise; the reason to print it is that someone chose
+        // something other than the default.
+        let text = report(vec![tier("local", true), tier("grok", false)]).render();
+        assert!(!text.contains("on stuck"), "{text}");
+    }
+
+    #[test]
+    fn the_json_always_carries_the_policy_even_when_it_is_the_default() {
+        // A machine reading the report should not have to infer a field from its
+        // absence, which is why this differs from the text.
+        let report = report(vec![tier("local", true), consulting_tier("helper")]);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&report.to_json()).expect("valid JSON");
+
+        assert_eq!(parsed["tiers"][0]["onStuck"], "escalate");
+        assert_eq!(parsed["tiers"][1]["onStuck"], "consult");
+    }
+
+    #[tokio::test]
+    async fn a_configured_policy_is_reported_for_a_real_config() {
+        let library = Library::embedded();
+        let report = diagnose(
+            &library,
+            &config(
+                r#"
+                [[tier]]
+                id = "local"
+                kind = "openai"
+                base_url = "http://127.0.0.1:9/v1"
+                model = "m"
+                on_stuck = "consult"
+                "#,
+            ),
+        )
+        .await;
+
+        assert_eq!(report.tiers[0].on_stuck, OnStuck::Consult);
+        assert!(
+            report.render().contains("on stuck: consult"),
+            "{}",
+            report.render()
+        );
     }
 
     #[test]

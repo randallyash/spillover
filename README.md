@@ -268,17 +268,30 @@ consults_per_turn = 2     # the default
 ```
 
 You do not have to decide in a file, though. `/on-stuck consult` switches every tier
-for the rest of the session and `/on-stuck escalate` puts it back, and `/consult` asks
-for **one** consult on the next stall without changing anything — which is the way to
-find out whether it helps before committing to it. The session panel says which policy
-is live, and marks a policy you chose rather than one from your configuration:
+for the rest of the session, and `/consult` asks for **one** consult on the next stall
+without changing anything — which is the way to find out whether it helps before
+committing to it.
+
+Because a session choice flattens the whole chain to one answer, `/on-stuck auto` hands
+the choice back to each tier's own, which is the only way to return to a configuration
+where two tiers differ:
+
+```
+> /on-stuck auto
+back to the configured policies — Local consult, Frontier escalate
+```
+
+The session panel says which policy is live, and marks a policy you chose rather than
+one from your configuration:
 
 ```
 fallback   sticky
 on stuck * consult
 ```
 
-The `*` means the session chose it. Restarting returns to whatever the config says.
+The `*` means the session chose it; without it, the policy is the answering tier's own
+from your configuration, which can differ per tier. Restarting returns to the config
+either way.
 
 When that tier gets stuck, the next tier in the chain is asked a question built from
 evidence spill already holds: your own words, the reason the tier was judged stuck, and
@@ -353,6 +366,7 @@ spill 0.1.0 — doctor
 
 ok    local    openai  http://localhost:1234/v1
                would use qwen3-coder-30b  (5 ms)
+               on stuck: consult
 FAIL  offline  openai  http://127.0.0.1:9/v1
                could not reach http://127.0.0.1:9/v1/models: could not connect  (0 ms)
 ok    grok     cli     grok
@@ -362,8 +376,12 @@ ok    grok     cli     grok
 ```
 
 Every configured tier is checked, with what each would actually use, how long it
-took, and why anything failed. `--json` produces the same report for a script, and
-the exit code is non-zero when no tier is usable.
+took, and why anything failed. A tier whose stuck policy is not the default says so,
+because consult is a choice worth being able to audit — and the plain-text report shows
+it only when it is not `escalate`, so an ordinary configuration stays as short as it
+was. The JSON always carries `onStuck` for every tier, so a script never has to infer
+it from a missing line. `--json` produces the same report for a script, and the exit
+code is non-zero when no tier is usable.
 
 **API keys are never printed** — only the *name* of the environment variable one
 would come from. That is deliberate, so a doctor report is safe to paste into an
@@ -483,7 +501,7 @@ single-model agent cannot offer:
 | `/tier auto` | Go back to the configured order |
 | `/escalate` | Spill to the next tier now, without waiting for a stall |
 | `/consult` | Ask the tier below one question about the next stall, and keep driving |
-| `/on-stuck <escalate\|consult>` | What a stuck tier does for the rest of the session |
+| `/on-stuck <escalate\|consult\|auto>` | What a stuck tier does for the rest of the session; `auto` goes back to each tier's own |
 | `/retry [tier]` | Send the last turn again, here or somewhere else |
 | `/drop` | Discard the active tier's own conversation and start it fresh |
 | `/sticky <on\|off>` | Whether a spill keeps the lower tier for the session |

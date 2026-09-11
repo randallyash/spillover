@@ -144,6 +144,21 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `/on-stuck consult` on a chain one tier deep says the policy cannot take
   effect rather than silently doing nothing.
 
+- `/on-stuck auto` hands the choice back to each tier's own. A session policy
+  flattens the whole chain to one answer, so without this a single `/on-stuck`
+  would be a one-way door: the arrangement its configuration described — one tier
+  consulting, the next not — would be unreachable until a restart. The notice says
+  what going back actually means, naming each tier's policy, because "back to the
+  configuration" is not one policy.
+
+- `spill doctor` reports each tier's stuck policy. Consult is opt-in and its whole
+  argument is that a choice was made, and until now nothing outside the session
+  panel could show which tiers consult — not `doctor`, and not for a tier other
+  than the one answering. The plain-text report prints the policy only where it is
+  not the default, so an ordinary configuration stays as short as it was, and the
+  JSON carries `onStuck` for every tier so a script never has to infer it from a
+  missing line.
+
 - The session panel says which stuck policy is live. It is drawn from the
   answering tier's own configuration when the session has not chosen one, because
   tiers differ on purpose — consulting a hesitant local model is the point, while

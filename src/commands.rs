@@ -47,7 +47,7 @@ pub const CATALOGUE: &[Spec] = &[
     },
     Spec {
         name: "on-stuck",
-        arg: Arg::Required("<escalate|consult>"),
+        arg: Arg::Required("<escalate|consult|auto>"),
         summary: "What a stuck tier does for the rest of the session",
     },
     Spec {

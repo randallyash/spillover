@@ -877,23 +877,25 @@ impl App {
             }
 
             "on-stuck" => match argument.trim().to_lowercase().as_str() {
-                "escalate" => {
+                "escalate" | "consult" | "auto" => {
                     // Recorded only once the chain has been told, so the panel
                     // cannot report a policy that is not in effect.
-                    if send(self, Command::SetOnStuck(OnStuck::Escalate)) {
-                        self.on_stuck = Some(OnStuck::Escalate);
-                    }
-                }
-                "consult" => {
-                    if send(self, Command::SetOnStuck(OnStuck::Consult)) {
-                        self.on_stuck = Some(OnStuck::Consult);
+                    let chosen = match argument.trim().to_lowercase().as_str() {
+                        "escalate" => Some(OnStuck::Escalate),
+                        "consult" => Some(OnStuck::Consult),
+                        // Not a third policy: the absence of one, which is the
+                        // only way back to a chain whose tiers differ.
+                        _ => None,
+                    };
+                    if send(self, Command::SetOnStuck(chosen)) {
+                        self.on_stuck = chosen;
                     }
                 }
                 other => {
                     let complaint = if other.is_empty() {
-                        "usage: /on-stuck <escalate|consult>".to_string()
+                        "usage: /on-stuck <escalate|consult|auto>".to_string()
                     } else {
-                        format!("/on-stuck takes escalate or consult, not {other:?}")
+                        format!("/on-stuck takes escalate, consult or auto, not {other:?}")
                     };
                     self.messages.push(Message::system(complaint));
                 }
@@ -2121,7 +2123,7 @@ mod tests {
         assert_eq!(app.on_stuck(), before);
         assert!(!app.on_stuck_is_chosen());
         assert!(
-            last_message(&app).contains("on-stuck takes escalate or consult"),
+            last_message(&app).contains("escalate, consult or auto"),
             "{}",
             last_message(&app)
         );
@@ -2153,7 +2155,51 @@ mod tests {
 
         assert_eq!(
             commands.try_recv().expect("the command should be sent"),
-            Command::SetOnStuck(OnStuck::Consult)
+            Command::SetOnStuck(Some(OnStuck::Consult))
+        );
+    }
+
+    #[test]
+    fn auto_hands_the_policy_back_to_each_tier() {
+        // Without this, one `/on-stuck` would be a one-way door: every concrete
+        // policy flattens the chain to a single answer, so the only way back to
+        // an arrangement where two tiers differ would be a restart.
+        let (mut app, mut commands) = app_with_policies(&[OnStuck::Consult, OnStuck::Escalate]);
+        app.messages.clear();
+
+        type_and_send(&mut app, "/on-stuck escalate");
+        assert_eq!(
+            app.on_stuck(),
+            OnStuck::Escalate,
+            "the override applies to the tier that consults too"
+        );
+
+        type_and_send(&mut app, "/on-stuck auto");
+
+        // Both went to the agent, in order, and the second says "no policy"
+        // rather than naming a third one.
+        assert_eq!(
+            commands.try_recv().expect("the first was forwarded"),
+            Command::SetOnStuck(Some(OnStuck::Escalate))
+        );
+        assert_eq!(
+            commands.try_recv().expect("and so was the second"),
+            Command::SetOnStuck(None),
+            "auto is the absence of a policy, not another one"
+        );
+
+        assert!(!app.on_stuck_is_chosen(), "the choice was handed back");
+        assert_eq!(
+            app.on_stuck(),
+            OnStuck::Consult,
+            "and the first tier's own policy is back in force"
+        );
+
+        app.activate_tier("second");
+        assert_eq!(
+            app.on_stuck(),
+            OnStuck::Escalate,
+            "as is the second's — which is what going back means"
         );
     }
 

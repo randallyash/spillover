@@ -144,9 +144,26 @@ impl FallbackChain {
         self.on_stuck.unwrap_or(self.active().on_stuck)
     }
 
-    /// Choose the stuck policy for the rest of the session.
-    pub fn set_on_stuck(&mut self, policy: OnStuck) {
-        self.on_stuck = Some(policy);
+    /// Choose the stuck policy for the rest of the session, or hand the choice
+    /// back to each tier's own.
+    ///
+    /// `None` is not a third policy: it is the absence of one, which is the only
+    /// way to get back to a chain where two tiers differ. Every concrete policy
+    /// flattens the whole chain to one answer, so without this a session that
+    /// tried one could never return to the arrangement its configuration
+    /// described.
+    pub fn set_on_stuck(&mut self, policy: Option<OnStuck>) {
+        self.on_stuck = policy;
+    }
+
+    /// Each tier's own policy, for saying what "back to the configuration"
+    /// actually means — which differs per tier, and is the point of going back.
+    pub fn describe_own_policies(&self) -> String {
+        self.tiers
+            .iter()
+            .map(|tier| format!("{} {}", tier_name(&tier.label), tier.on_stuck))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     /// Whether the answering tier should consult rather than hand the turn over.
@@ -563,7 +580,7 @@ mod tests {
         let mut chain = FallbackChain::new(vec![first, second], true).expect("a chain");
 
         assert!(!chain.consults_when_stuck());
-        chain.set_on_stuck(OnStuck::Consult);
+        chain.set_on_stuck(Some(OnStuck::Consult));
 
         assert!(
             chain.consults_when_stuck(),

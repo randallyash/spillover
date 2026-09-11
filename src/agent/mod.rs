@@ -166,8 +166,10 @@ pub enum Command {
     /// intention from "consult from now on", and the second one has a command of
     /// its own.
     Consult,
-    /// Choose the stuck policy for the rest of the session.
-    SetOnStuck(OnStuck),
+    /// Choose the stuck policy for the rest of the session. `None` hands the
+    /// choice back to each tier's own, which is the only way to return to a
+    /// chain whose tiers differ.
+    SetOnStuck(Option<OnStuck>),
     /// Send the last turn again, optionally on a named tier.
     Retry { tier: Option<String> },
     /// Forget the active tier's own conversation.
@@ -398,8 +400,18 @@ async fn handle_command(
             }
         }
 
-        Command::SetOnStuck(policy) => {
-            state.chain.set_on_stuck(policy);
+        Command::SetOnStuck(None) => {
+            state.chain.set_on_stuck(None);
+            // Says what going back actually means, because it is not one policy:
+            // each tier has its own, and that is the reason to go back.
+            let _ = events.send(AgentEvent::Notice(format!(
+                "back to the configured policies — {}",
+                state.chain.describe_own_policies()
+            )));
+        }
+
+        Command::SetOnStuck(Some(policy)) => {
+            state.chain.set_on_stuck(Some(policy));
             let _ = events.send(AgentEvent::Notice(match policy {
                 OnStuck::Consult => {
                     let consultant = state
@@ -2629,7 +2641,7 @@ mod tests {
         let (chain, driver, consultant) = consultable(2);
         let (tx, mut rx) = loop_over(dir.path(), chain);
 
-        tx.send(Command::SetOnStuck(OnStuck::Consult))
+        tx.send(Command::SetOnStuck(Some(OnStuck::Consult)))
             .expect("send");
         let events = collect(&mut rx).await;
         let said = notices(&events).join(" ");
@@ -2649,12 +2661,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn on_stuck_auto_hands_the_choice_back_and_says_what_that_means() {
+        // The route back. Says what going back actually means, because it is not
+        // one policy: each tier has its own, and that is the reason to go back.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (chain, _driver, _consultant) = consultable(2);
+        let (tx, mut rx) = loop_over(dir.path(), chain);
+
+        // Flatten both tiers, so going back is visible.
+        tx.send(Command::SetOnStuck(Some(OnStuck::Escalate)))
+            .expect("send");
+        let _ = collect(&mut rx).await;
+
+        tx.send(Command::SetOnStuck(None)).expect("send");
+        let events = collect(&mut rx).await;
+        let said = notices(&events).join(" ");
+
+        assert!(said.contains("back to the configured"), "{said}");
+        assert!(
+            said.contains("Local consult"),
+            "it should name each tier's own policy: {said}"
+        );
+        assert!(said.contains("DeepSeek escalate"), "{said}");
+    }
+
+    #[tokio::test]
+    async fn on_stuck_auto_restores_the_tier_that_consults() {
+        // The behaviour that matters, not just the message: after going back, a
+        // stall consults again because the tier's own config says so.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (chain, driver, consultant) = consultable(2);
+        let (tx, mut rx) = loop_over(dir.path(), chain);
+
+        tx.send(Command::SetOnStuck(Some(OnStuck::Escalate)))
+            .expect("send");
+        let _ = collect(&mut rx).await;
+        tx.send(Command::SetOnStuck(None)).expect("send");
+        let _ = collect(&mut rx).await;
+
+        tx.send(Command::Prompt("go".to_string())).expect("send");
+        let events = drain_from(&mut rx).await;
+
+        assert_eq!(
+            consulted(&events).len(),
+            1,
+            "the tier's own policy is back in force: {events:?}"
+        );
+        assert_eq!(driver.request_count(), 2);
+        assert_eq!(consultant.request_count(), 1);
+    }
+
+    #[tokio::test]
     async fn on_stuck_escalate_puts_it_back() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (chain, _driver, _consultant) = consultable(2);
         let (tx, mut rx) = loop_over(dir.path(), chain);
 
-        tx.send(Command::SetOnStuck(OnStuck::Escalate))
+        tx.send(Command::SetOnStuck(Some(OnStuck::Escalate)))
             .expect("send");
         let events = collect(&mut rx).await;
         assert!(
@@ -2711,7 +2774,7 @@ mod tests {
 
         tx.send(Command::Consult).expect("send");
         let events = collect(&mut rx).await;
-        tx.send(Command::SetOnStuck(OnStuck::Consult))
+        tx.send(Command::SetOnStuck(Some(OnStuck::Consult)))
             .expect("send");
         let events2 = collect(&mut rx).await;
 
@@ -2751,7 +2814,7 @@ mod tests {
         let (chain, _provider) = one_tier("only");
         let (tx, mut rx) = loop_over(dir.path(), chain);
 
-        tx.send(Command::SetOnStuck(OnStuck::Consult))
+        tx.send(Command::SetOnStuck(Some(OnStuck::Consult)))
             .expect("send");
         let events = collect(&mut rx).await;
         let said = notices(&events).join(" ");
