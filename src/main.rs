@@ -22,7 +22,10 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use crossterm::cursor;
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture, KeyCode, KeyEventKind};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, KeyCode,
+    KeyEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -251,7 +254,12 @@ async fn run(mut config: Config) -> io::Result<()> {
     let mut approvals = None;
     match start_agent(&config).await {
         AgentStart::Ready(channels) => {
-            app.attach(channels.commands, &channels.tier_labels, channels.warning);
+            app.attach(
+                channels.commands,
+                channels.cancel,
+                &channels.tier_labels,
+                channels.warning,
+            );
             agent_events = Some(channels.events);
             approvals = Some(channels.approvals);
         }
@@ -282,6 +290,7 @@ async fn run(mut config: Config) -> io::Result<()> {
             biased;
             input = input_rx.recv() => match input {
                 Some(InputEvent::Key(key)) => app.handle_key(key),
+                Some(InputEvent::Paste(text)) => app.paste(&text),
                 // Resizing via the backend, not `Terminal::clear`, which can hang
                 // waiting on a terminal size report.
                 Some(InputEvent::Resize { cols, rows }) => {
@@ -336,6 +345,8 @@ struct AgentChannels {
     commands: UnboundedSender<crate::agent::Command>,
     events: UnboundedReceiver<AgentEvent>,
     approvals: UnboundedReceiver<ApprovalRequest>,
+    /// How the interface stops a turn that is already running.
+    cancel: crate::agent::Canceller,
     /// The chain, in order, under the labels the agent reports tiers by, so the
     /// header rail can tell which one is answering.
     tier_labels: Vec<String>,
@@ -373,10 +384,14 @@ async fn start_agent(config: &Config) -> AgentStart {
     let tier_labels = chain.labels();
 
     let (approval_tx, approval_rx) = mpsc::unbounded_channel();
+    // Created here and shared, so the interface can stop a turn the agent is in
+    // the middle of.
+    let canceller = crate::agent::Canceller::default();
     let (commands, events) = crate::agent::spawn(
         AgentConfig {
             workspace,
             max_steps: crate::agent::DEFAULT_MAX_STEPS,
+            cancel: canceller.clone(),
         },
         chain,
         Arc::new(Registry::with_default_tools()),
@@ -387,6 +402,7 @@ async fn start_agent(config: &Config) -> AgentStart {
         commands,
         events,
         approvals: approval_rx,
+        cancel: canceller,
         tier_labels,
         warning,
     }))
@@ -499,6 +515,9 @@ async fn run_wizard(path: PathBuf) -> io::Result<Option<PathBuf>> {
                     InputEvent::Resize { cols, rows } => {
                         terminal.resize(Rect::new(0, 0, cols, rows))?;
                     }
+                    // The wizard's text steps take typing, not a paste, so a
+                    // pasted block is ignored rather than inserted unbidden.
+                    InputEvent::Paste(_) => {}
                     InputEvent::Key(key) => {
                         if key.kind != KeyEventKind::Press {
                             continue;
@@ -611,7 +630,15 @@ impl TerminalGuard {
         enable_raw_mode()?;
 
         let mut stdout = io::stdout();
-        if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
+        // Bracketed paste is what makes a paste arrive as one block of text
+        // rather than as a burst of keystrokes, which in raw mode is unreliable
+        // for anything long and loses the line breaks in a multi-line paste.
+        if let Err(error) = execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste
+        ) {
             let _ = disable_raw_mode();
             return Err(error);
         }
@@ -628,6 +655,7 @@ impl Drop for TerminalGuard {
             stdout,
             LeaveAlternateScreen,
             DisableMouseCapture,
+            DisableBracketedPaste,
             cursor::Show
         );
         let _ = disable_raw_mode();

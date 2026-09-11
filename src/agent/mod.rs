@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::watch;
 
 use crate::agent::approval::{Approver, Decision};
 use crate::agent::tools::{Registry, Risk, ToolOutcome};
@@ -30,6 +31,64 @@ pub const KEEP_TURNS: usize = 3;
 /// Below this many user turns there is nothing worth compacting, so an
 /// escalation does not churn the history of a short session.
 const COMPACT_ABOVE_TURNS: usize = KEEP_TURNS + 2;
+
+/// Stops a turn that is already running.
+///
+/// Deliberately not a `Command`: the command channel is read by the very loop
+/// that is *awaiting* the turn, so a cancel sent down it would sit in the queue
+/// until the turn it was meant to stop had already finished. This is shared state
+/// instead, which the turn watches directly.
+#[derive(Clone, Debug)]
+pub struct Canceller {
+    flag: Arc<watch::Sender<bool>>,
+    watcher: watch::Receiver<bool>,
+}
+
+impl Default for Canceller {
+    fn default() -> Self {
+        let (flag, watcher) = watch::channel(false);
+        Self {
+            flag: Arc::new(flag),
+            watcher,
+        }
+    }
+}
+
+impl Canceller {
+    /// Ask the running turn to stop. Does nothing when nothing is running.
+    pub fn cancel(&self) {
+        let _ = self.flag.send(true);
+    }
+
+    /// Whether a cancel is outstanding.
+    pub fn is_cancelled(&self) -> bool {
+        *self.flag.borrow()
+    }
+
+    /// Clear the flag before a new turn, so a cancel cannot leak into it.
+    fn arm(&self) {
+        let _ = self.flag.send(false);
+    }
+
+    fn watcher(&self) -> watch::Receiver<bool> {
+        self.watcher.clone()
+    }
+}
+
+/// Resolve when a cancel is asked for.
+///
+/// If every sender is gone this never resolves, which is what the turn wants: no
+/// signal, nothing to stop for.
+async fn cancelled(mut watcher: watch::Receiver<bool>) {
+    loop {
+        if *watcher.borrow_and_update() {
+            return;
+        }
+        if watcher.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
 
 /// What a turn is allowed to do.
 ///
@@ -144,6 +203,9 @@ pub enum AgentEvent {
         stop_reason: Option<String>,
         usage: Option<Usage>,
     },
+    /// The user stopped the turn. The tier is named so the transcript can say
+    /// where it was stopped, not just that it was.
+    Cancelled { tier: String },
     /// Every tier was tried and none of them produced an answer.
     Exhausted { reason: String },
 }
@@ -152,6 +214,8 @@ pub enum AgentEvent {
 pub struct AgentConfig {
     pub workspace: PathBuf,
     pub max_steps: usize,
+    /// How a running turn is stopped from outside.
+    pub cancel: Canceller,
 }
 
 /// The conversation and the chain, plus what it takes to run the last turn
@@ -460,6 +524,16 @@ fn describe_context(session: &Session, chain: &FallbackChain) -> String {
 enum Attempt {
     Answered,
     Stuck(StuckReason),
+    /// The user stopped it. Kept apart from `Stuck` because it must not spill to
+    /// the next tier: nobody asked for a different model.
+    Cancelled,
+}
+
+/// How a tool call ended.
+enum ToolRun {
+    Done(ToolOutcome),
+    /// Stopped by the user while it was running.
+    Cancelled,
 }
 
 /// Run one user turn, moving down the tiers until one of them answers.
@@ -485,6 +559,8 @@ async fn run_turn(
     session.push(ChatMessage::user(prompt));
     chain.begin_turn();
     let checkpoint = session.messages().len();
+    // A cancel from a previous turn must not stop this one.
+    config.cancel.arm();
 
     loop {
         let tier = chain.active();
@@ -492,6 +568,17 @@ async fn run_turn(
 
         match outcome {
             Attempt::Answered => return,
+            Attempt::Cancelled => {
+                // No rollback and no session forgotten. Unlike a stalled tier,
+                // a cancelled one is not being abandoned: the conversation up to
+                // this point is real work, and the same tier will carry on from
+                // it. The half-generated answer was never pushed to the session
+                // (only the finished ones are), so there is nothing to undo.
+                let _ = events.send(AgentEvent::Cancelled {
+                    tier: tier.label.clone(),
+                });
+                return;
+            }
             Attempt::Stuck(reason) => {
                 let from = tier.label.clone();
                 let abandoned = Arc::clone(&tier.provider);
@@ -576,14 +663,29 @@ async fn try_tier(
     let mut progress = ProgressDetector::new(tier.limits.max_repeat_run as usize);
 
     for _step in 0..config.max_steps {
+        // Stopped between steps, so a cancel that arrives while tools are being
+        // run does not buy another round trip.
+        if config.cancel.is_cancelled() {
+            return Attempt::Cancelled;
+        }
+
         let request = ChatRequest {
             model: tier.model.clone(),
             messages: session.messages().to_vec(),
             tools: tools.clone(),
         };
 
-        let summary = match stream_turn(&tier.provider, request, events, &mut watchdog).await {
+        let summary = match stream_turn(
+            &tier.provider,
+            request,
+            events,
+            &mut watchdog,
+            &config.cancel,
+        )
+        .await
+        {
             Ok(summary) => summary,
+            Err(StuckReason::Cancelled) => return Attempt::Cancelled,
             Err(reason) => return Attempt::Stuck(reason),
         };
 
@@ -601,8 +703,33 @@ async fn try_tier(
         }
 
         for call in summary.tool_calls.clone() {
-            let outcome =
-                run_tool(mode, registry, approver, &config.workspace, &call, events).await;
+            let outcome = run_tool(
+                mode,
+                registry,
+                approver,
+                &config.workspace,
+                &call,
+                events,
+                &config.cancel,
+            )
+            .await;
+
+            let outcome = match outcome {
+                ToolRun::Done(outcome) => outcome,
+                ToolRun::Cancelled => {
+                    // The assistant message above is already in the session and
+                    // names this call, and a provider rejects a call with no
+                    // result. So the cancellation is recorded as the result
+                    // rather than left as a gap: the conversation stays valid,
+                    // and the next turn knows what became of it.
+                    session.push(ChatMessage::tool_result(
+                        call.id.clone(),
+                        "the user cancelled before this finished.",
+                    ));
+                    return Attempt::Cancelled;
+                }
+            };
+
             if let Some(reason) = progress.record(&call.name, &call.arguments, !outcome.is_error) {
                 return Attempt::Stuck(reason);
             }
@@ -627,6 +754,7 @@ async fn stream_turn(
     request: ChatRequest,
     events: &UnboundedSender<AgentEvent>,
     watchdog: &mut Watchdog,
+    cancel: &Canceller,
 ) -> Result<TurnSummary, StuckReason> {
     let (delta_tx, mut delta_rx) = mpsc::unbounded_channel::<StreamEvent>();
     let provider = provider.clone();
@@ -637,6 +765,9 @@ async fn stream_turn(
 
         tokio::select! {
             biased;
+            // Ahead of the stream, so a cancel is felt on the next frame rather
+            // than after it.
+            _ = cancelled(cancel.watcher()) => break Err(StuckReason::Cancelled),
             joined = &mut task => {
                 // A fast response can finish before this loop gets to its
                 // queued frames, so drain them first: otherwise a looping
@@ -708,7 +839,8 @@ async fn run_tool(
     workspace: &std::path::Path,
     call: &ToolCall,
     events: &UnboundedSender<AgentEvent>,
-) -> ToolOutcome {
+    cancel: &Canceller,
+) -> ToolRun {
     let offered = || -> Vec<String> {
         registry
             .specs_permitting(mode.risk_ceiling())
@@ -724,7 +856,7 @@ async fn run_tool(
             offered().join(", ")
         );
         let _ = events.send(AgentEvent::Notice(message.clone()));
-        return ToolOutcome::error(message);
+        return ToolRun::Done(ToolOutcome::error(message));
     };
 
     // The guarantee. Withholding these from the tool list is the polite version
@@ -742,7 +874,7 @@ async fn run_tool(
             "✗ {} was refused — plan mode is read-only",
             call.name
         )));
-        return ToolOutcome::error(message);
+        return ToolRun::Done(ToolOutcome::error(message));
     }
 
     let arguments: serde_json::Value = match serde_json::from_str(&call.arguments) {
@@ -753,7 +885,7 @@ async fn run_tool(
                 call.name, call.arguments
             );
             let _ = events.send(AgentEvent::Notice(message.clone()));
-            return ToolOutcome::error(message);
+            return ToolRun::Done(ToolOutcome::error(message));
         }
     };
 
@@ -761,21 +893,42 @@ async fn run_tool(
 
     // Only tools that can change something need permission; the short-circuit
     // keeps read-only tools from ever reaching the approver.
-    if tool.risk() == Risk::Write && approver.decide(&call.name, &preview).await == Decision::Deny {
-        let _ = events.send(AgentEvent::Denied {
-            tool: call.name.clone(),
-        });
-        return ToolOutcome::error(format!(
-            "the user declined to run {}. Do not repeat it; ask what they would prefer instead.",
-            call.name
-        ));
+    //
+    // The wait is raced against the cancel as well. In practice Esc over a modal
+    // denies it rather than cancelling, so this is belt and braces: without it,
+    // a cancel raised while a prompt was open would wait for an answer that is
+    // never coming.
+    if tool.risk() == Risk::Write {
+        let decision = tokio::select! {
+            biased;
+            _ = cancelled(cancel.watcher()) => return ToolRun::Cancelled,
+            decision = approver.decide(&call.name, &preview) => decision,
+        };
+        if decision == Decision::Deny {
+            let _ = events.send(AgentEvent::Denied {
+                tool: call.name.clone(),
+            });
+            return ToolRun::Done(ToolOutcome::error(format!(
+                "the user declined to run {}. Do not repeat it; ask what they would prefer instead.",
+                call.name
+            )));
+        }
     }
 
     let _ = events.send(AgentEvent::ToolStarted {
         name: call.name.clone(),
         preview: preview.clone(),
     });
-    let outcome = tool.run(&arguments, workspace).await;
+
+    // The tool races the cancel, so a long build is stopped rather than waited
+    // out. Both the shell and the CLI tiers spawn their child with
+    // `kill_on_drop`, so dropping this future takes the process with it instead
+    // of leaving it running unnoticed.
+    let outcome = tokio::select! {
+        biased;
+        _ = cancelled(cancel.watcher()) => return ToolRun::Cancelled,
+        outcome = tool.run(&arguments, workspace) => outcome,
+    };
 
     let _ = events.send(AgentEvent::ToolFinished {
         name: call.name.clone(),
@@ -783,7 +936,7 @@ async fn run_tool(
         summary: first_line(&outcome.content),
     });
 
-    outcome
+    ToolRun::Done(outcome)
 }
 
 /// A tool's output can be thousands of lines; the transcript gets the gist.
@@ -949,7 +1102,22 @@ mod tests {
         AgentConfig {
             workspace: workspace.to_path_buf(),
             max_steps,
+            cancel: Canceller::default(),
         }
+    }
+
+    /// The same, with a canceller the test can hold.
+    fn config_with_cancel(
+        workspace: &std::path::Path,
+        max_steps: usize,
+    ) -> (AgentConfig, Canceller) {
+        let cancel = Canceller::default();
+        let config = AgentConfig {
+            workspace: workspace.to_path_buf(),
+            max_steps,
+            cancel: cancel.clone(),
+        };
+        (config, cancel)
     }
 
     /// A chain of one, which is what most of these tests want.
@@ -2158,5 +2326,198 @@ mod tests {
         let events = collect(&mut rx).await;
         let said = notices(&events).join(" ");
         assert!(said.contains("write files"), "{said}");
+    }
+
+    // ---- cancelling -------------------------------------------------------
+
+    /// Talks forever without repeating itself, so the watchdog never trips and
+    /// the only thing that can end the turn is a cancel.
+    struct Endless {
+        streamed: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Provider for Endless {
+        fn describe(&self) -> String {
+            "endless".to_string()
+        }
+
+        async fn stream(
+            &self,
+            _request: ChatRequest,
+            events: UnboundedSender<StreamEvent>,
+        ) -> Result<TurnSummary, ProviderError> {
+            loop {
+                let n = self
+                    .streamed
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Distinct every time: identical lines would trip the repetition
+                // detector and end the turn for the wrong reason.
+                let _ = events.send(StreamEvent::Text(format!("chunk number {n}\n")));
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+    }
+
+    /// Never answers an approval, so a turn sits inside a tool until cancelled.
+    struct NeverApproves;
+
+    #[async_trait]
+    impl Approver for NeverApproves {
+        async fn decide(&self, _tool: &str, _preview: &str) -> Decision {
+            std::future::pending::<()>().await;
+            unreachable!("pending never resolves")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_turn_stops_and_is_not_spilled_to_the_next_tier() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let second = Quiet::new("second answer");
+        let (config, cancel) = config_with_cancel(dir.path(), DEFAULT_MAX_STEPS);
+        let chain = FallbackChain::new(
+            vec![
+                Tier {
+                    label: "Endless".to_string(),
+                    model: "m".to_string(),
+                    provider: Arc::new(Endless {
+                        streamed: std::sync::atomic::AtomicUsize::new(0),
+                    }),
+                    limits: Limits::default(),
+                },
+                Tier {
+                    label: "DeepSeek".to_string(),
+                    model: "m".to_string(),
+                    provider: second.clone(),
+                    limits: Limits::default(),
+                },
+            ],
+            true,
+        )
+        .expect("a chain");
+        let (tx, mut rx) = spawn(
+            config,
+            chain,
+            Arc::new(Registry::with_default_tools()),
+            Arc::new(AlwaysApprove::default()),
+        );
+
+        tx.send(Command::Prompt("go".to_string())).expect("send");
+        // Let it start producing, then stop it.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        cancel.cancel();
+
+        let events = collect(&mut rx).await;
+        let terminal = events.last().expect("a terminal event");
+
+        assert!(
+            matches!(terminal, AgentEvent::Cancelled { tier } if tier == "Endless"),
+            "the turn should end as cancelled, not finished or spilled: {terminal:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Escalated { .. })),
+            "a cancel is not a reason to change models: {events:?}"
+        );
+        assert_eq!(
+            second.requests(),
+            0,
+            "the next tier must not be asked to take over"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancel_does_not_leak_into_the_next_turn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = ScriptedProvider::new(vec![answer("first"), answer("second")]);
+        let (config, cancel) = config_with_cancel(dir.path(), DEFAULT_MAX_STEPS);
+        let (tx, mut rx) = spawn(
+            config,
+            single_tier(provider.clone()),
+            Arc::new(Registry::with_default_tools()),
+            Arc::new(AlwaysApprove::default()),
+        );
+
+        // Cancelled while nothing was running: the flag must be cleared before
+        // the next turn, or that turn would stop the instant it began.
+        cancel.cancel();
+        tx.send(Command::Prompt("go".to_string())).expect("send");
+
+        let events = drain_from(&mut rx).await;
+        assert!(
+            matches!(events.last(), Some(AgentEvent::Finished { .. })),
+            "the turn should have run normally: {:?}",
+            events.last()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancel_inside_a_tool_answers_its_call_so_the_history_stays_valid() {
+        // A provider rejects an assistant message whose tool calls have no
+        // results, so a cancel that lands mid-tool still has to record what
+        // became of the call.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = ScriptedProvider::new(vec![
+            calls_tool("write_file", r#"{"path":"new.txt","content":"hi"}"#),
+            answer("understood"),
+        ]);
+        let (config, cancel) = config_with_cancel(dir.path(), DEFAULT_MAX_STEPS);
+        let (tx, mut rx) = spawn(
+            config,
+            single_tier(provider.clone()),
+            Arc::new(Registry::with_default_tools()),
+            // Stuck waiting for an approval that never comes, which is the
+            // earliest a turn can be caught inside a tool.
+            Arc::new(NeverApproves),
+        );
+
+        tx.send(Command::Prompt("go".to_string())).expect("send");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        cancel.cancel();
+
+        let events = collect(&mut rx).await;
+        assert!(
+            matches!(events.last(), Some(AgentEvent::Cancelled { .. })),
+            "it should end as cancelled: {:?}",
+            events.last()
+        );
+        assert!(
+            !dir.path().join("new.txt").exists(),
+            "nothing may have been written"
+        );
+
+        // The next turn must be sendable: every call answered by a result.
+        tx.send(Command::Prompt("again".to_string())).expect("send");
+        let _ = drain_from(&mut rx).await;
+
+        let last = provider
+            .requests
+            .lock()
+            .expect("lock")
+            .last()
+            .cloned()
+            .expect("a second request");
+        let calls: Vec<String> = last
+            .messages
+            .iter()
+            .flat_map(|m| m.tool_calls.iter().map(|c| c.id.clone()))
+            .collect();
+        let results: Vec<String> = last
+            .messages
+            .iter()
+            .filter_map(|m| m.tool_call_id.clone())
+            .collect();
+
+        assert!(
+            !calls.is_empty(),
+            "the cancelled call should still be there"
+        );
+        for id in &calls {
+            assert!(
+                results.contains(id),
+                "call {id} has no result, so this request would be rejected"
+            );
+        }
     }
 }

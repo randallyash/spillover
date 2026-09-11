@@ -101,6 +101,8 @@ pub async fn run(library: &Library, config: &Config, options: &Options) -> Outco
         AgentConfig {
             workspace,
             max_steps: crate::agent::DEFAULT_MAX_STEPS,
+            // A one-shot run has nobody to press escape, so nothing cancels it.
+            cancel: crate::agent::Canceller::default(),
         },
         chain,
         Arc::new(Registry::with_default_tools()),
@@ -138,6 +140,13 @@ pub async fn run(library: &Library, config: &Config, options: &Options) -> Outco
             }
             AgentEvent::Exhausted { reason } => {
                 outcome.failure = Some(format!("no tier could answer: {reason}"));
+                break;
+            }
+            // Nothing cancels a one-shot run, so this cannot arrive; it is
+            // handled as a failure rather than ignored, so a future change that
+            // finds a way to cancel would say so rather than return no answer.
+            AgentEvent::Cancelled { tier } => {
+                outcome.failure = Some(format!("the turn on {tier} was cancelled"));
                 break;
             }
             // Notices and tool chatter are for the TUI; a pipeline wants the

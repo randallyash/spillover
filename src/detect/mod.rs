@@ -27,6 +27,13 @@ pub enum StuckReason {
     StepLimit { steps: usize },
     /// The tier failed at the transport, protocol or HTTP level.
     Failed { detail: String },
+    /// The user stopped the turn.
+    ///
+    /// Not really "stuck", but it ends an attempt the same way, and giving it a
+    /// home here is what lets the turn loop stop through the one path it already
+    /// has. `run_turn` treats it separately: a cancelled turn is not spilled to
+    /// the next tier, because nobody asked for a different model.
+    Cancelled,
 }
 
 impl StuckReason {
@@ -47,6 +54,7 @@ impl StuckReason {
                 format!("used all {steps} tool steps without finishing")
             }
             Self::Failed { detail } => detail.clone(),
+            Self::Cancelled => "you cancelled it".to_string(),
         }
     }
 }

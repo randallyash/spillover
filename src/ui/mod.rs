@@ -71,6 +71,9 @@ impl Shape {
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let theme = Theme::detect();
     let area = frame.area();
+    // Recorded so key handling can size things the way the renderer does — the
+    // approval preview's scroll clamp is the reason.
+    app.viewport = area;
 
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         too_small(frame, area, &theme);
@@ -109,7 +112,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     // Drawn last so it sits above everything, including the prompt.
     if let Some(pending) = &app.approval {
-        approval::render(frame, area, pending, &theme);
+        approval::render(frame, area, pending, &theme, app.approval_scroll);
     }
 }
 
@@ -151,12 +154,13 @@ fn footer(frame: &mut Frame, area: Rect, app: &App, theme: &Theme, shape: Shape)
     .areas::<2>(area);
 
     let hints: &[(&str, &str)] = if app.approval.is_some() {
-        &[("y", "run"), ("n", "skip")]
+        &[("y", "run"), ("n", "skip"), ("↑↓", "read")]
     } else if crate::commands::looks_like_command(&app.input) {
         // A command is not a turn, so the keys that matter change with it.
         &[("enter", "run"), ("tab", "complete"), ("esc", "cancel")]
     } else if app.busy {
-        &[("waiting on the model", ""), ("esc", "quit")]
+        // The way out of a turn in flight, which used to be quitting outright.
+        &[("esc", "stop"), ("", "working")]
     } else if app.mode.is_read_only() {
         // The way out of plan mode is the one thing worth saying while in it.
         &[("shift+tab", "build"), ("enter", "send"), ("?", "help")]

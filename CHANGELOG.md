@@ -6,6 +6,34 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- `Esc` stops a turn instead of quitting the program. It used to kill the whole
+  session, which meant a model forty seconds into a bad answer left no way out
+  but losing the conversation. Stopping is deliberately not the same as spilling
+  over: the tier stays the one you chose, the work already in the conversation
+  stays there, and the half-generated answer — which was never sent to the model
+  — is dropped from the transcript rather than left looking like part of it. A
+  tool in flight is stopped too, because both the shell and the CLI tiers spawn
+  their child with `kill_on_drop`, so a build is killed rather than waited out.
+  A call caught mid-flight is recorded as cancelled rather than left unanswered,
+  since a provider rejects an assistant message whose tool calls have no results.
+  `Esc` still quits when nothing is running, and still cancels a half-typed
+  command first.
+- The approval preview scrolls. It used to be truncated at the box edge with an
+  ellipsis, so a long diff could only be approved blind — the one thing that
+  prompt must not ask. `↑`/`↓` and `PageUp`/`PageDown` move through it, the title
+  shows the position (`edit a file? — 97/121`), the answer keys stay pinned below
+  the window, and the scroll hint appears only when there is something to scroll
+  to. The offset is clamped against the same geometry the renderer uses, so
+  holding `↓` at the end does not strand it past the content.
+- Bracketed paste is enabled, so a multi-line paste arrives as one block with its
+  line breaks intact instead of a burst of keystrokes. Control characters are
+  stripped; newlines are kept, because flattening a pasted snippet would silently
+  change what the model is asked. A paste is ignored while a modal or the help
+  overlay has the keys, and cut short past 100,000 characters with a note, since
+  a stray clipboard can hold a whole file.
+
 ### Added
 
 - Build and plan modes, switched with `Shift+Tab` (or `Tab` when no command is

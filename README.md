@@ -327,11 +327,22 @@ text that happens to sit in a box.
 
 ## Keyboard
 
-`Enter` send · `Shift+Tab` switch mode · `Esc` or `Ctrl-C` quit · `PageUp` / `PageDown` scroll
+`Enter` send · `Shift+Tab` switch mode · `Esc` stop or quit · `PageUp` / `PageDown` scroll
+
+`Esc` does the nearest thing first: it stops a turn that is running, and only quits
+when there is nothing to stop. Stopping is not spilling over — the model you chose
+stays the model you chose, the work done so far stays in the conversation, and nothing
+half-written reaches the transcript. It also stops a tool that is running: a build or a
+test is killed rather than waited out.
 
 Before anything that can change your files, a prompt appears showing exactly what it
 will do. `y` runs it, `n` skips it — and the model is told it was declined, so it can
-try another way rather than repeating itself.
+try another way rather than repeating itself. When the preview is longer than the box,
+`↑`/`↓` and `PageUp`/`PageDown` read the rest of it, with the position shown in the
+title, so you are never asked to approve a change you cannot see.
+
+Pasting is bracketed, so a multi-line paste arrives as one block with its line breaks
+intact rather than as a stream of keystrokes.
 
 ## Modes
 

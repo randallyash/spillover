@@ -1,15 +1,26 @@
 //! Application state and key handling.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::layout::Rect;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 
 use crate::agent::AgentEvent;
 use crate::agent::approval::{ApprovalRequest, Decision};
 use crate::agent::first_line;
-use crate::agent::{Command, Mode};
+use crate::agent::{Canceller, Command, Mode};
 use crate::commands::{self, Input};
 use crate::config::Config;
+
+/// How much of the prompt a single paste may add, in characters.
+///
+/// Bracketed paste hands over whatever the clipboard held, and a stray
+/// clipboard can hold a whole file. Without a limit that lands in the editor and
+/// is then sent to a model; this is a guard against an accident, not a policy.
+const MAX_PASTE: usize = 100_000;
+
+/// How many lines PageUp and PageDown move the approval preview.
+const APPROVAL_PAGE: i32 = 10;
 
 /// How many turns of token history the session panel keeps for its sparkline.
 const HISTORY: usize = 48;
@@ -86,6 +97,14 @@ pub struct App {
     /// What a turn is allowed to do. The agent enforces it; this copy is so the
     /// interface can say which mode is active.
     pub mode: Mode,
+    /// How to stop a turn that is already running. `None` when no agent is
+    /// attached, in which case there is nothing to cancel.
+    cancel: Option<Canceller>,
+    /// The last frame size, so key handling can work out how much of the
+    /// approval modal is on screen without reaching into the renderer.
+    pub viewport: Rect,
+    /// How far the approval modal is scrolled down its preview.
+    pub approval_scroll: u16,
     /// Per-tier totals, so `/cost` can attribute the session rather than only
     /// sum it. Keyed by the tier's label, in first-seen order.
     pub usage_by_tier: Vec<(String, crate::provider::Usage)>,
@@ -140,6 +159,9 @@ impl App {
             busy: false,
             sticky,
             mode: Mode::default(),
+            cancel: None,
+            viewport: Rect::new(0, 0, 80, 24),
+            approval_scroll: 0,
             usage_by_tier: Vec::new(),
             menu_index: 0,
             help: false,
@@ -165,10 +187,12 @@ impl App {
     pub fn attach(
         &mut self,
         commands: UnboundedSender<Command>,
+        cancel: Canceller,
         tier_labels: &[String],
         warning: Option<String>,
     ) {
         self.commands = Some(commands);
+        self.cancel = Some(cancel);
         self.tier_labels = tier_labels.to_vec();
         self.tier_failed = vec![false; tier_labels.len()];
         self.active_tier = 0;
@@ -271,7 +295,8 @@ impl App {
             return;
         }
 
-        // While the agent is asking, the answer keys belong to the modal.
+        // While the agent is asking, the keys belong to the modal: the answer
+        // keys answer it, and the arrows read a preview that does not fit.
         if self.approval.is_some() {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
@@ -280,6 +305,10 @@ impl App {
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     self.answer_approval(false);
                 }
+                KeyCode::Up => self.scroll_approval(-1),
+                KeyCode::Down => self.scroll_approval(1),
+                KeyCode::PageUp => self.scroll_approval(-APPROVAL_PAGE),
+                KeyCode::PageDown => self.scroll_approval(APPROVAL_PAGE),
                 _ => {}
             }
             return;
@@ -335,9 +364,14 @@ impl App {
 
         match key.code {
             KeyCode::Esc => {
-                // A half-typed command is cancelled rather than quitting, which
-                // is what Esc means everywhere else.
-                if self.input.starts_with('/') {
+                // Esc means "stop what you are doing" before it means "leave",
+                // so a turn in flight is what it stops. Quitting out from under
+                // a running model would throw the conversation away.
+                if self.busy {
+                    self.cancel_turn();
+                } else if self.input.starts_with('/') {
+                    // A half-typed command is cancelled, which is what Esc means
+                    // everywhere else.
                     self.input.clear();
                 } else {
                     self.should_quit = true;
@@ -365,6 +399,72 @@ impl App {
     /// Whether the slash menu should be on screen.
     pub fn menu_open(&self) -> bool {
         commands::completion_prefix(&self.input).is_some() && !self.menu_matches().is_empty()
+    }
+
+    /// Stop the turn that is running.
+    ///
+    /// The turn is stopped where it stands rather than retried on another tier,
+    /// so the model is not changed out from under a decision the user just made
+    /// about it.
+    fn cancel_turn(&mut self) {
+        match &self.cancel {
+            Some(cancel) => cancel.cancel(),
+            None => self
+                .messages
+                .push(Message::system("there is nothing to cancel")),
+        }
+    }
+
+    /// Take a pasted block of text into the prompt.
+    ///
+    /// Newlines are kept: a pasted snippet is often several lines, and flattening
+    /// it would silently change what the model is asked. The prompt box already
+    /// wraps and scrolls, so a multi-line paste is exactly what it handles.
+    pub fn paste(&mut self, text: &str) {
+        if self.approval.is_some() || self.help {
+            // The keys belong elsewhere; a paste must not land in a prompt that
+            // is not taking input.
+            return;
+        }
+        let room = MAX_PASTE.saturating_sub(self.input.chars().count());
+        if room == 0 {
+            return;
+        }
+        let mut taken: String = text.chars().take(room).collect();
+        if taken.chars().count() < text.chars().count() {
+            taken.push('…');
+            self.messages.push(Message::system(format!(
+                "that paste was longer than {MAX_PASTE} characters, so only the beginning was \
+                 kept"
+            )));
+        }
+        // Control characters would corrupt the rendered layout; the wrapper
+        // strips them at render time, but they should not be stored at all.
+        for ch in taken.chars().filter(|ch| !ch.is_control() || *ch == '\n') {
+            self.input.push(ch);
+        }
+        self.menu_index = 0;
+    }
+
+    /// Move the approval preview by `delta` lines, staying within it.
+    ///
+    /// Clamped against the same geometry the renderer uses, so holding Down at
+    /// the end does not leave the offset stranded past the content where an Up
+    /// press would appear to do nothing.
+    fn scroll_approval(&mut self, delta: i32) {
+        let Some(pending) = &self.approval else {
+            return;
+        };
+        let theme = crate::ui::theme::Theme::detect();
+        let max = crate::ui::approval::max_scroll(pending, &theme, self.viewport);
+
+        let next = if delta < 0 {
+            self.approval_scroll
+                .saturating_sub(delta.unsigned_abs() as u16)
+        } else {
+            self.approval_scroll.saturating_add(delta as u16)
+        };
+        self.approval_scroll = next.min(max);
     }
 
     /// Switch between building and planning.
@@ -425,6 +525,7 @@ impl App {
             preview: request.preview,
             reply: request.reply,
         });
+        self.approval_scroll = 0;
         self.scroll_back = 0;
     }
 
@@ -506,6 +607,21 @@ impl App {
                 self.messages.push(Message::system(format!(
                     "✗ {from} {reason} — spilling over to {to}"
                 )));
+            }
+            AgentEvent::Cancelled { tier } => {
+                // The half-streamed answer never reached the conversation, so
+                // showing it would leave the transcript claiming something the
+                // model was never told. Everything before it stands.
+                self.discard_streaming_message();
+                self.streaming = None;
+                self.running = None;
+                self.busy = false;
+                self.escalated_at = None;
+                // A modal can only be up while a turn runs, so stopping the turn
+                // takes it down too. The reply channel is already gone.
+                self.approval = None;
+                self.messages
+                    .push(Message::system(format!("✗ you stopped {tier}")));
             }
             AgentEvent::Exhausted { reason } => {
                 self.streaming = None;
@@ -990,7 +1106,7 @@ mod tests {
     fn attached_app() -> (App, tokio::sync::mpsc::UnboundedReceiver<Command>) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = new_app();
-        app.attach(tx, &["Local model".to_string()], None);
+        app.attach(tx, Canceller::default(), &["Local model".to_string()], None);
         (app, rx)
     }
 
@@ -1329,6 +1445,7 @@ mod tests {
         let mut app = new_app();
         app.attach(
             tx,
+            Canceller::default(),
             &["Local model".to_string()],
             Some("not in the chain yet: grok (cli)".to_string()),
         );
@@ -1346,6 +1463,7 @@ mod tests {
         let mut app = new_app();
         app.attach(
             tx,
+            Canceller::default(),
             &[
                 "Local".to_string(),
                 "DeepSeek".to_string(),
@@ -1686,6 +1804,7 @@ mod tests {
         app.tier_labels = vec!["Local".to_string(), "DeepSeek V4 Flash".to_string()];
         app.attach(
             tokio::sync::mpsc::unbounded_channel().0,
+            Canceller::default(),
             &app.tier_labels.clone(),
             None,
         );
@@ -1834,5 +1953,280 @@ mod tests {
             "{}",
             last_message(&app)
         );
+    }
+
+    // ---- cancelling a turn ------------------------------------------------
+
+    /// An attached app whose canceller the test also holds.
+    fn attached_with_cancel() -> (
+        App,
+        tokio::sync::mpsc::UnboundedReceiver<Command>,
+        Canceller,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = Canceller::default();
+        let mut app = new_app();
+        app.attach(tx, cancel.clone(), &["Local model".to_string()], None);
+        (app, rx, cancel)
+    }
+
+    #[test]
+    fn escape_stops_a_running_turn_instead_of_quitting() {
+        let (mut app, _commands, cancel) = attached_with_cancel();
+        type_and_send(&mut app, "do something");
+        assert!(app.busy);
+
+        app.handle_key(press(KeyCode::Esc));
+
+        assert!(cancel.is_cancelled(), "the turn should have been stopped");
+        assert!(
+            !app.should_quit,
+            "quitting would throw away the conversation the user is in the middle of"
+        );
+    }
+
+    #[test]
+    fn escape_still_quits_when_nothing_is_running() {
+        let (mut app, _commands, cancel) = attached_with_cancel();
+        assert!(!app.busy);
+
+        app.handle_key(press(KeyCode::Esc));
+
+        assert!(app.should_quit);
+        assert!(!cancel.is_cancelled(), "nothing to cancel");
+    }
+
+    #[test]
+    fn escape_cancels_a_half_typed_command_before_it_quits() {
+        // The menu's own meaning wins while it is open, running turn or not.
+        let (mut app, _commands, _cancel) = attached_with_cancel();
+        for ch in "/tie".chars() {
+            app.handle_key(press(KeyCode::Char(ch)));
+        }
+
+        app.handle_key(press(KeyCode::Esc));
+
+        assert!(app.input.is_empty());
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn a_cancelled_event_clears_the_working_state_and_says_so() {
+        let (mut app, _commands, _cancel) = attached_with_cancel();
+        type_and_send(&mut app, "do something");
+        app.handle_agent_event(AgentEvent::Text("half an answer".to_string()));
+
+        app.handle_agent_event(AgentEvent::Cancelled {
+            tier: "Local model".to_string(),
+        });
+
+        assert!(!app.busy, "the app must not stay stuck as working");
+        assert!(
+            last_message(&app).contains("you stopped"),
+            "{}",
+            last_message(&app)
+        );
+        // The half-streamed answer was never in the conversation, so it must not
+        // be left in the transcript as though it were.
+        assert!(
+            !app.messages
+                .iter()
+                .any(|m| m.text.contains("half an answer")),
+            "{:?}",
+            app.messages.iter().map(|m| &m.text).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_cancelled_event_takes_down_a_pending_approval() {
+        let (mut app, _commands, _cancel) = attached_with_cancel();
+        let (reply, _answer) = oneshot::channel();
+        app.set_approval(ApprovalRequest {
+            tool: "write_file".to_string(),
+            preview: "create a.txt".to_string(),
+            reply,
+        });
+
+        app.handle_agent_event(AgentEvent::Cancelled {
+            tier: "Local model".to_string(),
+        });
+
+        assert!(
+            app.approval.is_none(),
+            "the modal would otherwise sit there with no turn behind it"
+        );
+    }
+
+    #[test]
+    fn cancelling_with_no_agent_says_so_rather_than_pretending() {
+        let mut app = new_app();
+        app.busy = true;
+        app.handle_key(press(KeyCode::Esc));
+
+        assert!(
+            last_message(&app).contains("nothing to cancel"),
+            "{}",
+            last_message(&app)
+        );
+    }
+
+    // ---- pasting ----------------------------------------------------------
+
+    #[test]
+    fn a_paste_lands_in_the_prompt_as_one_block() {
+        let mut app = new_app();
+        app.paste("first line\nsecond line");
+
+        assert_eq!(app.input, "first line\nsecond line");
+    }
+
+    #[test]
+    fn a_paste_keeps_its_line_breaks() {
+        // A pasted snippet is often several lines, and flattening it would
+        // silently change what the model is asked.
+        let mut app = new_app();
+        app.paste("fn main() {\n    todo!()\n}\n");
+
+        assert!(app.input.contains('\n'), "{:?}", app.input);
+        assert_eq!(app.input.lines().count(), 3);
+    }
+
+    #[test]
+    fn a_paste_is_ignored_while_the_keys_belong_elsewhere() {
+        let mut app = new_app();
+        app.help = true;
+        app.paste("should not land");
+        assert!(app.input.is_empty(), "the help overlay owns the keys");
+
+        let mut app = new_app();
+        let (reply, _answer) = oneshot::channel();
+        app.set_approval(ApprovalRequest {
+            tool: "write_file".to_string(),
+            preview: "create a.txt".to_string(),
+            reply,
+        });
+        app.paste("should not land either");
+        assert!(app.input.is_empty(), "the modal owns the keys");
+    }
+
+    #[test]
+    fn an_enormous_paste_is_cut_short_and_says_so() {
+        // A stray clipboard can hold a whole file, and it would go straight to a
+        // model.
+        let mut app = new_app();
+        let huge = "x".repeat(MAX_PASTE + 500);
+        app.paste(&huge);
+
+        assert!(app.input.chars().count() <= MAX_PASTE + 1);
+        assert!(
+            last_message(&app).contains("longer than"),
+            "{}",
+            last_message(&app)
+        );
+    }
+
+    #[test]
+    fn control_characters_are_stripped_from_a_paste_but_newlines_are_not() {
+        let mut app = new_app();
+        app.paste("a\u{7}b\u{1b}[31mc\nd");
+        assert_eq!(app.input, "ab[31mc\nd");
+    }
+
+    // ---- scrolling an approval -------------------------------------------
+
+    /// A preview long enough to need scrolling in the default viewport.
+    fn long_preview_approval() -> (App, oneshot::Receiver<Decision>) {
+        let mut app = new_app();
+        // The default test viewport is 80x24, whose capacity is well under this.
+        let preview = (0..80)
+            .map(|n| format!("+ line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (reply, answer) = oneshot::channel();
+        app.set_approval(ApprovalRequest {
+            tool: "edit_file".to_string(),
+            preview,
+            reply,
+        });
+        (app, answer)
+    }
+
+    #[test]
+    fn the_approval_preview_scrolls_and_stops_at_both_ends() {
+        let (mut app, _answer) = long_preview_approval();
+        assert_eq!(app.approval_scroll, 0);
+
+        // Up at the top does nothing rather than wrapping or panicking.
+        app.handle_key(press(KeyCode::Up));
+        assert_eq!(app.approval_scroll, 0);
+
+        app.handle_key(press(KeyCode::Down));
+        app.handle_key(press(KeyCode::Down));
+        assert_eq!(app.approval_scroll, 2);
+
+        // Down at the bottom stops at the content, so an Up afterwards responds
+        // immediately instead of unwinding a stranded offset.
+        for _ in 0..500 {
+            app.handle_key(press(KeyCode::Down));
+        }
+        let bottom = app.approval_scroll;
+        assert!(bottom > 0, "it should have scrolled");
+        app.handle_key(press(KeyCode::Up));
+        assert_eq!(app.approval_scroll, bottom - 1);
+    }
+
+    #[test]
+    fn page_keys_move_further_than_the_arrows() {
+        let (mut app, _answer) = long_preview_approval();
+        app.handle_key(press(KeyCode::PageDown));
+        assert_eq!(app.approval_scroll, APPROVAL_PAGE as u16);
+
+        app.handle_key(press(KeyCode::PageUp));
+        assert_eq!(app.approval_scroll, 0);
+    }
+
+    #[test]
+    fn a_short_preview_cannot_be_scrolled_at_all() {
+        let mut app = new_app();
+        let (reply, _answer) = oneshot::channel();
+        app.set_approval(ApprovalRequest {
+            tool: "write_file".to_string(),
+            preview: "create /tmp/a.txt".to_string(),
+            reply,
+        });
+
+        app.handle_key(press(KeyCode::Down));
+
+        assert_eq!(app.approval_scroll, 0, "there is nothing to scroll to");
+    }
+
+    #[test]
+    fn a_new_approval_starts_at_the_top() {
+        let (mut app, _answer) = long_preview_approval();
+        app.handle_key(press(KeyCode::PageDown));
+        assert!(app.approval_scroll > 0);
+
+        let (reply, _answer) = oneshot::channel();
+        app.set_approval(ApprovalRequest {
+            tool: "edit_file".to_string(),
+            preview: "edit /tmp/a.txt".to_string(),
+            reply,
+        });
+
+        assert_eq!(
+            app.approval_scroll, 0,
+            "a fresh preview must not open part-way down"
+        );
+    }
+
+    #[test]
+    fn the_answer_keys_still_work_with_a_scrolled_preview() {
+        let (mut app, mut answer) = long_preview_approval();
+        app.handle_key(press(KeyCode::PageDown));
+
+        app.handle_key(press(KeyCode::Char('y')));
+
+        assert_eq!(answer.try_recv().expect("an answer"), Decision::Approve);
+        assert!(app.approval.is_none());
     }
 }
