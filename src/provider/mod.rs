@@ -38,6 +38,41 @@ pub struct Usage {
     pub cache_write_tokens: u64,
 }
 
+impl Usage {
+    /// Add another request's tokens to this total.
+    ///
+    /// A total here is a sum over *requests*, not over turns: a turn can make
+    /// several requests — one per tool call — and every one of them is billed,
+    /// including the requests behind an answer that was thrown away. Counting
+    /// only the last one understates a turn in proportion to how much work it
+    /// did, which is the worst possible direction for the error.
+    ///
+    /// Saturating, like every other tally in the program, so a provider
+    /// reporting nonsense cannot panic a turn.
+    pub fn absorb(&mut self, other: &Usage) {
+        self.prompt_tokens = self.prompt_tokens.saturating_add(other.prompt_tokens);
+        self.completion_tokens = self
+            .completion_tokens
+            .saturating_add(other.completion_tokens);
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(other.cache_read_tokens);
+        self.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(other.cache_write_tokens);
+    }
+}
+
+/// Fold one request's reported tokens into a running total.
+///
+/// Free rather than a method because a total that has not been reported yet is
+/// absent, which is a fact about the total rather than about any one request.
+pub fn accumulate(total: &mut Option<Usage>, more: Option<Usage>) {
+    if let Some(more) = more {
+        total.get_or_insert_with(Usage::default).absorb(&more);
+    }
+}
+
 /// What a completed turn produced.
 #[derive(Debug, Clone, Default)]
 pub struct TurnSummary {

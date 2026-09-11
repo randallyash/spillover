@@ -138,6 +138,14 @@ pub struct App {
     /// panel draws these as a sparkline, which is the only place the shape of a
     /// session's cost is visible rather than just its total.
     pub usage_history: Vec<u64>,
+    /// What this turn has cost so far, summed across every tier and consult it
+    /// has used.
+    ///
+    /// Held here because a turn is not one request: it makes one per tool call,
+    /// and may spill or consult on the way, so the figure the transcript shows
+    /// has to be accumulated as the parts arrive rather than read off any one of
+    /// them. Cleared when the turn ends.
+    turn_usage: Option<crate::provider::Usage>,
     /// User turns completed.
     pub turns: u32,
 }
@@ -175,6 +183,7 @@ impl App {
             cache_read: 0,
             cache_write: 0,
             usage_history: Vec::new(),
+            turn_usage: None,
             turns: 0,
         }
     }
@@ -233,13 +242,11 @@ impl App {
         self.cache_read = self.cache_read.saturating_add(usage.cache_read_tokens);
         self.cache_write = self.cache_write.saturating_add(usage.cache_write_tokens);
 
-        self.usage_history.push(usage.prompt_tokens);
-        // Keep only what the sparkline can show, so a long session does not grow
-        // this without bound.
-        if self.usage_history.len() > HISTORY {
-            self.usage_history.remove(0);
-        }
-
+        // The per-turn history is deliberately *not* recorded here. This is
+        // called once per attempt, and a turn can make several — one per tier it
+        // tried, plus any consult — so pushing here would put several bars in
+        // the graph for a single prompt and quietly change what it means.
+        // `close_turn` records the turn's total once, when the turn is over.
         if let Some(tier) = tier {
             match self
                 .usage_by_tier
@@ -261,6 +268,26 @@ impl App {
                 None => self.usage_by_tier.push((tier.to_string(), *usage)),
             }
         }
+    }
+
+    /// Finish the current turn's tally, returning the line to show for it.
+    ///
+    /// A turn is not one request: it makes one per tool call, and may spill to
+    /// another tier or consult one on the way. Every part arrives as a `Spent`
+    /// event and is summed here, so what the transcript reports is what the turn
+    /// actually cost rather than the last request in it. Returns `None` when a
+    /// tier reported nothing, so a provider without usage does not get a line of
+    /// invented zeros.
+    fn close_turn(&mut self) -> Option<String> {
+        let usage = self.turn_usage.take()?;
+
+        // One bar per turn, which is what the graph claims to show.
+        self.usage_history.push(usage.prompt_tokens);
+        if self.usage_history.len() > HISTORY {
+            self.usage_history.remove(0);
+        }
+
+        Some(usage_line(&usage))
     }
 
     /// Add one turn's tokens to the session totals, with no tier to attribute
@@ -580,7 +607,14 @@ impl App {
                 self.running = None;
                 self.messages.push(Message::system(message));
             }
-            AgentEvent::Finished { stop_reason, usage } => {
+            AgentEvent::Spent { tier, usage } => {
+                // The one place tokens are counted, so nothing can be missed or
+                // counted twice: an attempt that was abandoned, one that
+                // answered, and a consult all arrive here.
+                self.record_usage_on(Some(&tier), &usage);
+                crate::provider::accumulate(&mut self.turn_usage, Some(usage));
+            }
+            AgentEvent::Finished { stop_reason } => {
                 self.streaming = None;
                 self.running = None;
                 self.busy = false;
@@ -592,12 +626,10 @@ impl App {
                         "! the model hit its output limit, so this answer is incomplete",
                     ));
                 }
-                if let Some(usage) = usage {
-                    // The rail already follows every escalation, so the tier
-                    // answering is known here without the agent having to say.
-                    let tier = self.active_tier_name().map(str::to_string);
-                    self.record_usage_on(tier.as_deref(), &usage);
-                    self.messages.push(Message::system(usage_line(&usage)));
+                // The whole turn, not the last request in it: a turn that read
+                // four files made five requests, and this is what they cost.
+                if let Some(line) = self.close_turn() {
+                    self.messages.push(Message::system(line));
                 }
             }
             AgentEvent::Escalated { from, to, reason } => {
@@ -627,6 +659,11 @@ impl App {
                 self.approval = None;
                 self.messages
                     .push(Message::system(format!("✗ you stopped {tier}")));
+                // Requests were made and billed before the stop, so the turn
+                // closes with what it cost rather than dropping it.
+                if let Some(line) = self.close_turn() {
+                    self.messages.push(Message::system(line));
+                }
             }
             AgentEvent::Consulted {
                 driver,
@@ -634,7 +671,6 @@ impl App {
                 about,
                 nth,
                 of,
-                usage,
             } => {
                 // The failed attempt is being thrown away in the conversation, so
                 // it has to leave the transcript too. Without this the looped
@@ -644,12 +680,11 @@ impl App {
                 self.discard_streaming_message();
                 self.streaming = None;
                 self.running = None;
-                // The consultant's tokens belong to the consultant. Charging
-                // them to the active tier would make `/cost` wrong in exactly the
-                // comparison consult exists to inform.
-                if let Some(usage) = usage {
-                    self.record_usage_on(Some(&consultant), &usage);
-                }
+                // The consultant's tokens were already counted, and charged to
+                // the consultant rather than to the driver, by the `Spent` event
+                // that arrived just before this one. `/cost` compares the two
+                // tiers, so it has to be the tier that did the work.
+                //
                 // Where the consult sits in its budget, so a turn that consulted
                 // twice is not mistaken for one that consulted once.
                 let position = if of > 1 {
@@ -674,6 +709,10 @@ impl App {
                 self.escalated_at = None;
                 self.messages
                     .push(Message::system(format!("✗ no tier could answer: {reason}")));
+                // Every tier that was tried had been billed for it.
+                if let Some(line) = self.close_turn() {
+                    self.messages.push(Message::system(line));
+                }
             }
         }
         self.scroll_back = 0;
@@ -843,6 +882,7 @@ impl App {
                     self.tokens_out = 0;
                     self.cache_read = 0;
                     self.cache_write = 0;
+                    self.turn_usage = None;
                     self.scroll_back = 0;
                 }
             }
@@ -1327,7 +1367,6 @@ mod tests {
 
         app.handle_agent_event(AgentEvent::Finished {
             stop_reason: Some("end_turn".to_string()),
-            usage: None,
         });
 
         assert!(!app.busy);
@@ -1336,14 +1375,14 @@ mod tests {
     #[test]
     fn token_usage_is_reported_when_the_server_gives_it() {
         let mut app = new_app();
-        app.handle_agent_event(AgentEvent::Finished {
-            stop_reason: Some("end_turn".to_string()),
-            usage: Some(crate::provider::Usage {
+        spend_and_finish(
+            &mut app,
+            crate::provider::Usage {
                 prompt_tokens: 120,
                 completion_tokens: 45,
                 ..Default::default()
-            }),
-        });
+            },
+        );
 
         assert!(
             app.messages
@@ -1355,15 +1394,15 @@ mod tests {
     #[test]
     fn cache_hits_are_shown_alongside_the_token_counts() {
         let mut app = new_app();
-        app.handle_agent_event(AgentEvent::Finished {
-            stop_reason: Some("end_turn".to_string()),
-            usage: Some(crate::provider::Usage {
+        spend_and_finish(
+            &mut app,
+            crate::provider::Usage {
                 prompt_tokens: 15360,
                 completion_tokens: 2,
                 cache_read_tokens: 7424,
                 cache_write_tokens: 0,
-            }),
-        });
+            },
+        );
 
         let line = &app.messages.last().expect("a message").text;
         assert!(line.contains("15,360 in, 2 out"), "{line}");
@@ -1377,14 +1416,14 @@ mod tests {
     #[test]
     fn a_tier_with_no_cache_reads_exactly_as_before() {
         let mut app = new_app();
-        app.handle_agent_event(AgentEvent::Finished {
-            stop_reason: Some("end_turn".to_string()),
-            usage: Some(crate::provider::Usage {
+        spend_and_finish(
+            &mut app,
+            crate::provider::Usage {
                 prompt_tokens: 10,
                 completion_tokens: 2,
                 ..Default::default()
-            }),
-        });
+            },
+        );
 
         assert_eq!(
             app.messages.last().expect("a message").text,
@@ -1397,7 +1436,6 @@ mod tests {
         let mut app = new_app();
         app.handle_agent_event(AgentEvent::Finished {
             stop_reason: Some("length".to_string()),
-            usage: None,
         });
 
         assert!(
@@ -1598,7 +1636,6 @@ mod tests {
         // The flash belongs to the turn; once it is over, the move is history.
         app.handle_agent_event(AgentEvent::Finished {
             stop_reason: Some("end_turn".to_string()),
-            usage: None,
         });
         assert!(!app.recently_escalated());
     }
@@ -1607,10 +1644,13 @@ mod tests {
     fn the_usage_history_keeps_only_the_recent_turns() {
         let mut app = new_app();
         for turn in 0..(HISTORY as u64 + 30) {
-            app.record_usage(&crate::provider::Usage {
-                prompt_tokens: turn,
-                ..Default::default()
-            });
+            spend_and_finish(
+                &mut app,
+                crate::provider::Usage {
+                    prompt_tokens: turn,
+                    ..Default::default()
+                },
+            );
         }
 
         assert_eq!(app.usage_history.len(), HISTORY);
@@ -1618,6 +1658,76 @@ mod tests {
             *app.usage_history.last().expect("the newest turn"),
             HISTORY as u64 + 29,
             "the oldest are dropped, not the newest"
+        );
+    }
+
+    #[test]
+    fn the_graph_gets_one_bar_per_turn_even_when_the_turn_spilled() {
+        // Two attempts means two spends, but the graph is labelled per turn and
+        // has to stay that way: a spill would otherwise look like two prompts.
+        let (mut app, _commands) = attached_app();
+        app.tier_labels = vec!["Local".to_string(), "DeepSeek".to_string()];
+
+        app.handle_agent_event(AgentEvent::Spent {
+            tier: "Local".to_string(),
+            usage: crate::provider::Usage {
+                prompt_tokens: 2_000,
+                ..Default::default()
+            },
+        });
+        app.handle_agent_event(AgentEvent::Spent {
+            tier: "DeepSeek".to_string(),
+            usage: crate::provider::Usage {
+                prompt_tokens: 15_000,
+                ..Default::default()
+            },
+        });
+        app.handle_agent_event(AgentEvent::Finished {
+            stop_reason: Some("end_turn".to_string()),
+        });
+
+        assert_eq!(
+            app.usage_history.len(),
+            1,
+            "one prompt, one bar: {:?}",
+            app.usage_history
+        );
+        assert_eq!(
+            app.usage_history[0], 17_000,
+            "and the bar is what the whole turn cost"
+        );
+        assert!(
+            last_message(&app).contains("17,000 in"),
+            "the transcript should agree with the graph: {}",
+            last_message(&app)
+        );
+    }
+
+    #[test]
+    fn a_cancelled_turn_still_counts_what_it_cost() {
+        // Requests were made and billed before the stop, so the turn closes with
+        // what it spent rather than dropping it on the floor.
+        let (mut app, _commands, _cancel) = attached_with_cancel();
+        type_and_send(&mut app, "do something");
+
+        app.handle_agent_event(AgentEvent::Spent {
+            tier: "Local model".to_string(),
+            usage: crate::provider::Usage {
+                prompt_tokens: 1_234,
+                completion_tokens: 56,
+                ..Default::default()
+            },
+        });
+        app.handle_agent_event(AgentEvent::Cancelled {
+            tier: "Local model".to_string(),
+        });
+
+        assert_eq!(app.tokens_in, 1_234, "the spend is kept");
+        assert_eq!(app.usage_history.len(), 1, "and graphed");
+        assert!(
+            last_message(&app).contains("1,234 in"),
+            "the user should see what the stopped turn cost: {}",
+            last_message(&app)
         );
     }
 
@@ -1643,15 +1753,14 @@ mod tests {
             cache_write_tokens: 0,
         };
 
-        app.handle_agent_event(AgentEvent::Finished {
-            stop_reason: Some("end_turn".to_string()),
-            usage: Some(turn),
-        });
-        app.handle_agent_event(AgentEvent::Finished {
-            stop_reason: Some("end_turn".to_string()),
-            usage: Some(turn),
-        });
+        spend_and_finish(&mut app, turn);
+        spend_and_finish(&mut app, turn);
 
+        assert_eq!(
+            app.usage_history.len(),
+            2,
+            "one bar per turn, not per request"
+        );
         assert_eq!(app.tokens_in, 30_720);
         assert_eq!(app.tokens_out, 4);
         assert_eq!(app.cache_read, 14_848);
@@ -1662,6 +1771,16 @@ mod tests {
 
     fn last_message(app: &App) -> &str {
         app.messages.last().map(|m| m.text.as_str()).unwrap_or("")
+    }
+
+    /// Drive one request's spend and then the end of the turn, the way the agent
+    /// does: the money arrives as its own event, before the turn ends.
+    fn spend_and_finish(app: &mut App, usage: crate::provider::Usage) {
+        let tier = app.active_tier_name().unwrap_or("a tier").to_string();
+        app.handle_agent_event(AgentEvent::Spent { tier, usage });
+        app.handle_agent_event(AgentEvent::Finished {
+            stop_reason: Some("end_turn".to_string()),
+        });
     }
 
     #[test]
@@ -2354,15 +2473,24 @@ mod tests {
 
     // ---- consulting -------------------------------------------------------
 
-    fn consulted_event(usage: Option<crate::provider::Usage>) -> AgentEvent {
+    fn consulted_event() -> AgentEvent {
         AgentEvent::Consulted {
             driver: "Local".to_string(),
             consultant: "DeepSeek".to_string(),
             about: "repeated the same output 4 times".to_string(),
             nth: 1,
             of: 2,
-            usage,
         }
+    }
+
+    /// What a consult cost, reported the way the agent reports it: as a spend by
+    /// the consultant, before the consult itself is announced.
+    fn consulted_and_spent(app: &mut App, usage: crate::provider::Usage) {
+        app.handle_agent_event(AgentEvent::Spent {
+            tier: "DeepSeek".to_string(),
+            usage,
+        });
+        app.handle_agent_event(consulted_event());
     }
 
     #[test]
@@ -2381,7 +2509,7 @@ mod tests {
             "the looped output should be streaming before the consult"
         );
 
-        app.handle_agent_event(consulted_event(None));
+        app.handle_agent_event(consulted_event());
 
         assert!(
             !app.messages
@@ -2415,7 +2543,6 @@ mod tests {
             about: "repeated the same output 4 times".to_string(),
             nth: 1,
             of: 2,
-            usage: None,
         });
 
         let line = last_message(&app);
@@ -2444,7 +2571,7 @@ mod tests {
         type_and_send(&mut app, "go");
         assert!(app.busy);
 
-        app.handle_agent_event(consulted_event(None));
+        app.handle_agent_event(consulted_event());
 
         assert!(app.busy, "the driver is still working on the same turn");
         assert!(!app.should_quit);
@@ -2457,12 +2584,15 @@ mod tests {
         type_and_send(&mut app, "go");
         let _ = app.messages.pop();
 
-        app.handle_agent_event(consulted_event(Some(crate::provider::Usage {
-            prompt_tokens: 900,
-            completion_tokens: 40,
-            cache_read_tokens: 0,
-            cache_write_tokens: 0,
-        })));
+        consulted_and_spent(
+            &mut app,
+            crate::provider::Usage {
+                prompt_tokens: 900,
+                completion_tokens: 40,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+        );
 
         // The active tier is the driver, so charging there would be wrong.
         let spent = |name: &str| {
@@ -2474,6 +2604,17 @@ mod tests {
         assert_eq!(spent("DeepSeek"), Some(900), "{:?}", app.usage_by_tier);
         assert_eq!(spent("Local"), None, "the driver spent nothing");
         assert_eq!(app.tokens_in, 900);
+
+        // And it counts towards the turn, so the turn's closing line is the
+        // whole cost and not just the driver's part of it.
+        app.handle_agent_event(AgentEvent::Finished {
+            stop_reason: Some("end_turn".to_string()),
+        });
+        assert!(
+            last_message(&app).contains("900 in"),
+            "the turn total should include the consult: {}",
+            last_message(&app)
+        );
     }
 
     #[test]
@@ -2487,7 +2628,6 @@ mod tests {
             about: "repeated the same output 4 times".to_string(),
             nth: 2,
             of: 2,
-            usage: None,
         });
 
         assert!(
@@ -2509,7 +2649,6 @@ mod tests {
             about: "repeated the same output 4 times".to_string(),
             nth: 1,
             of: 1,
-            usage: None,
         });
 
         assert!(

@@ -133,9 +133,15 @@ pub async fn run(library: &Library, config: &Config, options: &Options) -> Outco
                 outcome.answered_by = Some(to.clone());
                 outcome.escalations.push(format!("{from} {reason} → {to}"));
             }
-            AgentEvent::Finished { stop_reason, usage } => {
+            // Summed rather than replaced: a turn makes one request per tool
+            // call, and reporting only the last of them understated a scripted
+            // run in proportion to how much work it did.
+            AgentEvent::Spent { usage, .. } => {
+                let total = outcome.usage.get_or_insert_with(Usage::default);
+                total.absorb(&usage);
+            }
+            AgentEvent::Finished { stop_reason } => {
                 outcome.stop_reason = stop_reason;
-                outcome.usage = usage;
                 break;
             }
             AgentEvent::Exhausted { reason } => {

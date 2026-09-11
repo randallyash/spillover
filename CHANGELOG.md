@@ -8,6 +8,25 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Token accounting counted only the last request of a turn.** A turn is not one
+  request: it makes one per tool call, and every one of them is billed, so a turn
+  that read four files made five requests and reported one. The transcript's
+  `tokens:` line, `spill -p --output-format json`, `/cost` and the session panel
+  were all low by the cost of every step but the last — and low in proportion to
+  how much work a turn did, which is the worst direction for a cost figure to be
+  wrong in.
+
+  Usage is now accumulated across a turn's requests and reported through a single
+  `Spent` event, which is also what an *abandoned* attempt costs: a tier that
+  looped and was thrown away was billed for the work it did, and dropping that
+  made a spill — the most interesting cost event there is — the least visible
+  one. The cost graph still gets one bar per turn rather than per request, so
+  spilling does not make one prompt look like two.
+
+  One gap remains and cannot be closed from here: a provider reports usage with
+  its response, so an attempt whose *stream* was killed mid-flight — a repetition
+  loop, a transport failure — never reported any, and there is nothing to count.
+
 - `Ctrl-C` quits from anywhere again. The approval prompt and the help overlay
   both swallow every key they do not use, and the check for `Ctrl-C` sat below
   them, so the universal way out was dead in exactly the two places someone might

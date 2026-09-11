@@ -199,11 +199,16 @@ pub enum AgentEvent {
         to: String,
         reason: String,
     },
+    /// Tokens a tier spent on this turn.
+    ///
+    /// The single accounting path, and deliberately separate from the events
+    /// that say what *happened*: every request is billed, including the ones
+    /// behind an answer that was thrown away, so the money has to be reported
+    /// whether the attempt answered, was abandoned, or was stopped. Emitting it
+    /// from one place is what keeps it from being counted twice or not at all.
+    Spent { tier: String, usage: Usage },
     /// The turn ended normally.
-    Finished {
-        stop_reason: Option<String>,
-        usage: Option<Usage>,
-    },
+    Finished { stop_reason: Option<String> },
     /// The user stopped the turn. The tier is named so the transcript can say
     /// where it was stopped, not just that it was.
     Cancelled { tier: String },
@@ -217,9 +222,6 @@ pub enum AgentEvent {
         /// Which consult this was within the turn, and the cap.
         nth: u32,
         of: u32,
-        /// What the consultant spent, so it is billed to the tier that spent it
-        /// rather than to the driver.
-        usage: Option<Usage>,
     },
     /// Every tier was tried and none of them produced an answer.
     Exhausted { reason: String },
@@ -535,13 +537,21 @@ fn describe_context(session: &Session, chain: &FallbackChain) -> String {
     out
 }
 
-/// What one tier made of a turn.
+/// What one tier made of a turn, and what finding out cost.
+///
+/// The usage is carried out of the attempt rather than reported from inside it,
+/// because the money is owed whichever way the attempt went: a tier that looped
+/// five times and was abandoned has been billed for all five requests. The
+/// caller reports it through one path so nothing is counted twice.
 enum Attempt {
-    Answered,
-    Stuck(StuckReason),
+    Answered {
+        stop_reason: Option<String>,
+        usage: Option<Usage>,
+    },
+    Stuck(StuckReason, Option<Usage>),
     /// The user stopped it. Kept apart from `Stuck` because it must not spill to
     /// the next tier: nobody asked for a different model.
-    Cancelled,
+    Cancelled(Option<Usage>),
 }
 
 /// How a tool call ended.
@@ -582,32 +592,46 @@ async fn run_turn(
     let mut consulted: Vec<consult::Previous> = Vec::new();
 
     loop {
-        let outcome = {
+        let (label, outcome) = {
             let tier = chain.active();
-            try_tier(config, tier, mode, registry, approver, events, session).await
+            (
+                tier.label.clone(),
+                try_tier(config, tier, mode, registry, approver, events, session).await,
+            )
         };
 
+        // Reported before the outcome is judged. Whatever this tier spent is
+        // owed however the attempt ended — answered, abandoned, or stopped — so
+        // it is sent here rather than inside any one branch, where a later edit
+        // could silently drop one of them. The UI sums these into the turn's
+        // total; this side only says who spent what.
+        if let Some(spent) = usage_of(&outcome) {
+            let _ = events.send(AgentEvent::Spent {
+                tier: label.clone(),
+                usage: spent,
+            });
+        }
+
         match outcome {
-            Attempt::Answered => return,
-            Attempt::Cancelled => {
+            Attempt::Answered { stop_reason, .. } => {
+                let _ = events.send(AgentEvent::Finished { stop_reason });
+                return;
+            }
+            Attempt::Cancelled(_) => {
                 // No rollback and no session forgotten. Unlike a stalled tier,
                 // a cancelled one is not being abandoned: the conversation up to
                 // this point is real work, and the same tier will carry on from
                 // it. The half-generated answer was never pushed to the session
                 // (only the finished ones are), so there is nothing to undo.
-                let tier = chain.active().label.clone();
-                let _ = events.send(AgentEvent::Cancelled { tier });
+                let _ = events.send(AgentEvent::Cancelled { tier: label });
                 return;
             }
-            Attempt::Stuck(reason) => {
+            Attempt::Stuck(reason, _) => {
+                let from = label;
                 // Read out of the driver before it can be borrowed mutably below.
-                let (from, wants_consult, cap) = {
+                let (wants_consult, cap) = {
                     let tier = chain.active();
-                    (
-                        tier.label.clone(),
-                        tier.consults_when_stuck(),
-                        tier.consults_per_turn,
-                    )
+                    (tier.consults_when_stuck(), tier.consults_per_turn)
                 };
 
                 // A consult keeps the driver in charge, so it is tried before
@@ -633,6 +657,15 @@ async fn run_turn(
                             .map(|tier| tier.label.clone())
                             .unwrap_or_default();
 
+                        // The consult is another request that was billed, so it
+                        // goes through the same accounting as an attempt.
+                        if let Some(spent) = answer.usage {
+                            let _ = events.send(AgentEvent::Spent {
+                                tier: consultant.clone(),
+                                usage: spent,
+                            });
+                        }
+
                         // The failed attempt goes, exactly as it would for an
                         // escalation: it was the poison. What replaces it is the
                         // answer, which is short and is the only new context.
@@ -655,7 +688,6 @@ async fn run_turn(
                             about: answer.about,
                             nth: consulted.len() as u32,
                             of: cap,
-                            usage: answer.usage,
                         });
 
                         // Back to the same tier, with the answer in hand.
@@ -686,6 +718,15 @@ async fn run_turn(
                     }
                 }
             }
+        }
+    }
+}
+
+/// What an attempt cost, if it reported anything.
+fn usage_of(attempt: &Attempt) -> Option<Usage> {
+    match attempt {
+        Attempt::Answered { usage, .. } | Attempt::Stuck(_, usage) | Attempt::Cancelled(usage) => {
+            *usage
         }
     }
 }
@@ -843,12 +884,15 @@ async fn try_tier(
     let tools = registry.specs_permitting(mode.risk_ceiling());
     let mut watchdog = Watchdog::new(&tier.limits);
     let mut progress = ProgressDetector::new(tier.limits.max_repeat_run as usize);
+    // Every request this tier makes is billed, one per step, so the total is
+    // carried across the loop rather than read off the last step.
+    let mut spent: Option<Usage> = None;
 
     for _step in 0..config.max_steps {
         // Stopped between steps, so a cancel that arrives while tools are being
         // run does not buy another round trip.
         if config.cancel.is_cancelled() {
-            return Attempt::Cancelled;
+            return Attempt::Cancelled(spent);
         }
 
         let request = ChatRequest {
@@ -867,9 +911,14 @@ async fn try_tier(
         .await
         {
             Ok(summary) => summary,
-            Err(StuckReason::Cancelled) => return Attempt::Cancelled,
-            Err(reason) => return Attempt::Stuck(reason),
+            Err(StuckReason::Cancelled) => return Attempt::Cancelled(spent),
+            Err(reason) => return Attempt::Stuck(reason, spent),
         };
+
+        // Folded in before anything else can return, so a step that produced a
+        // tool call — or one whose output is about to be discarded — still
+        // counts what it cost.
+        crate::provider::accumulate(&mut spent, summary.usage);
 
         session.push(ChatMessage::assistant(
             summary.text.clone(),
@@ -877,11 +926,10 @@ async fn try_tier(
         ));
 
         if summary.tool_calls.is_empty() {
-            let _ = events.send(AgentEvent::Finished {
+            return Attempt::Answered {
                 stop_reason: summary.stop_reason.clone(),
-                usage: summary.usage,
-            });
-            return Attempt::Answered;
+                usage: spent,
+            };
         }
 
         for call in summary.tool_calls.clone() {
@@ -908,12 +956,12 @@ async fn try_tier(
                         call.id.clone(),
                         "the user cancelled before this finished.",
                     ));
-                    return Attempt::Cancelled;
+                    return Attempt::Cancelled(spent);
                 }
             };
 
             if let Some(reason) = progress.record(&call.name, &call.arguments, !outcome.is_error) {
-                return Attempt::Stuck(reason);
+                return Attempt::Stuck(reason, spent);
             }
             // The result goes back even when it is an error or a refusal, so the
             // model can see what happened instead of retrying blindly.
@@ -921,9 +969,12 @@ async fn try_tier(
         }
     }
 
-    Attempt::Stuck(StuckReason::StepLimit {
-        steps: config.max_steps,
-    })
+    Attempt::Stuck(
+        StuckReason::StepLimit {
+            steps: config.max_steps,
+        },
+        spent,
+    )
 }
 
 /// Stream one turn from one tier, cutting it off if it goes quiet or loops.
@@ -1369,6 +1420,154 @@ mod tests {
         (drain(rx).await, provider)
     }
 
+    /// A turn that uses a tool, with a token cost on each step.
+    fn step_one() -> TurnSummary {
+        TurnSummary {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: r#"{"path":"note.txt"}"#.to_string(),
+            }],
+            stop_reason: Some("tool_calls".to_string()),
+            usage: Some(Usage {
+                prompt_tokens: 1_000,
+                completion_tokens: 10,
+                ..Default::default()
+            }),
+            session_id: None,
+        }
+    }
+
+    fn step_two() -> TurnSummary {
+        TurnSummary {
+            text: "read it".to_string(),
+            stop_reason: Some("end_turn".to_string()),
+            usage: Some(Usage {
+                prompt_tokens: 2_000,
+                completion_tokens: 20,
+                ..Default::default()
+            }),
+            ..TurnSummary::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn every_request_in_a_turn_is_counted_not_just_the_last() {
+        // A turn makes one request per tool call and every one of them is
+        // billed. Reporting only the final step understated a turn in
+        // proportion to how much work it did — a turn that read four files made
+        // five requests and reported one — which is the worst direction for a
+        // cost figure to be wrong in.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("note.txt"), "contents").expect("write");
+
+        let (events, provider) = run_one(
+            vec![step_one(), step_two()],
+            Arc::new(AlwaysApprove::default()),
+            dir.path(),
+            "read note.txt",
+        )
+        .await;
+
+        assert_eq!(provider.request_count(), 2, "two steps, two requests");
+
+        let spent: Vec<Usage> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Spent { usage, .. } => Some(*usage),
+                _ => None,
+            })
+            .collect();
+
+        // One report per attempt rather than per step: the accumulation is the
+        // agent's job, and a report per step would push a bar per request into
+        // the cost graph.
+        assert_eq!(spent.len(), 1, "one attempt, one report: {events:?}");
+        assert_eq!(
+            spent[0].prompt_tokens, 3_000,
+            "both requests are billed, so both must be counted"
+        );
+        assert_eq!(spent[0].completion_tokens, 30);
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_attempt_is_counted_too() {
+        // A tier that is thrown away was still billed for the requests it
+        // finished. Dropping those would make a spill — the most interesting
+        // cost event there is — the least visible one.
+        //
+        // The failure used here is the step limit, because that is one of the
+        // cases where the bills are actually knowable: usage arrives with a
+        // response, so an attempt whose *stream* was killed mid-flight (a
+        // repetition loop, a transport failure) never reported any and there is
+        // nothing to count. That gap is inherent to how providers bill, not
+        // something this code can close.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("note.txt"), "contents").expect("write");
+
+        let stubborn = Arc::new(ScriptedProvider {
+            turns: Mutex::new(VecDeque::new()),
+            requests: Mutex::new(Vec::new()),
+            // Keeps asking for the same tool, so the step limit is what ends it.
+            fallback: TurnSummary {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "call_1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: r#"{"path":"note.txt"}"#.to_string(),
+                }],
+                stop_reason: Some("tool_calls".to_string()),
+                usage: Some(Usage {
+                    prompt_tokens: 1_000,
+                    completion_tokens: 5,
+                    ..Default::default()
+                }),
+                session_id: None,
+            },
+            fail_with: None,
+        });
+        let healthy = ScriptedProvider::new(vec![step_two()]);
+
+        let tiers: Vec<(Arc<dyn Provider>, Limits)> = vec![
+            (stubborn.clone(), Limits::default()),
+            (healthy, Limits::default()),
+        ];
+        let (tx, mut rx) = spawn(
+            config(dir.path(), 2),
+            chain_of(tiers),
+            Arc::new(Registry::with_default_tools()),
+            Arc::new(AlwaysApprove::default()),
+        );
+        tx.send(Command::Prompt("go".to_string())).expect("send");
+        let events = drain_from(&mut rx).await;
+
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Escalated { .. })),
+            "the tier should have been abandoned: {events:?}"
+        );
+        assert_eq!(stubborn.request_count(), 2, "it used both its steps");
+
+        let spent: Vec<(String, Usage)> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Spent { tier, usage } => Some((tier.clone(), *usage)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(spent.len(), 2, "both tiers spent something: {events:?}");
+        assert_eq!(spent[0].0, "Tier 0");
+        assert_eq!(
+            spent[0].1.prompt_tokens, 2_000,
+            "both of the abandoned attempt's requests are owed"
+        );
+        assert_eq!(spent[1].0, "Tier 1");
+        assert_eq!(spent[1].1.prompt_tokens, 2_000);
+    }
+
     #[tokio::test]
     async fn a_turn_without_tools_emits_text_and_finishes() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1669,15 +1868,21 @@ mod tests {
         )
         .await;
 
+        let spent: Vec<Usage> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Spent { usage, .. } => Some(*usage),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(spent.len(), 1, "one attempt, one spend: {events:?}");
+        assert_eq!(spent[0].completion_tokens, 4);
+
         match events.last() {
-            Some(AgentEvent::Finished {
-                stop_reason,
-                usage: Some(usage),
-            }) => {
+            Some(AgentEvent::Finished { stop_reason }) => {
                 assert_eq!(stop_reason.as_deref(), Some("length"));
-                assert_eq!(usage.completion_tokens, 4);
             }
-            other => panic!("expected a finished turn with usage, got {other:?}"),
+            other => panic!("expected a finished turn, got {other:?}"),
         }
     }
 
@@ -3131,14 +3336,21 @@ mod tests {
         tx.send(Command::Prompt("go".to_string())).expect("send");
         let events = drain_from(&mut rx).await;
 
-        let usage = events
+        // Two spends: the driver's attempt, then the consultant's answer.
+        let spent: Vec<(String, Usage)> = events
             .iter()
-            .find_map(|event| match event {
-                AgentEvent::Consulted { usage, .. } => *usage,
+            .filter_map(|event| match event {
+                AgentEvent::Spent { tier, usage } => Some((tier.clone(), *usage)),
                 _ => None,
             })
-            .expect("the consult should report its usage");
-        assert_eq!(usage.prompt_tokens, 900);
-        assert_eq!(usage.completion_tokens, 40);
+            .collect();
+
+        let consultant = spent
+            .iter()
+            .find(|(tier, _)| tier == "DeepSeek")
+            .expect("the consultant's spend should be reported")
+            .1;
+        assert_eq!(consultant.prompt_tokens, 900);
+        assert_eq!(consultant.completion_tokens, 40);
     }
 }
