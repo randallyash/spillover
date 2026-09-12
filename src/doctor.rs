@@ -94,9 +94,10 @@ impl Report {
                 tier.milliseconds,
                 width = width
             ));
-            // Only when it is not the default. A line reading "escalate" under
+            // Only when it is not the default. A line reading "consult" under
             // every tier of every ordinary configuration is noise; the whole
-            // reason to print it is that somebody chose something else.
+            // reason to print it is that somebody chose something else — which,
+            // now that consulting is the default, means escalating.
             if tier.on_stuck != OnStuck::default() {
                 out.push_str(&format!(
                     "      {:<width$}  on stuck: {}\n",
@@ -286,9 +287,9 @@ mod tests {
     }
 
     /// The same, consulting when stuck.
-    fn consulting_tier(id: &str) -> TierReport {
+    fn escalating_tier(id: &str) -> TierReport {
         TierReport {
-            on_stuck: OnStuck::Consult,
+            on_stuck: OnStuck::Escalate,
             ..tier(id, true)
         }
     }
@@ -516,13 +517,13 @@ mod tests {
     }
 
     #[test]
-    fn a_tier_that_consults_when_stuck_says_so() {
-        // The policy is invisible everywhere else, and consult is opt-in, so a
-        // report that cannot show it cannot help anyone tell whether the choice
-        // took effect.
-        let text = report(vec![tier("local", true), consulting_tier("helper")]).render();
+    fn a_tier_that_escalates_when_stuck_says_so() {
+        // A tier that hands the turn over is the one that departs from the
+        // default, and the departure is what is worth printing: it means the
+        // whole turn goes to the tier below and the session stays there.
+        let text = report(vec![tier("local", true), escalating_tier("helper")]).render();
 
-        assert!(text.contains("on stuck: consult"), "{text}");
+        assert!(text.contains("on stuck: escalate"), "{text}");
         // And named against the tier it belongs to, not floating at the end.
         let helper = text
             .lines()
@@ -534,14 +535,14 @@ mod tests {
             text.lines()
                 .skip(helper)
                 .take(3)
-                .any(|line| line.contains("on stuck: consult")),
+                .any(|line| line.contains("on stuck: escalate")),
             "the policy should read as that tier's: {text}"
         );
     }
 
     #[test]
     fn the_default_policy_is_not_printed_at_all() {
-        // A line reading "escalate" under every tier of every ordinary
+        // A line reading "consult" under every tier of every ordinary
         // configuration is noise; the reason to print it is that someone chose
         // something other than the default.
         let text = report(vec![tier("local", true), tier("grok", false)]).render();
@@ -552,12 +553,12 @@ mod tests {
     fn the_json_always_carries_the_policy_even_when_it_is_the_default() {
         // A machine reading the report should not have to infer a field from its
         // absence, which is why this differs from the text.
-        let report = report(vec![tier("local", true), consulting_tier("helper")]);
+        let report = report(vec![tier("local", true), escalating_tier("helper")]);
         let parsed: serde_json::Value =
             serde_json::from_str(&report.to_json()).expect("valid JSON");
 
-        assert_eq!(parsed["tiers"][0]["onStuck"], "escalate");
-        assert_eq!(parsed["tiers"][1]["onStuck"], "consult");
+        assert_eq!(parsed["tiers"][0]["onStuck"], "consult", "the default");
+        assert_eq!(parsed["tiers"][1]["onStuck"], "escalate");
     }
 
     #[tokio::test]
@@ -572,15 +573,15 @@ mod tests {
                 kind = "openai"
                 base_url = "http://127.0.0.1:9/v1"
                 model = "m"
-                on_stuck = "consult"
+                on_stuck = "escalate"
                 "#,
             ),
         )
         .await;
 
-        assert_eq!(report.tiers[0].on_stuck, OnStuck::Consult);
+        assert_eq!(report.tiers[0].on_stuck, OnStuck::Escalate);
         assert!(
-            report.render().contains("on stuck: consult"),
+            report.render().contains("on stuck: escalate"),
             "{}",
             report.render()
         );

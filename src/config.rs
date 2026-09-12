@@ -129,15 +129,25 @@ impl fmt::Display for TierKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum OnStuck {
-    /// Abandon this tier and hand the whole turn to the next one. The default,
-    /// because it is the behaviour that always works.
-    #[default]
+    /// Abandon this tier and hand the whole turn to the next one.
+    ///
+    /// What a chain of one always gets, since there is nothing below to consult,
+    /// and what you ask for when the honest answer really is "someone else should
+    /// finish this". Set it with `on_stuck = "escalate"` on a tier, or for the
+    /// rest of a session with `/on-stuck escalate`.
     Escalate,
     /// Keep this tier driving, and ask the next one a narrow question about it.
     ///
-    /// Cheaper in frontier quota — the expensive model answers one question
-    /// instead of inheriting the turn — but it only pays off when the answer is
-    /// something the driver can act on. See `consult.rs`.
+    /// The default, because escalating is the expensive mistake: the turn goes to
+    /// the frontier, and once a tier has spilled the session stays there — one
+    /// bad turn costs the cheap model for every turn after it. A consult spends
+    /// one question on the tier below and the driver carries on with the answer.
+    ///
+    /// It only pays off when the answer is something the driver can act on, so
+    /// spill escalates anyway when the answer comes back empty, when the consult
+    /// fails, or when the cap is spent: a turn can never be stranded by it. See
+    /// `consult.rs`.
+    #[default]
     Consult,
 }
 
@@ -673,14 +683,14 @@ mod tests {
 
         // The local tier consults rather than escalating, and the comment in the
         // example says why: escalating costs the frontier the whole conversation
-        // and then every remaining turn of the session. The *default* is still
-        // escalate — see `the_stuck_policy_defaults_to_escalating` — which is the
-        // difference between what a config may choose and what silence means.
+        // and then every remaining turn of the session. It is also what the tier
+        // would get by saying nothing — see `the_stuck_policy_defaults_to_consulting`
+        // — so the line is there to be read rather than to change anything.
         assert_eq!(config.tiers[0].on_stuck, OnStuck::Consult);
         assert_eq!(config.tiers[0].consults_per_turn, 2);
 
-        // The second tier says nothing, so it behaves as it always has.
-        assert_eq!(config.tiers[1].on_stuck, OnStuck::Escalate);
+        // The second tier says nothing and takes the default with it.
+        assert_eq!(config.tiers[1].on_stuck, OnStuck::Consult);
     }
 
     #[test]
@@ -693,7 +703,11 @@ mod tests {
     }
 
     #[test]
-    fn the_stuck_policy_defaults_to_escalating() {
+    fn the_stuck_policy_defaults_to_consulting() {
+        // The default is the cheap mistake, not the tidy one. Escalating throws
+        // the whole turn at the tier below, and once the session has spilled it
+        // stays there, so one bad turn costs the local model every turn after it.
+        // A consult asks one question and the driver keeps its job.
         let config = parse(
             r#"
             [[tier]]
@@ -703,8 +717,26 @@ mod tests {
             "#,
         )
         .expect("a tier with no on_stuck should parse");
-        assert_eq!(config.tiers[0].on_stuck, OnStuck::Escalate);
+        assert_eq!(config.tiers[0].on_stuck, OnStuck::Consult);
         assert_eq!(config.tiers[0].consults_per_turn, 2);
+    }
+
+    #[test]
+    fn escalating_is_still_available_on_a_tier() {
+        // The override, and the reason it has to keep working: a chain of one
+        // has nothing to consult, and a tier whose failures are its own fault
+        // is better handed over than talked to.
+        let config = parse(
+            r#"
+            [[tier]]
+            id = "local"
+            kind = "openai"
+            base_url = "http://localhost:1234/v1"
+            on_stuck = "escalate"
+            "#,
+        )
+        .expect("a tier that asks to escalate should parse");
+        assert_eq!(config.tiers[0].on_stuck, OnStuck::Escalate);
     }
 
     #[test]

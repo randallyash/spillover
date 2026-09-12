@@ -1969,9 +1969,11 @@ mod first_run_tests {
         assert_eq!(tier.preset.as_deref(), Some("grok"));
         assert_eq!(tier.bin.as_deref(), Some("grok"));
         assert_eq!(tier.model, None, "a CLI tier's model is its own business");
-        // The default policy, unchanged: a fallback that is only reached when
-        // the tier above it failed has nothing below it to consult.
-        assert_eq!(tier.on_stuck, OnStuck::Escalate);
+        // The configured default, which for a first run's fallback happens to be
+        // inert either way: it is the last tier, so a stall ends the turn rather
+        // than consulting or handing over. Asserted so that a first run and
+        // `spill setup` keep writing the same thing for the same decision.
+        assert_eq!(tier.on_stuck, OnStuck::default());
     }
 
     #[test]

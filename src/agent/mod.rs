@@ -1885,16 +1885,28 @@ mod tests {
 
     /// Scripted tiers in order, so escalation can be driven end to end.
     fn chain_of(tiers: Vec<(Arc<dyn Provider>, Limits)>) -> FallbackChain {
+        chain_of_with(tiers, OnStuck::default())
+    }
+
+    /// The same, with the stuck policy named on every tier.
+    ///
+    /// Escalating is no longer the default, so a test whose subject *is* the
+    /// spill — the hand-over itself, the abandoned attempt, the log record — has
+    /// to ask for it. A test that is about the default leaves it out, which is
+    /// what makes the default visible.
+    fn chain_of_with(tiers: Vec<(Arc<dyn Provider>, Limits)>, policy: OnStuck) -> FallbackChain {
         let tiers = tiers
             .into_iter()
             .enumerate()
             .map(|(index, (provider, limits))| {
-                Tier::new(
+                let mut tier = Tier::new(
                     format!("Tier {index}"),
                     format!("model-{index}"),
                     provider,
                     limits,
-                )
+                );
+                tier.on_stuck = policy;
+                tier
             })
             .collect();
         FallbackChain::new(tiers, true).expect("at least one tier")
@@ -2060,7 +2072,7 @@ mod tests {
         ];
         let (tx, mut rx) = spawn(
             config(dir.path(), 2),
-            chain_of(tiers),
+            chain_of_with(tiers, OnStuck::Escalate),
             Arc::new(Registry::with_default_tools()),
             Arc::new(AlwaysApprove::default()),
         );
@@ -2528,7 +2540,7 @@ mod tests {
         ];
         let (tx, rx) = spawn(
             config(dir.path(), DEFAULT_MAX_STEPS),
-            chain_of(tiers),
+            chain_of_with(tiers, OnStuck::Escalate),
             Arc::new(Registry::with_default_tools()),
             Arc::new(AlwaysApprove::default()),
         );
@@ -2666,7 +2678,7 @@ mod tests {
         ];
         let (tx, rx) = spawn(
             config(dir.path(), DEFAULT_MAX_STEPS),
-            chain_of(tiers),
+            chain_of_with(tiers, OnStuck::Escalate),
             Arc::new(Registry::with_default_tools()),
             Arc::new(AlwaysApprove::default()),
         );
@@ -2742,6 +2754,12 @@ mod tests {
 
     /// A two-tier chain whose first tier repeats itself and whose second
     /// answers, with the ids a log would name.
+    ///
+    /// The repeating tier escalates on purpose. Consulting is the default, so a
+    /// chain left alone would ask the second tier a question and then stall
+    /// again — and every test that uses this helper at or past the threshold is
+    /// about *one* stall: one verdict, one near-miss decision, one log record.
+    /// The consult path has its own tests, built on `consultable`.
     fn looping_into_a_second(times: usize) -> (FallbackChain, Arc<Loops>) {
         let looping = Loops::new("the same line", times);
         let mut first = Tier::new(
@@ -2751,6 +2769,7 @@ mod tests {
             Limits::default(),
         );
         first.id = "local".to_string();
+        first.on_stuck = OnStuck::Escalate;
         let mut second = Tier::new(
             "Frontier".to_string(),
             "m1".to_string(),
@@ -3472,7 +3491,9 @@ mod tests {
             said.contains("Local consult"),
             "it should name each tier's own policy: {said}"
         );
-        assert!(said.contains("DeepSeek escalate"), "{said}");
+        // The second tier is the helper's and says nothing about its policy, so
+        // this is the default being named — which is the point of the message.
+        assert!(said.contains("DeepSeek consult"), "{said}");
     }
 
     #[tokio::test]
@@ -4700,22 +4721,70 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_default_policy_still_escalates_and_never_consults() {
-        // Consult is opt-in; nothing about the old behaviour may have changed.
+    async fn the_default_policy_consults_and_keeps_the_driver() {
+        // The default, end to end and leaning on nothing: neither tier says a
+        // word about its policy, and the one that stalls is asked a question
+        // instead of losing the turn.
+        //
+        // What it is worth is what escalating would have cost. The turn would go
+        // to the tier below whole, and because a spilled session stays spilled,
+        // the cheap model would be gone for every turn after it — one bad answer
+        // bought at the price of the rest of the session. That is the mistake
+        // the default is chosen to avoid.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let driver = ScriptedProvider::new(vec![looping_answer(), answer("recovered")]);
+        let consultant = ScriptedProvider::new(vec![answer("Use a HashMap instead.")]);
+
+        let tiers: Vec<(Arc<dyn Provider>, Limits)> = vec![
+            (driver.clone(), Limits::default()),
+            (consultant.clone(), Limits::default()),
+        ];
+        let (tx, mut rx) = loop_over(dir.path(), chain_of(tiers));
+
+        tx.send(Command::Prompt("go".to_string())).expect("send");
+        let events = drain_from(&mut rx).await;
+
+        assert_eq!(
+            consulted(&events),
+            vec![("Tier 0".to_string(), "Tier 1".to_string())],
+            "silence in the configuration now means consult: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Escalated { .. })),
+            "and the driver keeps the turn rather than handing it over: {events:?}"
+        );
+        assert!(
+            matches!(events.last(), Some(AgentEvent::Finished { .. })),
+            "the driver should have finished it: {:?}",
+            events.last()
+        );
+        // Two requests at the driver: the one that looped, and the one after the
+        // advice. One at the consultant, which is the whole saving.
+        assert_eq!(driver.request_count(), 2);
+        assert_eq!(consultant.request_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn escalate_is_still_what_a_tier_that_asks_for_it_gets() {
+        // Escalation is opt-in now, which makes it the thing to keep honest: a
+        // tier that asks for it must hand the turn over whole, not ask a question
+        // first and then hand it over anyway.
         let dir = tempfile::tempdir().expect("tempdir");
         let looping = ScriptedProvider::new(vec![looping_answer()]);
         let healthy = ScriptedProvider::new(vec![answer("recovered")]);
 
         let tiers: Vec<(Arc<dyn Provider>, Limits)> =
             vec![(looping, Limits::default()), (healthy, Limits::default())];
-        let (tx, mut rx) = loop_over(dir.path(), chain_of(tiers));
+        let (tx, mut rx) = loop_over(dir.path(), chain_of_with(tiers, OnStuck::Escalate));
 
         tx.send(Command::Prompt("go".to_string())).expect("send");
         let events = drain_from(&mut rx).await;
 
         assert!(
             consulted(&events).is_empty(),
-            "the default tier must not consult: {events:?}"
+            "a tier set to escalate must not consult: {events:?}"
         );
         assert!(
             events
@@ -5240,10 +5309,10 @@ mod tests {
         ]);
         let healthy = ScriptedProvider::new(vec![answer("recovered")]);
 
-        let chain = chain_of(vec![
-            (stubborn, Limits::default()),
-            (healthy, Limits::default()),
-        ]);
+        let chain = chain_of_with(
+            vec![(stubborn, Limits::default()), (healthy, Limits::default())],
+            OnStuck::Escalate,
+        );
         let (tx, mut rx) = spawn(
             config(dir.path(), DEFAULT_MAX_STEPS),
             chain,

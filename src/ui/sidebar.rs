@@ -250,9 +250,13 @@ fn pair_styled(
 ///
 /// Named `on stuck` rather than folded into `fallback`, because the two are
 /// different questions: `fallback` is whether a spill keeps the lower tier, this
-/// is whether there is a spill at all. Consult is drawn in the warning colour
-/// because it is the non-default and the one that changes what happens, and the
-/// word alone says which is live without relying on the colour.
+/// is whether there is a spill at all.
+///
+/// Escalating is drawn in the warning colour, because it is the departure from
+/// the default and the expensive one: a stalled turn goes to the tier below
+/// whole, and with `sticky_fallback` the cheap model that was doing the work is
+/// gone for the rest of the session. The word alone says which is live without
+/// relying on the colour.
 fn policy_row(app: &App, theme: &Theme, width: usize) -> Vec<Line<'static>> {
     let policy = app.on_stuck();
     let value = match policy {
@@ -260,8 +264,8 @@ fn policy_row(app: &App, theme: &Theme, width: usize) -> Vec<Line<'static>> {
         OnStuck::Escalate => "escalate",
     };
     let style = match policy {
-        OnStuck::Consult => theme.warn,
-        OnStuck::Escalate => Style::default(),
+        OnStuck::Escalate => theme.warn,
+        OnStuck::Consult => Style::default(),
     };
 
     // Marked when the session chose it rather than the config, so a policy that
@@ -411,14 +415,14 @@ mod tests {
 
         assert!(text.contains("on stuck"), "{text}");
         assert!(
-            text.contains("escalate"),
+            text.contains("consult"),
             "the policy in force should be named: {text}"
         );
         // And it is a separate line from the fallback policy, because they are
         // different questions: whether a spill happens, and whether it sticks.
         let fallback = rows(&app)[0].clone();
         assert!(fallback.contains("fallback"), "{fallback}");
-        assert!(!fallback.contains("escalate"), "{fallback}");
+        assert!(!fallback.contains("consult"), "{fallback}");
     }
 
     #[test]
@@ -447,24 +451,25 @@ mod tests {
     }
 
     #[test]
-    fn consult_is_drawn_in_the_warning_colour_and_escalate_is_not() {
-        // Consult is the non-default and the one that changes what happens, so
-        // it is worth noticing — with the word carrying the meaning either way.
+    fn escalate_is_drawn_in_the_warning_colour_and_consult_is_not() {
+        // Escalating is the departure from the default and the expensive one:
+        // the turn goes to the tier below whole, and the session stays there. It
+        // is worth noticing — with the word carrying the meaning either way.
         let theme = Theme::default();
 
         let mut chosen = app_with(&["Local", "DeepSeek"]);
-        chosen.on_stuck = Some(OnStuck::Consult);
-        let consult = policy_row(&chosen, &theme, value_width(29));
-        let value = &consult[0].spans[1];
-        assert_eq!(value.content, "consult");
+        chosen.on_stuck = Some(OnStuck::Escalate);
+        let escalate = policy_row(&chosen, &theme, value_width(29));
+        let value = &escalate[0].spans[1];
+        assert_eq!(value.content, "escalate");
         assert_eq!(value.style, theme.warn);
 
         let mut configured = app_with(&["Local", "DeepSeek"]);
-        configured.on_stuck = Some(OnStuck::Escalate);
-        let escalate = policy_row(&configured, &theme, value_width(29));
-        assert_eq!(escalate[0].spans[1].content, "escalate");
+        configured.on_stuck = Some(OnStuck::Consult);
+        let consult = policy_row(&configured, &theme, value_width(29));
+        assert_eq!(consult[0].spans[1].content, "consult");
         assert_eq!(
-            escalate[0].spans[1].style,
+            consult[0].spans[1].style,
             Style::default(),
             "the default should not shout"
         );

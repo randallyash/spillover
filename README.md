@@ -383,15 +383,17 @@ one is abandoned, and the expensive one pays for the whole conversation again. A
 **consult** is the alternative — keep the cheap model driving, and spend the bigger
 one on one narrow question.
 
-The default is `escalate`, and it stays the default: consulting is newer, and the
-tiers where it pays off are the ones you would want to be sure of first.
+**Consult is the default when a local tier has a paid one below it**, because
+escalating is the expensive mistake: it spends the frontier on the whole conversation
+and then, with a sticky fallback, every turn after it. `/on-stuck escalate` switches a
+session over, and `on_stuck = "escalate"` does it for one tier.
 
 ```toml
 [[tier]]
 id = "local"
 kind = "openai"
 preset = "lmstudio"
-on_stuck = "consult"      # default is "escalate"
+on_stuck = "consult"      # what you get by default
 consults_per_turn = 2     # the default
 ```
 
@@ -405,16 +407,21 @@ the choice back to each tier's own, which is the only way to return to a configu
 where two tiers differ:
 
 ```
-> /on-stuck auto
-back to the configured policies — Local consult, Frontier escalate
+> /on-stuck escalate        # every tier, for this session
+> /on-stuck auto            # hand it back
+back to the configured policies — Local consult, Grok consult
 ```
+
+The message names each tier rather than saying "back to the default" because they are
+allowed to differ: here they happen to agree, since consult is what a tier gets for
+saying nothing, and they part company the moment one of them names a policy of its own.
 
 The session panel says which policy is live, and marks a policy you chose rather than
 one from your configuration:
 
 ```
 fallback   sticky
-on stuck * consult
+on stuck * escalate
 ```
 
 The `*` means the session chose it; without it, the policy is the answering tier's own
@@ -434,7 +441,7 @@ it is why consult is the cheaper move when the answer is something the driver ca
 
 It is not always the right move, so it falls back rather than insisting:
 
-- when the budget for the turn is spent, the turn **escalates** as it always did;
+- when the budget for the turn is spent, the turn **escalates** instead;
 - if the consult fails, is stopped, or comes back empty, the turn **escalates** too;
 - with no tier below, there is nobody to ask, so it **escalates**;
 - and a consultant that cannot be held read-only is not asked at all, so it **escalates**.
@@ -510,9 +517,9 @@ ok    grok     cli     grok
 
 Every configured tier is checked, with what each would actually use, how long it
 took, and why anything failed. A tier whose stuck policy is not the default says so,
-because consult is a choice worth being able to audit — and the plain-text report shows
-it only when it is not `escalate`, so an ordinary configuration stays as short as it
-was. The JSON always carries `onStuck` for every tier, so a script never has to infer
+because handing a turn over is a choice worth being able to audit — and the plain-text
+report shows it only when it is not `consult`, so an ordinary configuration stays as
+short as it was. The JSON always carries `onStuck` for every tier, so a script never has to infer
 it from a missing line. `--json` produces the same report for a script, and the exit
 code is non-zero when no tier is usable.
 

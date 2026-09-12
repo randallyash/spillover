@@ -47,17 +47,19 @@ preset = "lmstudio"
 # whatever this server has loaded", which is what I actually want.
 model = ""
 
-# Ask the tier below instead of handing the turn over. Escalating is expensive:
-# the frontier re-reads the whole conversation, and then answers every remaining
-# turn of the session, all because one turn went wrong and I lost the cheap model
-# with it. A consult spends one call on one narrow question and the local model
-# keeps driving.
+# Ask the tier below instead of handing the turn over. This is also what a tier
+# gets for saying nothing, and it is written out because it is the decision that
+# matters most in this file: escalating is expensive. The frontier re-reads the
+# whole conversation, and then answers every remaining turn of the session, all
+# because one turn went wrong and I lost the cheap model with it. A consult
+# spends one call on one narrow question and the local model keeps driving.
 #
-# This is safe to turn on. spill escalates anyway when the advice is no use —
-# when the consult fails, when the budget runs out, when the answer comes back
-# empty — so a turn can never be stranded by it. The two policies are genuinely
-# different rather than one being the good one: if the honest answer is "go and
-# read five more files", handing over is the right move, and consult is not.
+# It is safe either way. spill escalates anyway when the advice is no use — when
+# the consult fails, when the budget runs out, when the answer comes back empty —
+# so a turn can never be stranded by it. The two policies are genuinely different
+# rather than one being the good one: if the honest answer is "go and read five
+# more files", handing over is the right move, and consult is not. That is the
+# line to change — `on_stuck = "escalate"` — if that is the trade you want.
 on_stuck = "consult"
 
 # Two is enough to get unstuck. More than that and a model in a loop is just
@@ -104,9 +106,9 @@ preset = "grok"
 # model the rail shows.
 model = "grok-4.6"
 
-# No on_stuck here: it is the last tier, so escalating is what happens whether or
-# not it is written down. `escalate` is also the default everywhere, so a tier
-# that says nothing about its policy behaves the way it always has.
+# No on_stuck here: it takes the default like any tier that says nothing, and it
+# is the last tier, so there is nobody below it to consult anyway — a stall ends
+# the turn here whatever this says.
 
 # ---------------------------------------------------------------------------
 # Everything past this point is optional. The config above is the whole working

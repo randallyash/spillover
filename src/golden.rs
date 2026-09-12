@@ -23,6 +23,11 @@
 //! - [`a_consult_that_fails_escalates_rather_than_stranding_the_turn`] — the
 //!   consultant is down, so the fallback everyone relies on actually happens.
 //!
+//! The hand-over scenarios ask for escalation explicitly. Consulting is the
+//! default, so a chain left alone would ask the frontier a question first — and
+//! these are here to prove the other path, which is the one a chain of one
+//! always takes and the one that has to happen when a consult cannot.
+//!
 //! These are deliberately written against observable behaviour rather than
 //! internals: the transcript a tier was sent, the file on disk, the events the
 //! interface draws from. A change to how any of it is implemented should not
@@ -38,7 +43,7 @@ use crate::agent::approval::testing::AlwaysApprove;
 use crate::agent::tools::Registry;
 use crate::agent::{AgentConfig, AgentEvent, Canceller, Command, DEFAULT_MAX_STEPS};
 use crate::app::App;
-use crate::config::{Config, Limits};
+use crate::config::{Config, Limits, OnStuck};
 use crate::fallback::{FallbackChain, Tier};
 use crate::provider::openai::OpenAiProvider;
 use crate::provider::{Provider, Usage};
@@ -401,6 +406,16 @@ fn local_tier() -> FakeTier {
     FakeTier::new(vec![writes_note, looping_answer()])
 }
 
+/// A tier configured to hand the turn over rather than ask a question first.
+///
+/// Named rather than inlined because escalating is no longer the default: a
+/// scenario that wants the hand-over has to say so, and saying it here keeps the
+/// intent visible at the point where the chain is built.
+fn escalating(mut tier: Tier) -> Tier {
+    tier.on_stuck = OnStuck::Escalate;
+    tier
+}
+
 // -------------------------------------------------------------------- tests
 
 /// The golden loop, end to end.
@@ -424,7 +439,7 @@ async fn the_golden_loop() {
 
     let chain = FallbackChain::new(
         vec![
-            local.tier("local", "Local", &local_server.url()),
+            escalating(local.tier("local", "Local", &local_server.url())),
             frontier.tier("frontier", "Frontier", &frontier_server.url()),
         ],
         true,
@@ -749,7 +764,7 @@ async fn a_model_stuck_on_a_missing_file_is_spilled() {
 
     let chain = FallbackChain::new(
         vec![
-            driver.tier("local", "Local", &driver_server.url()),
+            escalating(driver.tier("local", "Local", &driver_server.url())),
             frontier.tier("frontier", "Frontier", &frontier_server.url()),
         ],
         true,

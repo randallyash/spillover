@@ -78,6 +78,21 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Consult is now the default when a local tier has a paid one below it.** Escalating
+  is the expensive mistake: the stalled turn goes to the tier below whole, and because a
+  spilled session stays spilled, the cheap model is then gone for every turn after it —
+  one bad answer bought at the price of the rest of the session. A consult spends one
+  question on the tier below and the local model carries on driving.
+  `/on-stuck escalate` switches a session over, and `on_stuck = "escalate"` does it for a
+  single tier; both still hand the turn over whole, and a chain of one behaves exactly as
+  before, since there is nothing below it to ask. The fallbacks are unchanged: when the
+  advice is no use, when the consult fails or comes back empty, or when the per-turn
+  budget is spent, the turn escalates anyway, so consulting can never strand a turn or
+  cost more than the escalation it replaced. What moved with the default is the rest of
+  the reporting — `spill doctor` prints a tier's policy when it is *not* the default,
+  which now means `escalate`, and the session rail highlights `escalate` for the same
+  reason.
+
 - **`config.example.toml` is a working config now, not a template with everything
   commented out.** Two tiers, in order, with the reasons written down the way a person
   writes them: the model left empty because LM Studio is already holding Qwen3 Coder

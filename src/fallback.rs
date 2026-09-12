@@ -28,7 +28,8 @@ pub struct Tier {
 }
 
 impl Tier {
-    /// A tier that escalates when stuck, which is the default policy.
+    /// A tier that carries the configured default policy — consult, unless the
+    /// configuration says otherwise.
     ///
     /// Most construction — the app, `doctor`, and tests — does not care about the
     /// stuck policy, so this keeps it out of the way of what they do care about.
@@ -635,12 +636,16 @@ mod tests {
             Limits::default(),
         );
         first.on_stuck = OnStuck::Consult;
-        let second = Tier::new(
+        let mut second = Tier::new(
             "grok".to_string(),
             "m".to_string(),
             Arc::new(Stub("stub")),
             Limits::default(),
         );
+        // Named rather than left to the default, because differing from the tier
+        // above is the whole point: consult on the tier that is doing the work,
+        // hand the turn over on the one that has to finish it.
+        second.on_stuck = OnStuck::Escalate;
         let mut chain = FallbackChain::new(vec![first, second], true).expect("a chain");
 
         assert!(chain.consults_when_stuck(), "the local tier consults");
@@ -684,7 +689,14 @@ mod tests {
     fn a_one_shot_consult_request_is_taken_rather_than_read() {
         // Taking it is what keeps it one-shot: a request that could be read
         // twice would quietly become the policy for the rest of the session.
-        let mut chain = chain(&["local", "grok"], true);
+        //
+        // The tier is set to escalate on purpose. Consulting is the default now,
+        // so a chain left alone could not tell "the one-shot changed the policy"
+        // from "the policy was already consult" — and telling those two apart is
+        // this test's entire job.
+        let mut tiers = vec![tier("local"), tier("grok")];
+        tiers[0].on_stuck = OnStuck::Escalate;
+        let mut chain = FallbackChain::new(tiers, true).expect("a chain");
 
         assert!(!chain.take_consult_request(), "nothing was asked for");
 
