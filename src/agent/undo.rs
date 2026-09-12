@@ -8,9 +8,10 @@
 //!
 //! Three things bound it, and each is deliberate:
 //!
-//! - **One write, not a stack.** `/undo` reaches the last approved write and
-//!   nothing further; a second `/undo` says so. The memory is one file, and the
-//!   behaviour is predictable.
+//! - **A stack, and a bounded one.** `/undo` reaches the last ten approved writes,
+//!   newest first. A snapshot is a copy of a file, so what bounds it is the bytes
+//!   as much as the count: whichever comes first drops the oldest write, and the
+//!   newest is never dropped, because that is the one the command is for.
 //! - **It refuses when the file has moved on.** The bytes are only put back if
 //!   what is there is still what the write left, so `/undo` can never destroy
 //!   work done since — including the user's own edit.
@@ -18,7 +19,20 @@
 //!   so rather than silently offering to restore an older write, and a shell
 //!   command has no reversal at all.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+
+/// How many writes an undo can reach.
+///
+/// Ten, though the byte budget below is usually what decides.
+const UNDO_DEPTH: usize = 10;
+
+/// The most file contents the history may hold at once.
+///
+/// The reason this was a single entry to begin with. One snapshot is capped at
+/// `MAX_SNAPSHOT`, but ten of them are not, so the budget is what actually bounds
+/// the memory a session can spend on being able to undo.
+const UNDO_BUDGET: usize = 8 * 1024 * 1024;
 
 /// How large a file may be and still have a copy kept for an undo.
 ///
@@ -56,6 +70,17 @@ pub struct Undo {
 }
 
 impl Undo {
+    /// How many bytes of file contents this entry is holding on to.
+    ///
+    /// What the budget counts. An entry that kept no copy — a file that was
+    /// created, or one too large to snapshot — is holding nothing.
+    pub fn held_bytes(&self) -> usize {
+        match &self.before {
+            Before::Bytes(bytes) => bytes.len(),
+            Before::Nothing | Before::Unavailable(_) => 0,
+        }
+    }
+
     /// Record what is at `path` now, for a write that is about to replace it.
     ///
     /// Read before the write rather than after: afterwards the old bytes are gone,
@@ -226,6 +251,68 @@ fn fingerprint(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
+}
+
+/// The writes an undo can still reach, newest first.
+///
+/// A stack rather than a single slot, so `/undo` reaches back past the mistake you
+/// just made to the one before it. Bounded twice — by a count and by the bytes it
+/// holds — and whichever bound is reached first drops the *oldest* entry, because
+/// the newest writes are the ones anybody wants to reach for.
+///
+/// Every entry carries its own path and its own fingerprint of what the write left
+/// behind, so the rule that an entry may only be put back while its file is
+/// untouched holds per entry, exactly as it did when there was one of them.
+#[derive(Debug, Default)]
+pub struct UndoStack {
+    entries: VecDeque<Box<Undo>>,
+    held: usize,
+}
+
+impl UndoStack {
+    /// Record a write. The newest is the one `/undo` reaches first.
+    pub fn push(&mut self, undo: Undo) {
+        self.held += undo.held_bytes();
+        self.entries.push_front(Box::new(undo));
+        self.trim();
+    }
+
+    /// Take the newest entry, if there is one.
+    pub fn pop(&mut self) -> Option<Box<Undo>> {
+        let undo = self.entries.pop_front()?;
+        self.held = self.held.saturating_sub(undo.held_bytes());
+        Some(undo)
+    }
+
+    /// Put an entry back at the front.
+    ///
+    /// For a refusal, which changes nothing: the entry is still the newest write
+    /// that could be put back, so it belongs where it was rather than at the
+    /// bottom of the stack.
+    pub fn restore(&mut self, undo: Box<Undo>) {
+        self.held += undo.held_bytes();
+        self.entries.push_front(undo);
+        self.trim();
+    }
+
+    /// How many writes an undo would reach from here.
+    pub fn depth(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Drop the oldest entries while either bound is exceeded.
+    fn trim(&mut self) {
+        // Never the entry just recorded: a bound that could throw away the write
+        // it was just handed would turn "bounded" into "silently unreversible".
+        // The budget is four times `MAX_SNAPSHOT`, so one entry cannot reach it.
+        while self.entries.len() > UNDO_DEPTH || (self.held > UNDO_BUDGET && self.entries.len() > 1)
+        {
+            let Some(oldest) = self.entries.pop_back() else {
+                break;
+            };
+            self.held = self.held.saturating_sub(oldest.held_bytes());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -399,5 +486,172 @@ mod tests {
         assert_eq!(fingerprint(b"abc"), fingerprint(b"abc"));
         assert_ne!(fingerprint(b"abc"), fingerprint(b"abd"));
         assert_ne!(fingerprint(b""), fingerprint(b"a"));
+    }
+
+    // ---- the stack ----------------------------------------------------------
+
+    /// An entry with no file behind it, for the bounds: only the held bytes and
+    /// the name matter to a stack.
+    fn entry(tool: &str, held: usize) -> Undo {
+        Undo {
+            tool: tool.to_string(),
+            path: PathBuf::from(format!("/tmp/{tool}")),
+            before: if held == 0 {
+                Before::Nothing
+            } else {
+                Before::Bytes(vec![b'x'; held])
+            },
+            created_dirs: Vec::new(),
+            after: 0,
+        }
+    }
+
+    fn names(stack: &mut UndoStack) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Some(undo) = stack.pop() {
+            out.push(undo.tool.clone());
+        }
+        out
+    }
+
+    #[test]
+    fn an_undo_reaches_the_newest_write_first() {
+        let mut stack = UndoStack::default();
+        assert_eq!(stack.depth(), 0);
+
+        stack.push(entry("first", 0));
+        stack.push(entry("second", 0));
+
+        assert_eq!(stack.depth(), 2);
+        assert_eq!(names(&mut stack), vec!["second", "first"]);
+        assert_eq!(stack.depth(), 0, "one undo reaches one write");
+    }
+
+    #[test]
+    fn only_the_newest_writes_are_kept() {
+        // A bound rather than a history: the eleventh write is reachable and the
+        // first is not, because a stack deep enough to matter is a stack nobody
+        // keeps a mental model of.
+        let mut stack = UndoStack::default();
+        for index in 0..UNDO_DEPTH + 3 {
+            stack.push(entry(&format!("write{index}"), 0));
+        }
+
+        assert_eq!(stack.depth(), UNDO_DEPTH);
+        let reached = names(&mut stack);
+        assert_eq!(
+            reached.first().map(String::as_str),
+            Some("write12"),
+            "newest first"
+        );
+        assert_eq!(
+            reached.last().map(String::as_str),
+            Some("write3"),
+            "oldest kept"
+        );
+    }
+
+    #[test]
+    fn the_bytes_a_write_held_decide_the_bound_too() {
+        // Four entries of a quarter of the budget each: the fifth does not fit,
+        // and the oldest goes rather than the one just recorded.
+        let quarter = UNDO_BUDGET / 4;
+        let mut stack = UndoStack::default();
+        for index in 0..4 {
+            stack.push(entry(&format!("write{index}"), quarter));
+        }
+        assert_eq!(stack.depth(), 4);
+
+        stack.push(entry("write4", quarter));
+
+        let reached = names(&mut stack);
+        assert_eq!(reached.first().map(String::as_str), Some("write4"));
+        assert_eq!(
+            reached.last().map(String::as_str),
+            Some("write1"),
+            "the oldest went, not the newest: {reached:?}"
+        );
+    }
+
+    #[test]
+    fn an_entry_holding_nothing_costs_nothing() {
+        // A created file and an unsnapshotable one both keep no copy, so a stack
+        // of them is bounded by the count alone.
+        assert_eq!(entry("created", 0).held_bytes(), 0);
+        assert_eq!(
+            Undo {
+                tool: "big".to_string(),
+                path: PathBuf::from("/tmp/big"),
+                before: Before::Unavailable("too large".to_string()),
+                created_dirs: Vec::new(),
+                after: 0,
+            }
+            .held_bytes(),
+            0
+        );
+
+        let mut stack = UndoStack::default();
+        for index in 0..UNDO_DEPTH {
+            stack.push(entry(&format!("write{index}"), 0));
+        }
+        assert_eq!(stack.depth(), UNDO_DEPTH, "no bytes, so no eviction");
+    }
+
+    #[test]
+    fn a_refusal_puts_the_entry_back_where_it_was() {
+        // What `/undo` does when the file has moved on: nothing was restored, so
+        // the entry is still the newest one to reach for.
+        let mut stack = UndoStack::default();
+        stack.push(entry("first", 0));
+        stack.push(entry("second", 0));
+
+        let taken = stack.pop().expect("the newest");
+        assert_eq!(taken.tool, "second");
+        stack.restore(taken);
+
+        assert_eq!(stack.depth(), 2);
+        assert_eq!(
+            names(&mut stack),
+            vec!["second", "first"],
+            "order is unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_entry_is_only_put_back_while_its_own_file_is_untouched() {
+        // The invariant, with more than one entry to get it wrong across: each
+        // carries its own fingerprint, so a file that moved on is refused without
+        // saying anything about the entry beneath it.
+        let (_dir, first) = store("first version");
+        let (_dir2, second) = store("second version");
+
+        let mut stack = UndoStack::default();
+        stack.push(Undo::capture("edit_file", first.clone(), b"first edited").await);
+        stack.push(Undo::capture("edit_file", second.clone(), b"second edited").await);
+
+        std::fs::write(&second, "second edited").expect("the write lands");
+        std::fs::write(&first, "first edited").expect("the write lands");
+
+        // The newest restores, and the one beneath it still has its own check.
+        stack
+            .pop()
+            .expect("the newest")
+            .restore()
+            .await
+            .expect("untouched");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "second version");
+
+        let next = stack.pop().expect("the one beneath");
+        std::fs::write(&first, "somebody else's work").expect("changed since");
+        assert!(next.restore().await.is_err(), "refused");
+        assert_eq!(
+            std::fs::read_to_string(&first).unwrap(),
+            "somebody else's work",
+            "and left alone"
+        );
+
+        // And it goes back so the user can revert by hand and try again.
+        stack.restore(next);
+        assert_eq!(stack.depth(), 1);
     }
 }

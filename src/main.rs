@@ -1,6 +1,7 @@
 //! Terminal lifecycle and the main event loop.
 
 mod agent;
+mod allow;
 mod app;
 mod commands;
 mod config;
@@ -495,6 +496,8 @@ async fn start_agent(config: &Config, resume: Option<&SessionFile>) -> AgentStar
             cancel: canceller.clone(),
             store,
             log,
+            allow_shell: config.general.allow_shell.clone(),
+            origin: config.origin.clone(),
         },
         chain,
         Arc::new(Registry::with_default_tools()),

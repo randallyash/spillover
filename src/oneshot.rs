@@ -131,6 +131,11 @@ pub async fn run(library: &Library, config: &Config, options: &Options) -> Outco
             // the interactive path: a script whose turn was handed to another
             // model is exactly the case nobody is watching to notice.
             log: options.log.clone().or_else(default_log),
+            // The same rules the interactive path uses: `-p` runs unattended, so
+            // a command that ran without asking there should not stop and ask
+            // into a void here.
+            allow_shell: config.general.allow_shell.clone(),
+            origin: config.origin.clone(),
         },
         chain,
         Arc::new(Registry::with_default_tools()),

@@ -91,6 +91,14 @@ pub const CATALOGUE: &[Spec] = &[
         summary: "Start a new conversation, keeping the tiers as they are",
     },
     Spec {
+        name: "allow",
+        // `save` and `clear` are read as subcommands rather than as the words of
+        // a rule, which is the same bargain `/on-stuck auto` makes: a rule for a
+        // program literally called `clear` is not worth an unambiguous grammar.
+        arg: Arg::Optional("<words>|[save] <words>|clear"),
+        summary: "Let a shell command run without asking",
+    },
+    Spec {
         name: "undo",
         arg: Arg::None,
         summary: "Put back the last file an approved write changed",

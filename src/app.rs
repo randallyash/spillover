@@ -8,7 +8,7 @@ use tokio::sync::oneshot;
 use crate::agent::AgentEvent;
 use crate::agent::approval::{ApprovalRequest, Decision};
 use crate::agent::first_line;
-use crate::agent::{Canceller, Command, Mode};
+use crate::agent::{AllowChange, Canceller, Command, Mode};
 use crate::commands::{self, Input};
 use crate::config::Config;
 use crate::config::OnStuck;
@@ -1201,6 +1201,21 @@ impl App {
                 send(self, Command::Undo);
             }
 
+            "allow" => {
+                // The rules live with the agent too, for the same reason: it is
+                // what runs a tool, and it answers with a notice. So there is one
+                // copy of the list and no second one to keep in step.
+                match allow_change(argument.trim()) {
+                    Ok(Some(change)) => {
+                        send(self, Command::Allow(change));
+                    }
+                    Ok(None) => {
+                        send(self, Command::Allow(AllowChange::List));
+                    }
+                    Err(usage) => self.messages.push(Message::system(usage)),
+                }
+            }
+
             // `commands::parse` only produces names from the catalogue, so this
             // is unreachable; it is a message rather than a panic because a
             // future catalogue edit should not be able to crash the app.
@@ -1312,6 +1327,45 @@ impl App {
 /// the session panel groups them, because both are on screen at once and a
 /// figure that reads "15360" in one place and "15,360" in the other looks like
 /// two different numbers.
+/// Read `/allow`'s argument into the change it asks for.
+///
+/// `Ok(None)` is a bare `/allow`, which lists. `Err` carries what to say, so the
+/// one way of getting this wrong that has an obvious fix is explained rather than
+/// silently read as a rule.
+fn allow_change(argument: &str) -> Result<Option<AllowChange>, &'static str> {
+    /// The one word that makes `save` unmistakable for a rule.
+    const USAGE: &str = "usage: /allow save <words>, such as /allow save git status";
+
+    if argument.is_empty() {
+        return Ok(None);
+    }
+
+    // Subcommands before rules, so a bare `save` is a mistake explained rather
+    // than a rule for a program nobody has called `save` on purpose.
+    if argument == "clear" {
+        return Ok(Some(AllowChange::Clear));
+    }
+
+    if let Some((first, rest)) = argument.split_once(char::is_whitespace) {
+        if first == "save" {
+            let words = rest.trim();
+            return if words.is_empty() {
+                Err(USAGE)
+            } else {
+                Ok(Some(AllowChange::Save(words.to_string())))
+            };
+        }
+    }
+
+    if argument == "save" {
+        return Err(USAGE);
+    }
+
+    // Everything else is a rule, including anything the agent will refuse: the
+    // message that explains why is better than one that quietly does nothing.
+    Ok(Some(AllowChange::Add(argument.to_string())))
+}
+
 fn usage_line(usage: &crate::provider::Usage) -> String {
     let mut line = format!(
         "tokens: {} in, {} out",
@@ -3875,6 +3929,69 @@ mod tests {
         }
         assert!(
             app.menu_matches().iter().any(|spec| spec.name == "undo"),
+            "{:?}",
+            app.menu_matches()
+        );
+    }
+
+    #[test]
+    fn allow_reads_its_argument_into_the_change_it_asks_for() {
+        // The interface's whole job here is to read the argument and pass it on:
+        // the rules live with the agent, which is what runs a tool.
+        let (mut app, mut commands) = attached_app();
+
+        for (typed, expected) in [
+            ("/allow", Command::Allow(AllowChange::List)),
+            (
+                "/allow git status",
+                Command::Allow(AllowChange::Add("git status".to_string())),
+            ),
+            (
+                "/allow save git status",
+                Command::Allow(AllowChange::Save("git status".to_string())),
+            ),
+            ("/allow clear", Command::Allow(AllowChange::Clear)),
+        ] {
+            type_and_send(&mut app, typed);
+            assert_eq!(
+                commands.try_recv().expect("the command should be sent"),
+                expected,
+                "for {typed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_save_with_nothing_to_save_says_so_rather_than_sending_a_rule() {
+        // `/allow save` with no words is a mistake with an obvious fix, so it is
+        // explained instead of being read as a rule for the program `save`.
+        let (mut app, mut commands) = attached_app();
+        let before = app.messages.len();
+
+        type_and_send(&mut app, "/allow save");
+
+        assert!(
+            commands.try_recv().is_err(),
+            "nothing should have been sent"
+        );
+        let said: Vec<String> = app.messages[before..]
+            .iter()
+            .map(|message| message.text.clone())
+            .collect();
+        assert!(
+            said.iter().any(|line| line.contains("usage: /allow save")),
+            "{said:?}"
+        );
+    }
+
+    #[test]
+    fn allow_is_offered_in_the_command_menu() {
+        let (mut app, _commands) = attached_app();
+        for ch in "/allow".chars() {
+            app.handle_key(press(KeyCode::Char(ch)));
+        }
+        assert!(
+            app.menu_matches().iter().any(|spec| spec.name == "allow"),
             "{:?}",
             app.menu_matches()
         );

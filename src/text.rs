@@ -134,6 +134,39 @@ fn split_at_width(text: &str, width: usize) -> (&str, &str) {
     }
 }
 
+/// Lay atoms out in lines of at most `width` columns, never splitting one.
+///
+/// An atom is a phrase that has to stay whole to mean anything: a credential name,
+/// or a shell rule like `git status`. Wrapped the ordinary way, half of
+/// `git rev-parse` at one end of a line and half at the other reads as two rules
+/// nobody wrote.
+pub fn pack<'a>(atoms: impl IntoIterator<Item = &'a str>, indent: &str, width: usize) -> String {
+    let mut out = String::new();
+    let mut line = String::new();
+
+    for atom in atoms {
+        let would_be = indent.len() + line.len() + 1 + atom.len();
+        if !line.is_empty() && would_be > width {
+            out.push_str(indent);
+            out.push_str(&line);
+            out.push('\n');
+            line.clear();
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(atom);
+    }
+
+    if !line.is_empty() {
+        out.push_str(indent);
+        out.push_str(&line);
+        out.push('\n');
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,6 +221,34 @@ mod tests {
         assert_eq!(thousands(999_999), "999,999");
         assert_eq!(thousands(1_000_000), "1,000,000");
         assert_eq!(thousands(u64::MAX), "18,446,744,073,709,551,615");
+    }
+
+    #[test]
+    fn a_packed_phrase_is_never_split_across_lines() {
+        // The reason this exists rather than `wrap`: a rule is a phrase, and half
+        // of one on each of two lines reads as two rules.
+        let rules = ["ls", "git status", "git rev-parse", "cargo test"];
+        let packed = pack(rules, "  ", 20);
+
+        for rule in rules {
+            let words: Vec<&str> = rule.split_whitespace().collect();
+            assert!(
+                packed.lines().any(|line| {
+                    let on_line: Vec<&str> = line.split_whitespace().collect();
+                    on_line.windows(words.len()).any(|window| window == words)
+                }),
+                "{rule:?} should appear as whole words on one line: {packed:?}"
+            );
+        }
+        for line in packed.lines() {
+            assert!(line.len() <= 20, "{line:?} is wider than asked");
+            assert!(line.starts_with("  "), "{line:?} lost its indent");
+        }
+
+        // One wider than the width still goes on a line of its own rather than
+        // being cut in half.
+        let long = "a".repeat(30);
+        assert_eq!(pack([long.as_str()], "  ", 10), format!("  {long}\n"));
     }
 
     #[test]

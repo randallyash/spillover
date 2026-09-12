@@ -597,7 +597,16 @@ mod tests {
             ],
         );
         assert!(events.iter().all(|e| matches!(e, StreamEvent::Activity)));
-        assert!(parser.finish().expect("no error").text.is_empty());
+
+        let summary = parser.finish().expect("no error");
+        assert!(summary.text.is_empty());
+        // The claim the abandoned-text guarantee rests on: a tool-call frame is
+        // progress, never a call, so nothing here can become a side effect.
+        assert!(
+            summary.tool_calls.is_empty(),
+            "a tool-call frame is progress, not a call: {:?}",
+            summary.tool_calls
+        );
     }
 
     #[test]

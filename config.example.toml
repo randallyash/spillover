@@ -24,6 +24,29 @@ workspace = "~"
 # only paid for the frontier on the messages that needed it.
 sticky_fallback = true
 
+# Shell commands that run without being asked about.
+#
+# Left out, you get the read-only set — ls, cat, head, tail, wc, stat, file, du,
+# df, grep, rg, and git's read-only subcommands. Each one is the shell spelling
+# of a tool spill already runs unprompted (cat is read_file, ls is list_dir), so
+# the list removes a prompt rather than giving the agent any reach it lacked.
+# Everything else still stops and shows you the command first.
+#
+# A rule is a prefix of *words*, matched only against a command that has no shell
+# operators in it. So "git status" cannot be talked around by
+# "git status; rm -rf ~": that line holds a semicolon, so it always asks. The
+# same goes for pipes, redirections, substitutions, globs and quotes — and for
+# anything that sets a variable first, like FOO=bar ls.
+#
+# Commands whose *flags* can write or execute are not in the default list on
+# purpose: find, sort, sed, xargs, awk, make, cargo, npm, python. A prefix of
+# words cannot see a flag, so `find . -delete` would slip through one.
+#
+# allow_shell = [] asks about everything. `/allow <words>` adds a rule for the
+# session, and `/allow save <words>` writes the whole list in force back here —
+# surgically, so every comment on this page survives.
+# allow_shell = ["make", "cargo test"]
+
 # Nothing here chooses a session. Running `spill` with no arguments resumes the
 # conversation for this workspace and writes it back as you go, one file per
 # workspace under the state directory (~/.local/state/spill on Linux). `/clear`

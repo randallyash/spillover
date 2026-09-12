@@ -8,6 +8,46 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Read-only shell commands run without being asked about.** Every `run_shell`
+  command used to stop and show a modal, including `ls` and `git status` — which are
+  the shell spelling of `list_dir` and `read_file`, both of which spill already runs
+  unprompted. A list of them (listing, reading, searching, and `git`'s read-only
+  subcommands) now runs straight through, and everything else still asks. What counts
+  as a rule is a **prefix of words matched against a bare word list**: a command
+  holding `;`, `&`, `|`, a redirection, a substitution, a glob or a quote always asks,
+  however it starts, so `"git status"` cannot be talked around by
+  `git status; rm -rf ~`. The commands whose flags can write or execute — `find`,
+  `sort`, `sed`, `xargs`, `awk`, `make`, `cargo`, `npm`, `python` — are deliberately
+  left out, because a word-prefix rule cannot see a flag. `/allow <words>` sticks one
+  for the session, `/allow save <words>` writes the list into `[general] allow_shell`,
+  `/allow clear` drops the session's, and `allow_shell = []` asks about everything
+  again. `/allow save` edits the file surgically — one line, every comment intact —
+  and refuses rather than guessing when there is no `[general]` table, no file, or a
+  file it cannot parse. When a rule covers a command the transcript still shows the
+  command and names the rule that let it through, because a rule is invisible by
+  design and that is exactly what makes it worth saying.
+
+- **`/undo` reaches back ten writes instead of one.** Each entry keeps its own path
+  and its own fingerprint of what the write left behind, so an entry may still only be
+  put back while its file is untouched — the refusal is per entry, exactly as it was
+  with one. The stack is bounded twice: ten writes, or 8 MiB of remembered contents,
+  whichever comes first, oldest dropped. A snapshot is a copy of a file, so the byte
+  budget is the bound that usually decides; the newest entry is never the one dropped,
+  because it is the one the command is for. Every undo reports how much is still behind
+  it, and a refusal says that the entries behind it are blocked until the changed file
+  is dealt with — undoing out of order would be worse than being told why.
+
+- **A patch in a stalled tier's text is never applied, and now it cannot be.** Worth
+  writing down because the text of an abandoned turn can look exactly like an action:
+  `Here is the fix:` and a diff, or a line that reads like a command. It is only ever
+  text. The only thing that can change a workspace is a structured tool call that was
+  approved and ran, there is one place in the code where a call can become an action,
+  and the tests now pin it from both sides — a tier that says it patched a file and
+  then fails changes nothing and is not even shown to the next tier, while a tool call
+  that completed before the stall stands and can be undone. One caveat stated rather
+  than implied: a delegated `cli` tier runs its own tools in its own process, which
+  spill neither parses nor can withhold.
+
 - **`spill doctor` answers "it does not work on my machine" before anyone has to
   ask.** It now prints the configuration file in force and how it was chosen — an
   explicit `--config`, the default path, or *not there yet* with the built-in defaults

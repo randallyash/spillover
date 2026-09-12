@@ -14,9 +14,10 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::watch;
 
 use crate::agent::approval::{Approver, Decision};
-use crate::agent::tools::{Registry, Risk, ToolOutcome};
-use crate::agent::undo::Undo;
-use crate::config::OnStuck;
+use crate::agent::tools::{Registry, Risk, ToolOutcome, shell};
+use crate::agent::undo::UndoStack;
+use crate::allow::{AllowRules, Rule};
+use crate::config::{Config, OnStuck, Origin};
 use crate::detect::progress::ProgressDetector;
 use crate::detect::{ErrorClass, StuckReason, Watchdog};
 use crate::fallback::{FallbackChain, Tier};
@@ -191,12 +192,32 @@ pub enum Command {
     Clear,
     /// Report what is being sent each turn.
     Context,
-    /// Put back the last approved write.
+    /// Put back an approved write.
     ///
-    /// Reaches one write and no further. The user typed it, so it does not ask
-    /// again — what it does instead is refuse when the file has moved on since,
-    /// which is the safety that matters here.
+    /// Reaches the newest write on the stack. The user typed it, so it does not
+    /// ask again — what it does instead is refuse when the file has moved on
+    /// since, which is the safety that matters here.
     Undo,
+    /// Add, list or drop the shell rules this session runs without asking about.
+    ///
+    /// Answered with a notice rather than kept in the app, for the same reason the
+    /// undo pre-image lives with the agent: this is what runs the tool, so there
+    /// is one copy of the list and no second one that could report a rule which is
+    /// not in force.
+    Allow(AllowChange),
+}
+
+/// What `/allow` was asked to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AllowChange {
+    /// Report the rules in force.
+    List,
+    /// Stick a rule for the rest of the session.
+    Add(String),
+    /// Stick a rule, and write the whole list in force into the config file.
+    Save(String),
+    /// Drop this session's rules.
+    Clear,
 }
 
 #[derive(Debug, Clone)]
@@ -293,6 +314,18 @@ pub struct AgentConfig {
     /// different questions: a one-shot run has no session to resume and every
     /// reason to log why it spilled.
     pub log: Option<SpillLog>,
+    /// Shell commands that may run without being asked about.
+    ///
+    /// The configuration's own list, which is the read-only set unless it says
+    /// otherwise. Rules stuck with `/allow` are added to this at runtime and are
+    /// not part of it.
+    pub allow_shell: Vec<String>,
+    /// Which configuration file is in force, so `/allow save` can write to it.
+    ///
+    /// Carried rather than guessed at: the difference between the default path
+    /// and one named by `--config` is a file, and writing to the wrong one would
+    /// be worse than refusing.
+    pub origin: Origin,
 }
 
 /// A session to pick up where the last run left off.
@@ -315,13 +348,20 @@ struct Loop {
     mode: Mode,
     /// The turn most recently started, so it can be retried.
     last: Option<LastTurn>,
-    /// The last approved write, and the means to put it back.
+    /// The approved writes that can still be put back, newest first.
     ///
-    /// One, not a stack: an undo should be a predictable thing to reach for, and
-    /// keeping every write of a session would mean holding every file's previous
-    /// contents. It is set by whichever tool last changed a file, so it always
-    /// describes the *last* change rather than an older one.
-    last_write: Option<Box<Undo>>,
+    /// Bounded in `UndoStack` rather than here, because what bounds it is the
+    /// bytes it holds: an entry is a copy of a file as it was, so the depth and
+    /// the budget are the same decision.
+    undo: UndoStack,
+    /// Which shell commands run without being asked about.
+    ///
+    /// Held with the loop rather than the app because this is what runs a tool,
+    /// and because the rules cannot change while a turn is in flight — commands
+    /// queue behind the turn they arrive in. `/allow` answers from here, so there
+    /// is one copy of the list and no second one to report a rule that is not in
+    /// force.
+    allow: AllowRules,
     /// Whether the spill log has already been reported as unwritable.
     ///
     /// Once per run: a full disk would otherwise print the same line on every
@@ -364,6 +404,9 @@ pub fn spawn_seeded(
     let (command_tx, mut command_rx) = mpsc::unbounded_channel::<Command>();
     let (event_tx, event_rx) = mpsc::unbounded_channel::<AgentEvent>();
 
+    // Built once, so both branches of the loop below start from the same rules.
+    let rules = AllowRules::new(&config.allow_shell);
+
     tokio::spawn(async move {
         let mut state = match seed {
             Some(seed) => Loop {
@@ -380,7 +423,8 @@ pub fn spawn_seeded(
                 // Undo does not survive a restart, so a resumed session starts
                 // with nothing to put back — which is honest, since the bytes it
                 // would restore were never written down.
-                last_write: None,
+                undo: UndoStack::default(),
+                allow: rules,
                 log_warned: false,
             },
             None => Loop {
@@ -390,7 +434,8 @@ pub fn spawn_seeded(
                 chain,
                 mode: Mode::default(),
                 last: None,
-                last_write: None,
+                undo: UndoStack::default(),
+                allow: rules,
                 log_warned: false,
             },
         };
@@ -471,7 +516,8 @@ async fn handle_command(
                 approver,
                 events,
                 &mut state.session,
-                &mut state.last_write,
+                &mut state.undo,
+                &state.allow,
                 &mut state.log_warned,
                 prompt,
             )
@@ -632,7 +678,8 @@ async fn handle_command(
                 approver,
                 events,
                 &mut state.session,
-                &mut state.last_write,
+                &mut state.undo,
+                &state.allow,
                 &mut state.log_warned,
                 last.prompt,
             )
@@ -715,29 +762,54 @@ async fn handle_command(
             )));
         }
 
-        Command::Undo => {
-            // Taken rather than read, so one undo reaches one write: a second
-            // `/undo` says there is nothing left rather than flipping the file
-            // back and forth.
-            match state.last_write.take() {
-                Some(undo) => match undo.restore().await {
-                    Ok(said) => {
-                        let _ = events.send(AgentEvent::Notice(format!("· {said}")));
-                    }
-                    Err(refused) => {
-                        // Put back on a refusal: nothing was changed, so the
-                        // record is still the last write, and a user who undoes
-                        // their own edit by hand can try again.
-                        let _ = events.send(AgentEvent::Notice(format!("✗ {refused}")));
-                        state.last_write = Some(undo);
-                    }
-                },
-                None => {
-                    let _ = events.send(AgentEvent::Notice(
-                        "nothing to undo — /undo reaches only the last approved write".to_string(),
-                    ));
+        // Popped rather than read, so one undo reaches exactly one write: the
+        // stack shrinks by what was put back, and going deeper is a second
+        // deliberate command rather than something one press did quietly.
+        Command::Undo => match state.undo.pop() {
+            Some(entry) => match entry.restore().await {
+                Ok(said) => {
+                    let _ = events.send(AgentEvent::Notice(format!(
+                        "· {said}{}",
+                        reachable(state.undo.depth())
+                    )));
                 }
+                Err(refused) => {
+                    // Put back on a refusal: nothing was changed, so this is
+                    // still the newest write to reach for, and a user who puts
+                    // their own edit back by hand can try again. Said this way
+                    // because the entries behind it are blocked until then.
+                    let _ = events.send(AgentEvent::Notice(format!(
+                        "✗ {refused}{}",
+                        behind(state.undo.depth())
+                    )));
+                    state.undo.restore(entry);
+                }
+            },
+            None => {
+                let _ = events.send(AgentEvent::Notice(
+                    "nothing to undo — no approved write is still on the stack".to_string(),
+                ));
             }
+        },
+
+        Command::Allow(change) => {
+            let notice = match change {
+                AllowChange::List => describe_rules(&state.allow),
+                AllowChange::Add(text) => add_rule(&mut state.allow, &text, None),
+                AllowChange::Save(text) => add_rule(&mut state.allow, &text, Some(&config.origin)),
+                AllowChange::Clear => {
+                    let dropped = state.allow.clear_session();
+                    if dropped == 0 {
+                        "· no rules were stuck this session, so nothing changed".to_string()
+                    } else {
+                        format!(
+                            "· {dropped} session rule(s) dropped. The ones in your configuration \
+                             are unchanged, so /allow still lists them."
+                        )
+                    }
+                }
+            };
+            let _ = events.send(AgentEvent::Notice(notice));
         }
     }
 
@@ -846,7 +918,8 @@ async fn run_turn(
     approver: &Arc<dyn Approver>,
     events: &UnboundedSender<AgentEvent>,
     session: &mut Session,
-    last_write: &mut Option<Box<Undo>>,
+    undo: &mut UndoStack,
+    allow: &AllowRules,
     log_warned: &mut bool,
     prompt: String,
 ) {
@@ -871,7 +944,7 @@ async fn run_turn(
         let (label, tier_id, outcome, counters) = {
             let tier = chain.active();
             let (outcome, counters) = try_tier(
-                config, tier, mode, registry, approver, events, session, last_write,
+                config, tier, mode, registry, approver, events, session, undo, allow,
             )
             .await;
             (tier.label.clone(), tier.id.clone(), outcome, counters)
@@ -1297,7 +1370,8 @@ async fn try_tier(
     approver: &Arc<dyn Approver>,
     events: &UnboundedSender<AgentEvent>,
     session: &mut Session,
-    last_write: &mut Option<Box<Undo>>,
+    undo: &mut UndoStack,
+    allow: &AllowRules,
 ) -> (Attempt, Counters) {
     // A read-only turn is not offered the tools that could change anything. The
     // refusal in `run_tool` is what makes that a guarantee; this is what stops a
@@ -1385,6 +1459,7 @@ async fn try_tier(
                     approver,
                     &config.workspace,
                     &call,
+                    allow,
                     events,
                     &config.cancel,
                 )
@@ -1410,8 +1485,8 @@ async fn try_tier(
                 // the result moves into the session, and only for a write that
                 // succeeded — the tool leaves it `None` otherwise.
                 let mut outcome = outcome;
-                if let Some(undo) = outcome.undo.take() {
-                    *last_write = Some(undo);
+                if let Some(entry) = outcome.undo.take() {
+                    undo.push(*entry);
                 }
 
                 // Classified before the result moves into the session, so the kind of
@@ -1584,12 +1659,16 @@ fn observe(
     }
 }
 
+/// The same borrow split as `try_tier`: the undo stack is `&mut` while the rules
+/// are `&`, so a single `&mut Loop` here would borrow the loop twice.
+#[allow(clippy::too_many_arguments)]
 async fn run_tool(
     mode: Mode,
     registry: &Arc<Registry>,
     approver: &Arc<dyn Approver>,
     workspace: &std::path::Path,
     call: &ToolCall,
+    allow: &AllowRules,
     events: &UnboundedSender<AgentEvent>,
     cancel: &Canceller,
 ) -> ToolRun {
@@ -1650,7 +1729,15 @@ async fn run_tool(
     // denies it rather than cancelling, so this is belt and braces: without it,
     // a cancel raised while a prompt was open would wait for an answer that is
     // never coming.
-    if tool.risk() == Risk::Write {
+    // A rule is a prefix of words, so it can only be read against a command, and a
+    // command is what `run_shell` takes. A file write is never covered by one: the
+    // diff it shows is the whole reason it asks.
+    let covered = (call.name == shell::NAME)
+        .then(|| arguments.get("command").and_then(serde_json::Value::as_str))
+        .flatten()
+        .and_then(|command| allow.allows(command));
+
+    if tool.risk() == Risk::Write && covered.is_none() {
         let decision = tokio::select! {
             biased;
             _ = cancelled(cancel.watcher()) => return ToolRun::Cancelled,
@@ -1665,6 +1752,15 @@ async fn run_tool(
                 call.name
             )));
         }
+    } else if let Some(rule) = covered {
+        // Said out loud rather than done quietly. The command itself is shown by
+        // the tool line that follows; what this adds is the reason nobody was
+        // asked, which is the thing a rule could otherwise hide.
+        let _ = events.send(AgentEvent::Notice(format!(
+            "· {} runs without asking (rule: {})",
+            call.name,
+            rule.text()
+        )));
     }
 
     let _ = events.send(AgentEvent::ToolStarted {
@@ -1689,6 +1785,111 @@ async fn run_tool(
     });
 
     ToolRun::Done(outcome)
+}
+
+/// How much of the undo stack is still reachable, in words.
+///
+/// Said after every undo, because a stack that does not report its depth makes
+/// each press a guess about whether anything is behind it.
+fn reachable(depth: usize) -> String {
+    match depth {
+        0 => " — that was the last write on the stack".to_string(),
+        1 => " — 1 more write can still be put back".to_string(),
+        count => format!(" — {count} more writes can still be put back"),
+    }
+}
+
+/// The same, for a refusal: the entry stays, so this counts what is behind it.
+fn behind(depth: usize) -> String {
+    match depth {
+        0 => String::new(),
+        1 => " (1 more write is behind it)".to_string(),
+        count => format!(" ({count} more writes are behind it)"),
+    }
+}
+
+/// The rules in force, as `/allow` reports them.
+fn describe_rules(allow: &AllowRules) -> String {
+    if allow.is_empty() {
+        return "no shell command runs without asking. `/allow <words>` sticks one for this \
+                session, and `/allow save <words>` writes it into your configuration."
+            .to_string();
+    }
+
+    let (from_config, session) = allow.texts_by_source();
+    let mut out = String::from("shell commands that run without asking:\n");
+    // Packed rather than wrapped, so a rule like `git rev-parse` is never split
+    // across two lines and read as two rules that nobody wrote.
+    out.push_str(&crate::text::pack(
+        from_config.iter().map(String::as_str),
+        "  ",
+        74,
+    ));
+
+    // Marked rather than mixed in: the difference between "until the file
+    // changes" and "until spill exits" is the whole reason to list them at all.
+    if !session.is_empty() {
+        out.push_str(&crate::text::pack(
+            session.iter().map(String::as_str),
+            "* ",
+            74,
+        ));
+        out.push_str("  (* stuck for this session — a new one asks again)\n");
+    }
+
+    out.trim_end().to_string()
+}
+
+/// Stick a rule, and optionally write the list in force into the config.
+fn add_rule(allow: &mut AllowRules, text: &str, save: Option<&Origin>) -> String {
+    let rule = match Rule::parse(text) {
+        Ok(rule) => rule,
+        Err(error) => return format!("✗ {error}"),
+    };
+
+    let words = rule.text();
+    let added = allow.add_session(rule);
+
+    let Some(origin) = save else {
+        return if added {
+            format!(
+                "· this session will run {words:?} without asking. A new session will ask again — \
+                 `/allow save {words}` writes it into your configuration."
+            )
+        } else {
+            format!("· {words:?} already runs without asking, so nothing changed")
+        };
+    };
+
+    if let Err(error) = origin.writable_path() {
+        return format!(
+            "✗ {error}. {}",
+            if added {
+                format!("{words:?} is in force for this session regardless.")
+            } else {
+                "Nothing changed.".to_string()
+            }
+        );
+    }
+
+    // Everything in force, not just this rule: the key *is* the list, so writing
+    // one rule would drop the read-only set that was in force a moment ago.
+    let rules = allow.texts();
+    let path = origin.writable_path().expect("checked above");
+
+    match Config::save_allow(path, &rules) {
+        Ok(()) => format!(
+            "· {} rules written to {}{}",
+            rules.len(),
+            path.display(),
+            if added {
+                format!(", including {words:?}")
+            } else {
+                String::new()
+            }
+        ),
+        Err(error) => format!("✗ {error}"),
+    }
 }
 
 /// A tool's output can be thousands of lines; the transcript gets the gist.
@@ -1859,6 +2060,11 @@ mod tests {
             // the ones that are set a store on the config they build.
             store: None,
             log: None,
+            // A fixture, so it behaves as though the configuration said nothing:
+            // no rule covers anything, and there is no file for `/allow save` to
+            // write to. The tests that are about either set what they need.
+            allow_shell: Vec::new(),
+            origin: Origin::default(),
         }
     }
 
@@ -1874,6 +2080,11 @@ mod tests {
             cancel: cancel.clone(),
             store: None,
             log: None,
+            // A fixture, so it behaves as though the configuration said nothing:
+            // no rule covers anything, and there is no file for `/allow save` to
+            // write to. The tests that are about either set what they need.
+            allow_shell: Vec::new(),
+            origin: Origin::default(),
         };
         (config, cancel)
     }
@@ -1955,6 +2166,65 @@ mod tests {
             .expect("send prompt");
 
         (drain(rx).await, provider)
+    }
+
+    /// Like `run_one`, with a configuration of the test's own.
+    async fn run_one_with(
+        config: AgentConfig,
+        script: Vec<TurnSummary>,
+        approver: Arc<dyn Approver>,
+        prompt: &str,
+    ) -> (Vec<AgentEvent>, Arc<ScriptedProvider>) {
+        let provider = ScriptedProvider::new(script);
+        let (tx, rx) = spawn(
+            config,
+            single_tier(provider.clone()),
+            Arc::new(Registry::with_default_tools()),
+            approver,
+        );
+        tx.send(Command::Prompt(prompt.to_string()))
+            .expect("send prompt");
+
+        (drain(rx).await, provider)
+    }
+
+    /// The configuration a person gets who has written nothing about rules.
+    fn config_with_default_rules(workspace: &std::path::Path) -> AgentConfig {
+        AgentConfig {
+            allow_shell: crate::allow::READ_ONLY_SHELL
+                .iter()
+                .map(|rule| rule.to_string())
+                .collect(),
+            ..config(workspace, DEFAULT_MAX_STEPS)
+        }
+    }
+
+    /// A turn that asks for one shell command.
+    fn shell_call(command: &str) -> TurnSummary {
+        TurnSummary {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "call_shell".to_string(),
+                name: shell::NAME.to_string(),
+                arguments: serde_json::json!({ "command": command }).to_string(),
+            }],
+            stop_reason: Some("tool_calls".to_string()),
+            ..TurnSummary::default()
+        }
+    }
+
+    /// A turn that asks to write a file, for the rule that must not cover it.
+    fn write_call(path: &str) -> TurnSummary {
+        TurnSummary {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "call_write".to_string(),
+                name: "write_file".to_string(),
+                arguments: serde_json::json!({ "path": path, "content": "hello" }).to_string(),
+            }],
+            stop_reason: Some("tool_calls".to_string()),
+            ..TurnSummary::default()
+        }
     }
 
     /// A turn that uses a tool, with a token cost on each step.
@@ -5006,7 +5276,8 @@ mod tests {
             chain,
             mode: Mode::Plan,
             last: None,
-            last_write: None,
+            undo: UndoStack::default(),
+            allow: AllowRules::default(),
             log_warned: false,
         };
 
@@ -5016,6 +5287,11 @@ mod tests {
             cancel: Canceller::default(),
             store: None,
             log: None,
+            // A fixture, so it behaves as though the configuration said nothing:
+            // no rule covers anything, and there is no file for `/allow save` to
+            // write to. The tests that are about either set what they need.
+            allow_shell: Vec::new(),
+            origin: Origin::default(),
         };
         let file = snapshot(&agent_config, &state);
 
@@ -5387,5 +5663,537 @@ mod tests {
         let said = notices(&drain_quiet(&mut rx).await).join("\n");
 
         assert!(said.contains("nothing to undo"), "{said}");
+    }
+
+    // ---- what may run without being asked ----------------------------------
+
+    #[tokio::test]
+    async fn a_read_only_command_runs_without_being_asked_about() {
+        // The default list, through the real loop: the approver is never reached,
+        // which is the whole claim. Asserted on what the approver recorded rather
+        // than on the absence of an event, because a modal that was never shown
+        // and one that was answered instantly look the same from the transcript.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let approver = Arc::new(AlwaysApprove::default());
+
+        let (events, _) = run_one_with(
+            config_with_default_rules(dir.path()),
+            vec![shell_call("git status"), step_two()],
+            approver.clone(),
+            "what changed?",
+        )
+        .await;
+
+        assert!(
+            approver.asked.lock().expect("lock").is_empty(),
+            "a read-only command should not reach the approver"
+        );
+        // And it is not silent: what ran without asking is said out loud, since a
+        // rule is otherwise invisible by design.
+        let said = notices(&events).join("\n");
+        assert!(said.contains("runs without asking"), "{said}");
+        assert!(said.contains("rule: git status"), "{said}");
+    }
+
+    #[tokio::test]
+    async fn a_command_the_defaults_do_not_cover_is_still_asked_about() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let approver = Arc::new(AlwaysApprove::default());
+
+        run_one_with(
+            config_with_default_rules(dir.path()),
+            vec![shell_call("cargo test"), step_two()],
+            approver.clone(),
+            "run the tests",
+        )
+        .await;
+
+        let asked = approver.asked.lock().expect("lock").clone();
+        assert_eq!(asked.len(), 1, "the modal should have been shown once");
+        assert_eq!(asked[0].0, shell::NAME);
+        assert!(asked[0].1.contains("cargo test"), "{}", asked[0].1);
+    }
+
+    #[tokio::test]
+    async fn an_empty_list_asks_about_everything_including_reading() {
+        // The escape hatch, and the thing that makes shipping a default list
+        // defensible: anyone who wants the old behaviour has it in one line.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let approver = Arc::new(AlwaysApprove::default());
+
+        run_one_with(
+            config(dir.path(), DEFAULT_MAX_STEPS),
+            vec![shell_call("git status"), step_two()],
+            approver.clone(),
+            "what changed?",
+        )
+        .await;
+
+        assert_eq!(
+            approver.asked.lock().expect("lock").len(),
+            1,
+            "with no rules, everything asks"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_command_holding_a_shell_operator_is_asked_about_even_when_it_starts_well() {
+        // The case the whole word-prefix design exists for: a rule for `git
+        // status` must not cover a line that begins with it and goes on to do
+        // something else.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let approver = Arc::new(AlwaysApprove::default());
+
+        run_one_with(
+            config_with_default_rules(dir.path()),
+            vec![shell_call("git status; rm -rf important.txt"), step_two()],
+            approver.clone(),
+            "go",
+        )
+        .await;
+
+        assert_eq!(approver.asked.lock().expect("lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_rule_never_covers_a_file_write() {
+        // A rule names a command. A write is not one, and the diff it shows is the
+        // whole reason it asks — so nothing about the rules can make it quiet.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let approver = Arc::new(AlwaysApprove::default());
+
+        let mut config = config_with_default_rules(dir.path());
+        // A rule that would cover the *path* if anything were matching text
+        // rather than a command.
+        config.allow_shell.push("notes.txt".to_string());
+
+        run_one_with(
+            config,
+            vec![write_call("notes.txt"), step_two()],
+            approver.clone(),
+            "write it",
+        )
+        .await;
+
+        assert_eq!(approver.asked.lock().expect("lock").len(), 1);
+        assert!(dir.path().join("notes.txt").exists(), "and it still ran");
+    }
+
+    #[tokio::test]
+    async fn plan_mode_refuses_a_shell_command_a_rule_would_have_allowed() {
+        // The guarantee that outranks a rule: read-only is read-only. The mode's
+        // ceiling is checked before a rule is consulted, so a rule cannot widen
+        // what plan mode may do.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let approver = Arc::new(AlwaysApprove::default());
+
+        let mut config = config_with_default_rules(dir.path());
+        config.max_steps = DEFAULT_MAX_STEPS;
+        let provider = ScriptedProvider::new(vec![shell_call("git status"), step_two()]);
+        let (tx, rx) = spawn(
+            config,
+            single_tier(provider),
+            Arc::new(Registry::with_default_tools()),
+            approver.clone(),
+        );
+        tx.send(Command::SetMode(Mode::Plan)).expect("set mode");
+        tx.send(Command::Prompt("go".to_string())).expect("prompt");
+
+        let events = drain(rx).await;
+        let said = notices(&events).join("\n");
+
+        assert!(said.contains("plan mode is read-only"), "{said}");
+        assert!(
+            approver.asked.lock().expect("lock").is_empty(),
+            "and it was refused before the approver was even reached"
+        );
+    }
+
+    #[tokio::test]
+    async fn allow_sticks_a_rule_for_the_session_and_clear_takes_it_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let approver = Arc::new(AlwaysApprove::default());
+        let provider = ScriptedProvider::new(vec![
+            shell_call("cargo test"),
+            step_two(),
+            shell_call("cargo test"),
+            step_two(),
+        ]);
+        let (tx, mut rx) = spawn(
+            config(dir.path(), DEFAULT_MAX_STEPS),
+            single_tier(provider),
+            Arc::new(Registry::with_default_tools()),
+            approver.clone(),
+        );
+
+        // With no rules, `cargo test` asks.
+        tx.send(Command::Prompt("run the tests".to_string()))
+            .expect("prompt");
+        drain_from(&mut rx).await;
+        assert_eq!(approver.asked.lock().expect("lock").len(), 1);
+
+        // Sticking it is answered with a notice, and says what it covers.
+        tx.send(Command::Allow(AllowChange::Add("cargo test".to_string())))
+            .expect("allow");
+        let said = notices(&drain_quiet(&mut rx).await).join("\n");
+        assert!(said.contains("this session will run"), "{said}");
+        assert!(said.contains("cargo test"), "{said}");
+
+        // Now the same command runs without asking.
+        tx.send(Command::Prompt("run the tests again".to_string()))
+            .expect("prompt");
+        drain_from(&mut rx).await;
+        assert_eq!(
+            approver.asked.lock().expect("lock").len(),
+            1,
+            "the second one should have been covered by the rule"
+        );
+
+        // And `/allow clear` puts the question back.
+        tx.send(Command::Allow(AllowChange::Clear)).expect("clear");
+        let said = notices(&drain_quiet(&mut rx).await).join("\n");
+        assert!(said.contains("1 session rule(s) dropped"), "{said}");
+    }
+
+    #[tokio::test]
+    async fn allow_lists_the_rules_in_force_and_marks_the_session_ones() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = ScriptedProvider::new(vec![step_two()]);
+        let (tx, mut rx) = spawn(
+            config_with_default_rules(dir.path()),
+            single_tier(provider),
+            Arc::new(Registry::with_default_tools()),
+            Arc::new(AlwaysApprove::default()),
+        );
+
+        tx.send(Command::Allow(AllowChange::List)).expect("list");
+        let listed = notices(&drain_quiet(&mut rx).await).join("\n");
+        assert!(
+            listed.contains("shell commands that run without asking"),
+            "{listed}"
+        );
+        assert!(listed.contains("git status"), "{listed}");
+        assert!(
+            listed.contains("git rev-parse"),
+            "the longer rules too: {listed}"
+        );
+        assert!(!listed.contains("* "), "nothing stuck yet: {listed}");
+
+        tx.send(Command::Allow(AllowChange::Add("cargo test".to_string())))
+            .expect("add");
+        drain_quiet(&mut rx).await;
+        tx.send(Command::Allow(AllowChange::List))
+            .expect("list again");
+        let listed = notices(&drain_quiet(&mut rx).await).join("\n");
+        assert!(listed.contains("* cargo test"), "{listed}");
+        assert!(listed.contains("stuck for this session"), "{listed}");
+    }
+
+    #[tokio::test]
+    async fn a_rule_that_is_not_a_rule_is_refused_with_the_reason() {
+        // A rule is matched against a command with no operators in it, so one
+        // holding an operator could never match: say so rather than accept
+        // something that would silently never apply.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = ScriptedProvider::new(vec![step_two()]);
+        let (tx, mut rx) = spawn(
+            config(dir.path(), DEFAULT_MAX_STEPS),
+            single_tier(provider),
+            Arc::new(Registry::with_default_tools()),
+            Arc::new(AlwaysApprove::default()),
+        );
+
+        tx.send(Command::Allow(AllowChange::Add("ls; rm -rf ~".to_string())))
+            .expect("add");
+        let said = notices(&drain_quiet(&mut rx).await).join("\n");
+
+        assert!(said.contains("✗"), "{said}");
+        assert!(said.contains("cannot contain"), "{said}");
+    }
+
+    #[tokio::test]
+    async fn saving_with_no_configuration_file_keeps_the_rule_and_says_why_it_could_not_write() {
+        // `Origin::Text` is a run with no file at all — the same honesty as the
+        // rest of the save path: refuse, name the reason, and do not pretend the
+        // rule is permanent.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = ScriptedProvider::new(vec![step_two()]);
+        let (tx, mut rx) = spawn(
+            config(dir.path(), DEFAULT_MAX_STEPS),
+            single_tier(provider),
+            Arc::new(Registry::with_default_tools()),
+            Arc::new(AlwaysApprove::default()),
+        );
+
+        tx.send(Command::Allow(AllowChange::Save("cargo test".to_string())))
+            .expect("save");
+        let said = notices(&drain_quiet(&mut rx).await).join("\n");
+
+        assert!(said.contains("no configuration file"), "{said}");
+        assert!(said.contains("in force for this session"), "{said}");
+    }
+
+    #[tokio::test]
+    async fn saving_writes_every_rule_in_force_including_the_defaults() {
+        // The key *is* the list, so writing only the new rule would drop the
+        // read-only set: next start would ask about `ls`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[general]\nworkspace = \"~\"\n").expect("write");
+
+        let provider = ScriptedProvider::new(vec![step_two()]);
+        // The real defaults, because the point of the test is what happens to
+        // them: the key *is* the list, so writing one rule would drop them.
+        let mut config = config_with_default_rules(dir.path());
+        config.origin = Origin::Given(path.clone());
+        let (tx, mut rx) = spawn(
+            config,
+            single_tier(provider),
+            Arc::new(Registry::with_default_tools()),
+            Arc::new(AlwaysApprove::default()),
+        );
+
+        tx.send(Command::Allow(AllowChange::Save("cargo test".to_string())))
+            .expect("save");
+        let said = notices(&drain_quiet(&mut rx).await).join("\n");
+
+        assert!(said.contains("rules written to"), "{said}");
+        let written = std::fs::read_to_string(&path).expect("read");
+        assert!(written.contains("git status"), "{written}");
+        assert!(written.contains("cargo test"), "{written}");
+        // And what was written is what a reload gives back.
+        let reloaded = Config::load(Some(&path)).expect("valid");
+        assert!(
+            reloaded
+                .general
+                .allow_shell
+                .contains(&"cargo test".to_string())
+        );
+        assert!(reloaded.general.allow_shell.contains(&"ls".to_string()));
+    }
+
+    // ---- the stack ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn undo_reaches_back_through_several_writes_newest_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("note.txt");
+
+        let write = |content: &str| TurnSummary {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "call_write".to_string(),
+                name: "write_file".to_string(),
+                arguments: serde_json::json!({ "path": "note.txt", "content": content })
+                    .to_string(),
+            }],
+            stop_reason: Some("tool_calls".to_string()),
+            ..TurnSummary::default()
+        };
+
+        let provider = ScriptedProvider::new(vec![write("first"), write("second"), step_two()]);
+        let (tx, mut rx) = spawn(
+            config(dir.path(), DEFAULT_MAX_STEPS),
+            single_tier(provider),
+            Arc::new(Registry::with_default_tools()),
+            Arc::new(AlwaysApprove::default()),
+        );
+
+        tx.send(Command::Prompt("write it twice".to_string()))
+            .expect("prompt");
+        drain_from(&mut rx).await;
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
+
+        // The newest first: back to the first write.
+        tx.send(Command::Undo).expect("undo");
+        let said = notices(&drain_quiet(&mut rx).await).join("\n");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first");
+        assert!(
+            said.contains("1 more write can still be put back"),
+            "{said}"
+        );
+
+        // And then past it: back to no file at all.
+        tx.send(Command::Undo).expect("undo again");
+        let said = notices(&drain_quiet(&mut rx).await).join("\n");
+        assert!(
+            !path.exists(),
+            "the first write created it, so undoing removes it"
+        );
+        assert!(said.contains("last write on the stack"), "{said}");
+
+        // A third says there is nothing, rather than flipping anything back.
+        tx.send(Command::Undo).expect("undo once more");
+        let said = notices(&drain_quiet(&mut rx).await).join("\n");
+        assert!(said.contains("nothing to undo"), "{said}");
+    }
+
+    // ---- text is never a side effect ---------------------------------------
+
+    /// Says something and then falls over. What an abandoned turn looks like from
+    /// the outside: the text arrived, the turn did not finish.
+    struct SaysThenFails {
+        text: String,
+    }
+
+    #[async_trait]
+    impl Provider for SaysThenFails {
+        fn describe(&self) -> String {
+            "says-then-fails".to_string()
+        }
+
+        async fn stream(
+            &self,
+            _request: ChatRequest,
+            events: UnboundedSender<StreamEvent>,
+        ) -> Result<TurnSummary, ProviderError> {
+            let _ = events.send(StreamEvent::Text(self.text.clone()));
+            Err(ProviderError::Broken {
+                target: "says-then-fails".to_string(),
+                detail: "the connection went away mid-answer".to_string(),
+            })
+        }
+    }
+
+    /// Text that reads exactly like an applied patch and a command, and must stay
+    /// text all the same.
+    fn a_patch_in_prose() -> String {
+        "Here is the fix, already applied:\n\
+         ```diff\n\
+         --- a/notes.txt\n\
+         +++ b/notes.txt\n\
+         @@ -1 +1 @@\n\
+         -original\n\
+         +overwritten\n\
+         ```\n\
+         I have written the file. I also ran: rm -rf /tmp/spill-nothing\n"
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn a_patch_in_an_abandoned_turns_text_is_never_applied() {
+        // The guarantee, from the outside. A tier's text is never a source of a
+        // side effect: what can change the world is a structured tool call that was
+        // approved and ran, and this turn had neither — so nothing happened, and
+        // the turn was handed over as though it had said nothing at all.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let note = dir.path().join("notes.txt");
+        std::fs::write(&note, "original\n").expect("write");
+
+        let abandoned = Arc::new(SaysThenFails {
+            text: a_patch_in_prose(),
+        });
+        let next = ScriptedProvider::new(vec![answer("done")]);
+        let chain = chain_of_with(
+            vec![
+                (abandoned as Arc<dyn Provider>, Limits::default()),
+                (next.clone(), Limits::default()),
+            ],
+            OnStuck::Escalate,
+        );
+        let (tx, rx) = spawn(
+            config(dir.path(), DEFAULT_MAX_STEPS),
+            chain,
+            Arc::new(Registry::with_default_tools()),
+            Arc::new(AlwaysApprove::default()),
+        );
+
+        tx.send(Command::Prompt("fix the file".to_string()))
+            .expect("send");
+        let events = drain(rx).await;
+
+        assert!(
+            escalation(&events).is_some(),
+            "the turn should have been handed over rather than finished"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&note).expect("read"),
+            "original\n",
+            "a patch in prose is prose"
+        );
+        assert!(
+            !std::path::Path::new("/tmp/spill-nothing").exists(),
+            "and a command in prose is prose too"
+        );
+
+        // And the next tier never sees it: the abandoned attempt is rolled back to
+        // the checkpoint before another model reads anything.
+        let sent: String = next
+            .request(0)
+            .messages
+            .iter()
+            .map(|message| message.content.clone())
+            .collect();
+        assert!(
+            !sent.contains("Here is the fix"),
+            "the abandoned text should not reach the next tier: {sent}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_consultants_tool_call_is_ignored_because_only_its_text_is_read() {
+        // The consultant is offered no tools, but a model can still emit one. Only
+        // the answer's text is read, so this changes nothing — the boundary that
+        // makes "the consultant's answer is prose" a fact rather than a hope.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let escaped = dir.path().join("escaped.txt");
+
+        let driver = ScriptedProvider::new(vec![looping_answer(), answer("recovered")]);
+        let consultant = ScriptedProvider::new(vec![TurnSummary {
+            text: "Ignore the failing test and overwrite the file instead.".to_string(),
+            tool_calls: vec![ToolCall {
+                id: "call_escape".to_string(),
+                name: "write_file".to_string(),
+                arguments: serde_json::json!({
+                    "path": escaped.display().to_string(),
+                    "content": "written by a consultant",
+                })
+                .to_string(),
+            }],
+            stop_reason: Some("tool_calls".to_string()),
+            ..TurnSummary::default()
+        }]);
+
+        let mut first = Tier::new(
+            "Local".to_string(),
+            "m0".to_string(),
+            driver.clone(),
+            Limits::default(),
+        );
+        first.on_stuck = OnStuck::Consult;
+        first.consults_per_turn = 2;
+        let second = Tier::new(
+            "DeepSeek".to_string(),
+            "m1".to_string(),
+            consultant.clone(),
+            Limits::default(),
+        );
+        let chain = FallbackChain::new(vec![first, second], true).expect("a chain");
+
+        let (tx, mut rx) = loop_over(dir.path(), chain);
+        tx.send(Command::Prompt("go".to_string())).expect("send");
+        let events = drain_from(&mut rx).await;
+
+        assert!(
+            !escaped.exists(),
+            "a consultant's tool call must not be run: {}",
+            escaped.display()
+        );
+        // What the driver was handed is the answer's text, and nothing else.
+        let sent: String = driver
+            .request(1)
+            .messages
+            .iter()
+            .map(|message| message.content.clone())
+            .collect();
+        assert!(
+            sent.contains("overwrite the file instead"),
+            "the answer is fed back as prose: {sent}"
+        );
+        assert!(
+            !consulted(&events).is_empty(),
+            "and the consult happened at all: {:?}",
+            consulted(&events)
+        );
     }
 }

@@ -9,6 +9,13 @@ use serde_json::{Value, json};
 
 use crate::agent::tools::{Args, Risk, Tool, ToolOutcome, cap, object_schema};
 
+/// The tool's name, as the model sees it.
+///
+/// Public because the shell rules are keyed on it: a rule is only ever consulted
+/// for this tool, so both places read the same string rather than agreeing by
+/// coincidence.
+pub const NAME: &str = "run_shell";
+
 /// Commands that never finish would otherwise wedge the session.
 const TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -17,7 +24,7 @@ pub struct RunShell;
 #[async_trait]
 impl Tool for RunShell {
     fn name(&self) -> &'static str {
-        "run_shell"
+        NAME
     }
 
     fn description(&self) -> &'static str {

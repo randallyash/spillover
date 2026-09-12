@@ -54,11 +54,12 @@ worth knowing about once the basics make sense.
 | --- | --- |
 | **Consult a tier instead of handing over** | Escalating changes which model you use for the rest of the session. `on_stuck = "consult"` keeps the cheap model driving and spends the big one on one narrow question, built from the raw tool error rather than from the stuck model's own account of the problem — and `/on-stuck consult` turns it on for the session without editing a file. See [Consulting instead of handing over](#consulting-instead-of-handing-over). |
 | **Plan mode** | `Shift+Tab` makes a turn read-only. Not asked for in a prompt — the write tools are withheld from the model, and a call for one is refused before it reaches your disk. See [Modes](#modes). |
-| **Commands** | `/tier`, `/escalate`, `/consult`, `/on-stuck`, `/retry`, `/drop`, `/sticky`, `/cost`, `/context`, `/compact`, `/clear`, `/undo`. Type `/` and they appear, with a description beside each. |
+| **Commands** | `/tier`, `/escalate`, `/consult`, `/on-stuck`, `/retry`, `/drop`, `/sticky`, `/allow`, `/cost`, `/context`, `/compact`, `/clear`, `/undo`. Type `/` and they appear, with a description beside each. |
 | **Cost you can see** | Tokens *and* cache reads, attributed per tier, with a sparkline of per-turn spend. A cross-tier fallback is a cache miss no design can avoid; this is where you find out what it cost. Counted per **request**, which is what a turn is made of — one per tool call, plus any spill or consult — so a turn that read four files is billed as five requests and reported as five. Cost is counted as the tier reports it rather than only off a finished response, so a tier that *failed* — stalled, looped, or stopped by you — still shows what it spent. |
 | **Session continuity** | A CLI tier keeps its own conversation across turns and receives only the new message, instead of the whole transcript being flattened into every prompt. |
 | **It remembers** | Quit and come back in the same directory and nothing is lost: the conversation, the tier you had settled on, whether one was pinned, the sticky choice, the stuck policy, and the mode. One session per workspace. `-p` neither reads nor writes one, so scripts stay stateless. See [It remembers](#it-remembers). |
-| **Undo the last write** | `/undo` puts back the file the last approved write changed, using the very bytes it showed you in the diff before it happened. It refuses when the file has moved on since, so it can never discard work done after — and it says why rather than guessing. See [Undoing a write](#undoing-a-write). |
+| **Reading runs without asking** | `ls`, `cat`, `git status`, `git diff` and the rest of the read-only set run without a prompt, because they are the shell spelling of tools spill already runs unprompted (`read_file`, `list_dir`, `glob`, `grep`). Everything else still asks. `/allow` sticks a rule of your own, and `allow_shell = []` asks about everything. See [What runs without asking](#what-runs-without-asking). |
+| **Undo, several writes deep** | `/undo` puts back the last approved write using the very bytes it showed you in the diff before it happened, and then reaches the one before it, up to ten deep or 8 MiB of remembered contents. It refuses when the file has moved on since, so it can never discard work done after — and it says how much is still behind it. See [Undoing a write](#undoing-a-write). |
 | **A handoff you can follow** | The reason a tier is being abandoned is announced *before* the move, with the tier's mark flashing in the rail, rather than appearing at the same instant as the next model's answer. Silence during a failover is how you end up distrusting it. |
 | **Judged on where it runs** | Timeouts are per class, not per tier: a model on your LAN gets 120s to load its weights and then only 30s of silence once it is streaming, where a hosted tier gets 30s and 60s. The *reason* for a stall narrows too — the same missing path three times is a stall, three different files being read is work. |
 | **Stopping a turn** | `Esc` stops it where it stands — including a tool mid-flight, so a build is killed rather than waited out — without changing which model you chose. |
@@ -728,12 +729,16 @@ single-model agent cannot offer:
 | `/retry [tier]` | Send the last turn again, here or somewhere else |
 | `/drop` | Discard the active tier's own conversation and start it fresh |
 | `/sticky <on\|off>` | Whether a spill keeps the lower tier for the session |
+| `/allow` | List the shell commands that run without asking |
+| `/allow <words>` | Run commands starting with those words without asking, for this session |
+| `/allow save <words>` | The same, and write the list into your configuration |
+| `/allow clear` | Drop this session's rules, keeping the ones in the file |
 | `/why` | Why the last tier was abandoned, counter by counter |
 | `/cost` | Tokens and cache reads so far, tier by tier |
 | `/context` | What actually gets sent on each turn, and how large it has grown |
 | `/compact` | Fold earlier turns into a short ledger to shrink what is sent |
 | `/clear` | Start a new conversation, keeping the tiers as they are |
-| `/undo` | Put back the last file an approved write changed |
+| `/undo` | Put back the newest approved write, and reach back from there |
 | `/help`, `/quit` | The obvious two |
 
 Two details that matter:
@@ -756,19 +761,20 @@ part of spilling over, so the next tier starts from something small.
 ### Undoing a write
 
 `/undo` puts back the file that the last approved write changed, using the bytes
-that were already read to show you the diff before it happened. It reaches **one
-write** and no further: after it, a second `/undo` says there is nothing to undo
-rather than working backwards through the session.
+that were already read to show you the diff before it happened — and then reaches
+back to the write before that. The stack holds **ten writes, or 8 MiB of remembered
+contents, whichever comes first**; the oldest goes when either bound is reached, so
+the newest is always reachable.
 
 ```
 > /undo
-· restored src/a.rs (412 bytes, as it was before the write_file)
+· restored src/a.rs (412 bytes, as it was before the write_file) — 2 more writes can still be put back
 
-> /undo                        # the write had created the file
-· removed src/a.rs and the 2 directories it created (created by the write_file)
+> /undo                        # the write before it had created the file
+· removed src/b.rs and the 2 directories it created (created by the write_file) — that was the last write on the stack
 
-> /undo                        # somebody edited it in the meantime
-· src/a.rs has changed since that write — leaving it alone. Nothing was changed.
+> /undo                        # somebody edited src/a.rs in the meantime
+· src/a.rs has changed since that write — leaving it alone. Nothing was changed. (2 more writes are behind it)
 ```
 
 It refuses rather than guessing: if the file is not still exactly what the write
@@ -789,18 +795,92 @@ spill   Recovered on the second tier.
 · restored src/parser.rs (2,104 bytes, as it was before the write_file)
 ```
 
-Two limits worth knowing: it reaches only the **last** write, so a model that
-scattered junk across several files needs several rounds of spilling and undoing;
-and it covers the file tools only. A `run_shell` command can do anything, so there
-is no honest way to reverse one and `/undo` will not pretend otherwise.
+Two limits worth knowing. A write it refuses stays on the stack, which means the
+ones behind it are blocked until you either put the file back by hand and retry or
+accept that entry — undoing *out of order* would be worse than being told why. And
+it covers the file tools only: a `run_shell` command can do anything, so there is no
+honest way to reverse one and `/undo` will not pretend otherwise.
+
+### What runs without asking
+
+Every tool that can change something stops and shows you what it is about to do.
+`run_shell` handed over a whole command line is the one that asks most often, so it
+has a list of commands that do not need to:
+
+```
+ls  pwd  cat  head  tail  wc  file  stat  which  du  df  tree  grep  rg
+git status  git diff  git log  git show  git branch  git blame
+git grep  git rev-parse  git describe  git shortlog
+```
+
+Those are read-only by construction, and each is the shell spelling of something
+spill already does without asking: `read_file`, `list_dir`, `glob` and `grep` run
+unprompted, so `cat` and `git status` add no reach that the agent did not have. What
+they remove is a modal. When a rule covers a command, the transcript still shows the
+command *and* says why nobody was asked:
+
+```
+· run_shell runs without asking (rule: git status)
+→ run_shell  run in ~/code:
+             git status --short
+```
+
+Everything else asks, including the commands whose *flags* can write or execute —
+`find` (`-delete`, `-exec`), `sort` (`-o`), `sed` (`-i`), `xargs`, `awk`, `make`,
+`cargo`, `npm`, `python`. Leaving them out costs a question; putting them in would be
+a hole shaped like a flag.
+
+**A rule is a prefix of words, never a pattern over the line**, and that is the whole
+design. `"git status"` is a prefix of `"git status; rm -rf ~"`, so a rule is only ever
+matched against a command that is a *bare word list*: if the line contains `;`, `&`,
+`|`, `<`, `>`, a backtick, `$`, `(`, `)`, `{`, `}`, `[`, `]`, `*`, `?`, `~`, a quote
+or a backslash, no rule can cover it and it always asks — even when the character is
+harmless inside quotes. `ls; rm -rf ~` asks. So does `FOO=bar ls`, because the first
+word is not `ls`.
+
+Yours are one command away:
+
+```
+> /allow git push              # this session only
+> /allow save cargo test       # and write it into config.toml
+> /allow                       # what is in force, and what is stuck for now
+> /allow clear                 # forget this session's rules
+```
+
+`/allow save` writes into `[general] allow_shell`, and writes *everything in force*
+rather than just the new rule, because the key **is** the list: writing one rule
+alone would drop the read-only defaults. Setting `allow_shell = []` in the file is
+how you go back to being asked about everything. The edit is surgical — one line in
+`[general]` — so every comment and every other setting in that file is left exactly as
+you wrote it.
+
+### Text is never a side effect
+
+A tier that stalls has its text thrown away: the turn is rolled back to the checkpoint
+before the next model reads anything, and the CLI's own session is dropped. That
+matters more than it sounds, because a model's prose can look exactly like an action —
+`Here is the fix:` followed by a diff, or a line that reads like a command. None of it
+is ever applied. The only thing that can change your workspace is a **structured tool
+call** that was approved and ran, and there is exactly one place in the code where one
+of those can be turned into an action.
+
+The inverse is also true, and worth knowing: a tool call that *did* complete before
+the stall is not undone by the handover. Its result is a real record, and `/undo` is
+how you take it back.
+
+One honest caveat: a delegated `cli` tier runs its own harness and its own tools in
+its own process. Spill neither parses nor replays that, and cannot withhold tools from
+a program it does not run — so if the CLI acted before the turn was abandoned, that is
+the CLI acting, not spill applying prose.
 
 ## Status
 
 Working today: configuration and validation, the terminal UI, OpenAI-compatible
 streaming with model auto-discovery, the agent loop with seven tools and approval,
 stuck detection and tier escalation, consulting a tier instead of escalating,
-build and plan modes, slash commands, session continuity for CLI tiers, sessions
-that survive a restart, `/undo`, per-class timeouts, cost reporting per tier,
+build and plan modes, slash commands, the read-only shell rule list with `/allow`,
+session continuity for CLI tiers, sessions that survive a restart, `/undo` ten writes
+deep, per-class timeouts, cost reporting per tier,
 delegated CLI tiers, the preset library, the setup wizard (which checks every tier
 before it will write), zero-config first run, `doctor`, and `-p`.
 

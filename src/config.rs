@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::allow::{READ_ONLY_SHELL, Rule};
 use crate::provider::dialect::Dialect;
 
 /// The only configuration schema this build understands.
@@ -40,6 +41,13 @@ pub enum ConfigError {
         /// Extra guidance, or empty. Static because it is one of a few fixed
         /// sentences.
         hint: &'static str,
+    },
+
+    #[error("cannot write {path}: {source}")]
+    Write {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
     },
 
     #[error("{0}")]
@@ -115,6 +123,27 @@ impl Origin {
         }
     }
 
+    /// The configuration file a command can write a rule into.
+    ///
+    /// Each way there can be no file wants different advice, so the refusal says
+    /// which one it is: not set up yet is a thing to run, and no file at all is a
+    /// thing to know.
+    pub fn writable_path(&self) -> Result<&Path, String> {
+        match self {
+            Self::Given(path) | Self::Found(path) => Ok(path),
+            Self::Missing(path) => Err(format!(
+                "there is no configuration file yet — {} would have to be created first. Run \
+                 `spill setup`, or add allow_shell = [...] under [general] yourself",
+                path.display()
+            )),
+            Self::Text => Err(
+                "this run has no configuration file to write to, so the rule is in force for \
+                 this session only"
+                    .to_string(),
+            ),
+        }
+    }
+
     /// Which origin a load produced, from the two facts it has.
     ///
     /// `required` is whether the path was named by `--config`, which is also
@@ -138,6 +167,15 @@ pub struct General {
     pub workspace: String,
     #[serde(default = "default_true")]
     pub sticky_fallback: bool,
+    /// Shell commands that may run without being asked about.
+    ///
+    /// The default is the read-only set in [`crate::allow`], and the value *is*
+    /// the list, which gives the key three honest states: absent means those,
+    /// written out means the ones you chose, and `[]` means ask about everything.
+    /// Rules added at runtime with `/allow` are not here — they last for the
+    /// session, and `/allow save` is what writes them back to this file.
+    #[serde(default = "default_allow_shell")]
+    pub allow_shell: Vec<String>,
 }
 
 impl Default for General {
@@ -145,6 +183,7 @@ impl Default for General {
         Self {
             workspace: default_workspace(),
             sticky_fallback: true,
+            allow_shell: default_allow_shell(),
         }
     }
 }
@@ -531,6 +570,111 @@ impl Default for Config {
 fn default_schema() -> u32 {
     SUPPORTED_SCHEMA
 }
+
+fn default_allow_shell() -> Vec<String> {
+    READ_ONLY_SHELL
+        .iter()
+        .map(|rule| rule.to_string())
+        .collect()
+}
+
+/// A TOML array holding the rules.
+///
+/// Every rule is a bare token — `Rule::parse` refuses quotes, backslashes and
+/// control characters — so quoting each one is the whole job.
+fn toml_array(rules: &[String]) -> String {
+    let quoted: Vec<String> = rules.iter().map(|rule| format!("{rule:?}")).collect();
+    format!("[{}]", quoted.join(", "))
+}
+
+/// The key a line sets, if it sets one: everything before its first `=`.
+fn key_of(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    if trimmed.starts_with('#') {
+        return None;
+    }
+    let (key, _) = trimmed.split_once('=')?;
+    let key = key.trim();
+    // A table header is not a key, and neither is an array element.
+    (!key.starts_with('[')).then_some(key)
+}
+
+/// The table a line opens, if it opens one: `[general]` reads as `general`.
+fn table_of(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('[') || trimmed.starts_with("[[") {
+        return None;
+    }
+    let (name, _) = trimmed.trim_start_matches('[').split_once(']')?;
+    Some(name.trim())
+}
+
+/// The line ending this file uses, so an inserted line matches the rest.
+fn ending_of(line: &str) -> &'static str {
+    if line.ends_with("\r\n") { "\r\n" } else { "\n" }
+}
+
+/// Replace the `allow_shell` line inside `[general]`, if there is one.
+///
+/// Split inclusively on the newline rather than by lines, so every byte that is
+/// not the one line comes through untouched — including the carriage returns of a
+/// file checked out on Windows.
+fn replace_allow_line(text: &str, line: &str) -> Option<String> {
+    let mut in_general = false;
+    let mut replaced = false;
+    let mut out = String::with_capacity(text.len() + line.len() + 1);
+
+    for existing in text.split_inclusive('\n') {
+        if let Some(table) = table_of(existing) {
+            in_general = table == "general";
+        } else if in_general && !replaced && key_of(existing) == Some("allow_shell") {
+            out.push_str(line);
+            out.push_str(ending_of(existing));
+            replaced = true;
+            continue;
+        }
+        out.push_str(existing);
+    }
+
+    replaced.then_some(out)
+}
+
+/// Put the line directly under the `[general]` header.
+fn insert_allow_line(text: &str, line: &str) -> Option<String> {
+    let mut inserted = false;
+    let mut out = String::with_capacity(text.len() + line.len() + 1);
+
+    for existing in text.split_inclusive('\n') {
+        out.push_str(existing);
+        if !inserted && table_of(existing) == Some("general") {
+            out.push_str(line);
+            out.push_str(ending_of(existing));
+            inserted = true;
+        }
+    }
+
+    inserted.then_some(out)
+}
+
+/// Replace a file's contents in one step, keeping the mode it already had.
+fn write_atomically(path: &Path, text: &str) -> Result<(), ConfigError> {
+    let temporary = path.with_extension("toml.tmp");
+    std::fs::write(&temporary, text).map_err(|source| ConfigError::Write {
+        path: temporary.clone(),
+        source,
+    })?;
+
+    // A configuration is not secret, but it may have been made so deliberately.
+    // Keeping the mode it had is the only choice that cannot surprise anyone.
+    if let Ok(metadata) = std::fs::metadata(path) {
+        let _ = std::fs::set_permissions(&temporary, metadata.permissions());
+    }
+
+    std::fs::rename(&temporary, path).map_err(|source| ConfigError::Write {
+        path: path.to_path_buf(),
+        source,
+    })
+}
 fn default_true() -> bool {
     true
 }
@@ -580,6 +724,43 @@ impl Config {
         Ok(config)
     }
 
+    /// Write shell rules into a configuration file, leaving every other byte
+    /// alone.
+    ///
+    /// A text edit rather than a rewrite, because this file is meant to be
+    /// written by hand, comments included: rendering a parsed `Config` back out
+    /// would silently delete every comment in it. The only line that changes is
+    /// `allow_shell` under `[general]`.
+    ///
+    /// Refuses rather than guesses. A file this build cannot parse, or one with
+    /// no `[general]` table to put the line in, is an error naming what to add by
+    /// hand — the alternative is inventing a configuration nobody wrote.
+    pub fn save_allow(path: &Path, rules: &[String]) -> Result<(), ConfigError> {
+        let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+
+        // Never write a file this build cannot read back.
+        Self::parse(path, &text)?;
+
+        for rule in rules {
+            Rule::parse(rule).map_err(ConfigError::Invalid)?;
+        }
+
+        let line = format!("allow_shell = {}", toml_array(rules));
+        let updated = replace_allow_line(&text, &line)
+            .or_else(|| insert_allow_line(&text, &line))
+            .ok_or_else(|| {
+                ConfigError::Invalid(format!(
+                    "{} has no [general] table to put allow_shell in. Add one — [general] on a                      line of its own, then allow_shell = [...] under it — or run `spill setup`.",
+                    path.display()
+                ))
+            })?;
+
+        write_atomically(path, &updated)
+    }
+
     pub fn parse(path: &Path, text: &str) -> Result<Self, ConfigError> {
         let config: Self = toml::from_str(text).map_err(|source| ConfigError::Parse {
             path: path.to_path_buf(),
@@ -601,6 +782,17 @@ impl Config {
                  workspace = 'C:\\Users\\me' — or double the backslashes."
                     .to_string(),
             ));
+        }
+
+        // A rule that cannot be matched would be a line in the file that does
+        // nothing, which is worse than a line that fails loudly: it looks like
+        // permission and behaves like a question.
+        for rule in &self.general.allow_shell {
+            if let Err(error) = Rule::parse(rule) {
+                return Err(ConfigError::Invalid(format!(
+                    "in [general] allow_shell, {rule:?} is not a rule: {error}"
+                )));
+            }
         }
 
         if self.schema != SUPPORTED_SCHEMA {
@@ -1320,5 +1512,207 @@ mod tests {
             "and the local class's own first-token budget still gets through"
         );
         assert_eq!(limits.max_repeat_run, 4);
+    }
+
+    // ---- the shell rules, and writing one back ------------------------------
+
+    #[test]
+    fn the_shell_rules_default_to_the_read_only_set_and_can_be_emptied() {
+        // The value is the list, so an absent key and an empty one mean different
+        // things and both are honest.
+        let config = parse("").expect("valid");
+        assert_eq!(config.general.allow_shell, default_allow_shell());
+        assert!(!config.general.allow_shell.is_empty());
+
+        let emptied = parse("[general]\nallow_shell = []\n").expect("valid");
+        assert!(
+            emptied.general.allow_shell.is_empty(),
+            "an empty list is how you ask about everything"
+        );
+
+        let chosen = parse("[general]\nallow_shell = [\"make\", \"git status\"]\n").expect("valid");
+        assert_eq!(
+            chosen.general.allow_shell,
+            vec!["make".to_string(), "git status".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_rule_this_build_cannot_match_is_refused_rather_than_ignored() {
+        // A rule that cannot match would look like permission and behave like a
+        // question, which is the one outcome worse than failing loudly.
+        let error = parse("[general]\nallow_shell = [\"ls; rm -rf ~\"]\n").expect_err("refused");
+
+        let message = error.to_string();
+        assert!(message.contains("allow_shell"), "{message}");
+        assert!(message.contains("cannot contain"), "{message}");
+    }
+
+    /// A configuration as a person would write it: comments, a general table, and
+    /// tiers that have nothing to do with the rules being saved.
+    const HAND_WRITTEN: &str = "\
+# my spill config, edited by hand
+schema = 1
+
+[general]
+workspace = \"~/code\"      # where the agent works
+sticky_fallback = false
+
+[[tier]]
+id = \"local\"
+kind = \"openai\"
+base_url = \"http://localhost:1234/v1\"
+
+# the one I spill to
+[[tier]]
+id = \"grok\"
+kind = \"cli\"
+preset = \"grok\"
+";
+
+    fn written(text: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, text).expect("write");
+        (dir, path)
+    }
+
+    fn saved(path: &Path) -> String {
+        std::fs::read_to_string(path).expect("read back")
+    }
+
+    #[test]
+    fn saving_a_rule_keeps_every_other_byte_of_the_file() {
+        // The whole reason this is a text edit and not a rewrite: a hand-written
+        // configuration's comments are the user's, and a serializer would delete
+        // every one of them. Asserted as exact equality, so "every other byte"
+        // means it.
+        let (_dir, path) = written(HAND_WRITTEN);
+        let rules = vec!["git status".to_string(), "ls".to_string()];
+
+        Config::save_allow(&path, &rules).expect("saved");
+
+        let expected = HAND_WRITTEN.replacen(
+            "[general]\n",
+            "[general]\nallow_shell = [\"git status\", \"ls\"]\n",
+            1,
+        );
+        assert_eq!(saved(&path), expected);
+    }
+
+    #[test]
+    fn saving_again_replaces_the_line_rather_than_growing_the_file() {
+        let (_dir, path) = written(HAND_WRITTEN);
+
+        Config::save_allow(&path, &["ls".to_string()]).expect("saved");
+        Config::save_allow(&path, &["make".to_string(), "rg".to_string()]).expect("saved again");
+
+        let text = saved(&path);
+        assert_eq!(
+            text.matches("allow_shell").count(),
+            1,
+            "one line, replaced in place: {text}"
+        );
+        assert!(text.contains("allow_shell = [\"make\", \"rg\"]"), "{text}");
+        assert!(
+            !text.contains("\"ls\""),
+            "the old value should be gone: {text}"
+        );
+    }
+
+    #[test]
+    fn a_saved_file_reads_back_as_the_rules_that_were_written() {
+        let (_dir, path) = written(HAND_WRITTEN);
+        let rules = vec!["git diff".to_string(), "cargo test".to_string()];
+
+        Config::save_allow(&path, &rules).expect("saved");
+
+        let reloaded = Config::load(Some(&path)).expect("still valid TOML");
+        assert_eq!(reloaded.general.allow_shell, rules);
+        // And the rest of the file still says what it said.
+        assert_eq!(reloaded.general.workspace, "~/code");
+        assert!(!reloaded.general.sticky_fallback);
+        assert_eq!(reloaded.tiers.len(), 2);
+    }
+
+    #[test]
+    fn the_line_endings_the_file_already_uses_are_kept() {
+        // The same file checked out on Windows. A rewrite that normalised these
+        // would show up in every diff the user has.
+        let (_dir, path) = written(&HAND_WRITTEN.replace('\n', "\r\n"));
+
+        Config::save_allow(&path, &["ls".to_string()]).expect("saved");
+
+        let text = saved(&path);
+        let expected = HAND_WRITTEN.replace('\n', "\r\n").replacen(
+            "[general]\r\n",
+            "[general]\r\nallow_shell = [\"ls\"]\r\n",
+            1,
+        );
+        assert_eq!(text, expected);
+    }
+
+    #[test]
+    fn saving_refuses_a_file_it_cannot_place_the_line_in() {
+        // No [general] table to add to. Guessing would mean inventing a
+        // configuration nobody wrote, so it says what to do instead.
+        let (_dir, path) = written("schema = 1\n");
+
+        let error = Config::save_allow(&path, &["ls".to_string()]).expect_err("refused");
+        assert!(error.to_string().contains("[general]"), "{error}");
+        assert_eq!(saved(&path), "schema = 1\n", "nothing was written");
+    }
+
+    #[test]
+    fn saving_refuses_a_file_this_build_cannot_read_back() {
+        // Writing a file the next start cannot parse would break spill for a
+        // change that was supposed to be a convenience.
+        let broken = "this is not toml\n";
+        let (_dir, path) = written(broken);
+
+        assert!(Config::save_allow(&path, &["ls".to_string()]).is_err());
+        assert_eq!(saved(&path), broken, "nothing was written");
+    }
+
+    #[test]
+    fn saving_refuses_a_rule_that_is_not_a_rule() {
+        let (_dir, path) = written(HAND_WRITTEN);
+
+        assert!(Config::save_allow(&path, &["ls | rm -rf ~".to_string()]).is_err());
+        assert_eq!(saved(&path), HAND_WRITTEN, "nothing was written");
+    }
+
+    #[test]
+    fn saving_refuses_a_file_that_is_not_there() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nothing.toml");
+
+        assert!(Config::save_allow(&path, &["ls".to_string()]).is_err());
+        assert!(!path.exists(), "no file should have been created");
+    }
+
+    #[test]
+    fn a_general_table_with_a_comment_on_it_is_still_found() {
+        // The header is matched on its name, not on the line, so an explanation
+        // beside it does not hide the table.
+        let (_dir, path) = written("# top\n[general] # mine\nworkspace = \"~\"\n");
+
+        Config::save_allow(&path, &["ls".to_string()]).expect("saved");
+        assert_eq!(
+            saved(&path),
+            "# top\n[general] # mine\nallow_shell = [\"ls\"]\nworkspace = \"~\"\n"
+        );
+    }
+
+    #[test]
+    fn a_key_whose_name_merely_starts_with_allow_shell_is_left_alone() {
+        // Matching on the key rather than on the text, so nothing else gets
+        // overwritten by accident.
+        let (_dir, path) = written("[general]\nallow_shell_extra = 1\nworkspace = \"~\"\n");
+
+        Config::save_allow(&path, &["ls".to_string()]).expect("saved");
+        let text = saved(&path);
+        assert!(text.contains("allow_shell_extra = 1"), "{text}");
+        assert!(text.contains("allow_shell = [\"ls\"]"), "{text}");
     }
 }

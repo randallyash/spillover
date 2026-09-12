@@ -43,7 +43,7 @@ use crate::agent::approval::testing::AlwaysApprove;
 use crate::agent::tools::Registry;
 use crate::agent::{AgentConfig, AgentEvent, Canceller, Command, DEFAULT_MAX_STEPS};
 use crate::app::App;
-use crate::config::{Config, Limits, OnStuck};
+use crate::config::{Config, Limits, OnStuck, Origin};
 use crate::fallback::{FallbackChain, Tier};
 use crate::provider::openai::OpenAiProvider;
 use crate::provider::{Provider, Usage};
@@ -324,6 +324,11 @@ async fn run_turn(workspace: &std::path::Path, chain: FallbackChain) -> Vec<Agen
             // Nothing about this fixture is about surviving a restart.
             store: None,
             log: None,
+            // A fixture, so it behaves as though the configuration said nothing:
+            // no rule covers anything, and there is no file for `/allow save` to
+            // write to. The tests that are about either set what they need.
+            allow_shell: Vec::new(),
+            origin: Origin::default(),
         },
         chain,
         Arc::new(Registry::with_default_tools()),
@@ -1005,6 +1010,11 @@ async fn a_write_made_through_the_loop_can_be_put_back() {
             cancel: Canceller::default(),
             store: None,
             log: None,
+            // A fixture, so it behaves as though the configuration said nothing:
+            // no rule covers anything, and there is no file for `/allow save` to
+            // write to. The tests that are about either set what they need.
+            allow_shell: Vec::new(),
+            origin: Origin::default(),
         },
         chain,
         Arc::new(Registry::with_default_tools()),

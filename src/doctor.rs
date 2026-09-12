@@ -9,10 +9,12 @@ use std::time::Instant;
 
 use serde_json::json;
 
+use crate::allow::AllowRules;
 use crate::config::{Config, Limits, OnStuck, Origin, TierClass, TierKind};
 use crate::preset::{Library, cli_spec, openai_settings};
 use crate::provider::cli::{CliSpec, which};
 use crate::setup::probe;
+use crate::text::pack;
 
 /// What a `cli` tier resolved to, which is the half of it that is not visible
 /// anywhere else.
@@ -159,6 +161,12 @@ pub struct Report {
     /// removed from anything.
     pub credentials: Option<Credentials>,
     pub machine: Machine,
+    /// Which shell commands run without being asked about.
+    ///
+    /// Reported because a rule is invisible by design — the whole point is that
+    /// nothing stops to say so — which makes "why did that run without asking
+    /// me?" a question only the report can answer.
+    pub allow: AllowRules,
 }
 
 impl Report {
@@ -261,6 +269,14 @@ impl Report {
             out.push_str(&render_credentials(credentials));
         }
 
+        // Only when it is not what a configuration saying nothing would give,
+        // on the same reasoning as the stuck policy above: twenty-three lines
+        // reciting the defaults would drown the tier list they sit under.
+        if !self.allow.is_default() {
+            out.push('\n');
+            out.push_str(&self.render_allow());
+        }
+
         out.push('\n');
         out.push_str(&self.render_machine());
 
@@ -305,6 +321,14 @@ impl Report {
             width = LABEL_WIDTH
         ));
         out
+    }
+
+    /// What runs without being asked about.
+    fn render_allow(&self) -> String {
+        let rules = self.allow.texts();
+        let mut out = String::from("runs without asking:\n");
+        out.push_str(&pack(rules.iter().map(String::as_str), "  ", REPORT_WIDTH));
+        out.trim_end().to_string()
     }
 
     /// What this machine gives the interface.
@@ -376,6 +400,10 @@ impl Report {
                 })),
                 "colours": self.machine.colours,
                 "noColor": self.machine.no_color,
+            },
+            "allowShell": {
+                "rules": self.allow.texts(),
+                "default": self.allow.is_default(),
             },
         });
         serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
@@ -477,45 +505,17 @@ fn render_credentials(credentials: &Credentials) -> String {
          before they start — a key exported for another tier cannot change\nwhose account is \
          billed:\n",
     );
-    out.push_str(&wrapped(&credentials.removed, "  ", REPORT_WIDTH));
+    out.push_str(&pack(
+        credentials.removed.iter().copied(),
+        "  ",
+        REPORT_WIDTH,
+    ));
 
     if !credentials.set.is_empty() {
         out.push_str(&format!(
             "  * set here right now, so this is the removal doing something: {}\n",
             credentials.set.join(" ")
         ));
-    }
-
-    out
-}
-
-/// Names filled into lines of at most `width` columns.
-///
-/// The credential list is the only thing here long enough to need it, and it is
-/// also the only thing a reader greps: wrapped, every name is still one word on
-/// one line, and the block stays readable at any terminal size.
-fn wrapped(names: &[&str], indent: &str, width: usize) -> String {
-    let mut out = String::new();
-    let mut line = String::new();
-
-    for name in names {
-        let would_be = indent.len() + line.len() + 1 + name.len();
-        if !line.is_empty() && would_be > width {
-            out.push_str(indent);
-            out.push_str(&line);
-            out.push('\n');
-            line.clear();
-        }
-        if !line.is_empty() {
-            line.push(' ');
-        }
-        line.push_str(name);
-    }
-
-    if !line.is_empty() {
-        out.push_str(indent);
-        out.push_str(&line);
-        out.push('\n');
     }
 
     out
@@ -583,6 +583,7 @@ pub async fn diagnose(library: &Library, config: &Config) -> Report {
         sticky_fallback: config.general.sticky_fallback,
         credentials,
         machine: Machine::detect(),
+        allow: AllowRules::new(&config.general.allow_shell),
     }
 }
 
@@ -623,6 +624,12 @@ mod tests {
             sticky_fallback: true,
             credentials: None,
             machine: machine(),
+            allow: AllowRules::new(
+                &crate::allow::READ_ONLY_SHELL
+                    .iter()
+                    .map(|r| r.to_string())
+                    .collect::<Vec<_>>(),
+            ),
         }
     }
 
@@ -1373,5 +1380,73 @@ mod tests {
         .await;
 
         assert!(report.tiers[0].cli.is_none());
+    }
+
+    // ---- what runs without being asked --------------------------------------
+
+    #[test]
+    fn the_rules_are_printed_only_when_they_are_not_the_defaults() {
+        // Twenty-three lines reciting the read-only defaults would drown the tier
+        // list they sit under, so prose shows a *choice* — the same reasoning as
+        // the stuck policy. The JSON carries it either way.
+        let text = report(vec![tier("local", true)]).render();
+        assert!(!text.contains("runs without asking"), "{text}");
+
+        let mut chosen = report(vec![tier("local", true)]);
+        chosen.allow = AllowRules::new(&["make".to_string(), "cargo test".to_string()]);
+        let text = chosen.render();
+        assert!(text.contains("runs without asking"), "{text}");
+        assert!(text.contains("cargo test"), "{text}");
+        assert!(
+            !text.contains("git status"),
+            "and not the defaults it replaced: {text}"
+        );
+    }
+
+    #[test]
+    fn the_json_carries_the_rules_and_whether_they_are_the_defaults() {
+        // The question a rule answers badly is "why did that run without asking
+        // me?", and a script asking it should not have to guess from a missing
+        // line — the same reason `onStuck` is carried for every tier.
+        let mut chosen = report(vec![tier("local", true)]);
+        chosen.allow = AllowRules::new(&["git status".to_string()]);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&chosen.to_json()).expect("valid JSON");
+
+        assert_eq!(parsed["allowShell"]["default"], false);
+        assert_eq!(parsed["allowShell"]["rules"][0], "git status");
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&report(vec![tier("local", true)]).to_json()).expect("valid JSON");
+        assert_eq!(parsed["allowShell"]["default"], true);
+        assert_eq!(
+            parsed["allowShell"]["rules"].as_array().map(Vec::len),
+            Some(crate::allow::READ_ONLY_SHELL.len())
+        );
+    }
+
+    #[tokio::test]
+    async fn the_report_reads_the_rules_out_of_the_configuration() {
+        let library = Library::embedded();
+
+        let chosen = diagnose(
+            &library,
+            &config("[general]\nallow_shell = [\"make\", \"git status\"]\n"),
+        )
+        .await;
+        assert_eq!(
+            chosen.allow.texts(),
+            vec!["make".to_string(), "git status".to_string()]
+        );
+        assert!(!chosen.allow.is_default());
+
+        // And the empty list — the way to ask about everything — is a choice too.
+        let emptied = diagnose(&library, &config("[general]\nallow_shell = []\n")).await;
+        assert!(emptied.allow.texts().is_empty());
+        assert!(!emptied.allow.is_default());
+        assert!(
+            !emptied.render().contains("runs without asking"),
+            "nothing runs unasked, so there is no list to print"
+        );
     }
 }
