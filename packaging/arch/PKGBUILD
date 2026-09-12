@@ -11,7 +11,7 @@
 # and confirm the version and the URLs match the tag you are packaging.
 
 pkgname=spill-bin
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc="Agentic AI TUI that runs your local model first and spills over when it stalls"
 arch=('x86_64' 'aarch64')
@@ -19,16 +19,16 @@ url="https://github.com/randallyash/spillover"
 license=('MIT')
 depends=('glibc' 'gcc-libs')
 provides=('spill')
-conflicts=('spill', 'spill-bin-git')
+conflicts=('spill' 'spill-bin-git')
 options=('!strip')
 
 _base="https://github.com/randallyash/spillover/releases/download/v${pkgver}"
 source_x86_64=("spill-${pkgver}-x86_64.tar.xz::${_base}/spill-x86_64-unknown-linux-gnu.tar.xz")
 source_aarch64=("spill-${pkgver}-aarch64.tar.xz::${_base}/spill-aarch64-unknown-linux-gnu.tar.xz")
 
-# Checksums from the v0.1.0 release. `updpkgsums` refreshes them for a new one.
-sha256sums_x86_64=('131e5af7df3bea135b5979c043ca6b0d51f77691f4fb57ed855939964af3035f')
-sha256sums_aarch64=('5c58ce513e7407749942a4312941bb8e94f88c97c14f905a437b3eb4075f200c')
+# Checksums from the v0.1.1 release. `updpkgsums` refreshes them for a new one.
+sha256sums_x86_64=('44d0c4dab52be3a6a5415f3d75be4531336761a9f66c73cd620755cd06407dad')
+sha256sums_aarch64=('24e8aff16a70aae9d7dba6f055e47ab36fc94e4e1d95e2582006cbb545a7615f')
 
 package() {
   # The archive holds the binary and its documentation, at the top level.
