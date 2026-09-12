@@ -4,6 +4,73 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`/why`: the stall call, made inspectable.** Handing a turn to another model is the
+  one decision spill makes on its own, so it is the one that has to be arguable — a
+  user who cannot tell why their turn was taken away will turn the fallback off. The
+  reason was already in the transcript; what was missing was everything behind it. The
+  detectors kept their counts privately and threw them away at the threshold, so the
+  verdict existed and the evidence did not.
+
+  Now every attempt carries a verdict, and `/why` prints the counters it was decided
+  from — including the ones that never fired, which are usually the interesting ones.
+  A classic case it makes visible: the *same* tool failure three times trips a budget
+  of three while the tier's own allowance is four, and nothing on screen would ever
+  have said so.
+
+- **A one-line warning when a turn nearly spilled instead of answering.** A near miss
+  is the only evidence that a threshold is right — too tight costs a turn, too loose
+  never catches anything — and a silent one teaches nothing. Any counted signal one
+  short of its allowance fires it, as does a wait that used four fifths of its own
+  budget. The report says "3 of 4" rather than explaining what would have happened,
+  because it lands mid-transcript and has to stay one line.
+
+- **A spill log.** One stall is answered by `/why`; a pattern of them is answered by
+  `~/.local/state/spill/spills.jsonl`, one JSON record per line with the trigger, both
+  tier ids, whether a consult or a handover ran, and every counter including the
+  allowances they were measured against. `trigger` is a stable token rather than a
+  prose summary, so the file can be grouped by it — matching on wording that exists to
+  read well is how a log stops working the first time a message is reworded. A turn
+  that stalled with no tier below is logged as `"ended"` rather than skipped, because
+  that is the only ending a single-tier setup can have and its thresholds are the ones
+  most worth tuning. A log that cannot be written is reported once and does not stop
+  the turn: thresholds tuned from a file that has quietly stopped growing are worse
+  than no file.
+
+- **The watchdog now knows how close it came, not just that it waited.** A gap is
+  judged against the allowance that applied *to it* rather than the other one, because
+  eight seconds is unremarkable against a local tier's two-minute first-token budget
+  and nearly fatal against its thirty-second idle one. The gap between one request's
+  last frame and the next one's first is deliberately not counted: it contains the tool
+  call that ran in between, which can be minutes long and says nothing about the model.
+
+- Both samples in the README — the `/why` report and the log record — are pinned by
+  tests against the real output, so the documentation cannot drift from the program.
+
+### Fixed
+
+- **A spill record was written in many small pieces, so two processes spilling at
+  once spliced their records together.** The append is atomic, but only for a single
+  write, and `Display` for a JSON value emits in pieces — each of which became its own
+  `write` on a shared file. The record is now whole before it reaches the file, so
+  every line is one JSON object however many `spill` processes are running. Found in
+  this project's own log, which had two records interleaved character by character.
+
+- **The test suite wrote to the real spill log of whoever ran it.** A test drives the
+  real one-shot path, and that path resolved the log from the platform's state
+  directory — so `cargo test` appended to `~/.local/state/spill/spills.jsonl`, from
+  several threads at once. The path is now injectable, and the test helper points at a
+  temporary directory. The failure was the worst kind: a green suite quietly filling a
+  file the user is meant to be tuning thresholds from.
+
+- **The command menu's row ceiling was a hard-coded 14.** Derived from the catalogue
+  instead: the two drifting apart is exactly how a command becomes unreachable, which
+  is what a hard-coded 12 did to `/quit` once already. The menu scrolls, so nothing was
+  actually lost — but adding a command should not be what puts another out of sight.
+
 ## [0.1.2] - 2026-09-12
 
 ### Added
@@ -309,8 +376,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   overlay has the keys, and cut short past 100,000 characters with a note, since
   a stray clipboard can hold a whole file.
 
-### Added
-
 - **Consult is a command, not just a config key.** It was the interesting new
   mechanic and it was buried in TOML: the only way to try it was to edit a file
   and restart. `/on-stuck escalate|consult` now switches every tier for the rest
@@ -486,8 +551,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   session is dropped with it, so nothing resumes a conversation that no longer
   exists in that form. When a tier is abandoned and the session has grown past a
   few turns, this happens by itself, so the incoming tier's cold read is small.
-
-### Changed
 
 - The interface is composed for the work rather than boxed off. The tier chain is now a
   status rail across the top, with the answering tier drawn as a filled block, tiers that

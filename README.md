@@ -269,6 +269,74 @@ you     explain the parser
 spill   Recovered on the second tier.
 ```
 
+### Why it gave up, in numbers
+
+Handing a turn to another model is the one decision spill makes on its own, so it is
+the one that has to be arguable. `/why` prints every counter the verdict was made
+from — including the ones that never fired, which are usually the interesting ones:
+
+```
+> /why
+Looping Local was abandoned: read_file failed 3 times with the same error (no such file)
+
+decided from:
+  steps       6 of 12 used
+  repeated    1 identical line(s) in a row, allowed 4
+  spans       worst recurring span seen 1 time(s), allowed 4
+  calls       1 identical call(s) in a row, allowed 4
+  failures    3 in a row, allowed 4
+  same error  no such file x3 (budget 3)
+  silence     worst 0.3s of a 30.0s idle allowance
+  budgets     120.0s first token, 30.0s idle, rate limited at 4 repeats
+```
+
+Note the third line: the *same* failure three times tripped a budget of three while
+the tier's own allowance was four. That kind of thing is invisible without the numbers,
+and it is exactly what gets tuned.
+
+A turn that **stayed** can still have been close, and a near miss nobody is told about
+teaches nothing about whether a threshold is right, so a one-line warning says so:
+
+```
+·       nearly spilled · Local repeated the same line 3 of 4 times · /why
+```
+
+**Every spill is appended to a log**, because one stall is answered by `/why` and a
+pattern of them is answered by the file. On Linux that is
+`~/.local/state/spill/spills.jsonl`, one JSON record per line. This is a real record,
+not a tidied-up one:
+
+```json
+{"at":"2026-09-12T10:00:00Z","calls":{"allowed":4,"class":"no such file","failures":3,"identical":1,"same_error":3},"from":"local","policy":"escalate","reason":"read_file failed 3 times with the same error (no such file)","repeats":{"allowed":4,"lines":1,"span":1},"steps":{"allowed":12,"used":6},"to":"frontier","trigger":"same_tool_error","turn":7,"wait":{"allowance_ms":30000,"first_token_ms":120000,"idle_ms":30000,"phase":"idle","worst_ms":300}}
+```
+
+`trigger` is a stable token rather than the prose summary, so the file can be grouped
+and counted by it — matching on prose is how a log quietly stops working the first
+time a message is reworded. `policy` says whether a handover or a consult actually
+ran, or `"ended"` for a turn that stalled with no tier below it. That last case is
+logged deliberately: a single-tier setup can only ever end that way, and those are the
+thresholds most worth tuning.
+
+Every counter is in there, including the allowances they were measured against, which
+is the point — a count means nothing without the number it was supposed to stay under.
+Since it is JSON Lines, `jq` does the reading:
+
+```sh
+# every spill in this log, newest last, one line each
+jq -r '"\(.at) \(.from) -> \(.to // "nowhere") [\(.policy)] \(.trigger): \(.reason)"' \
+  ~/.local/state/spill/spills.jsonl
+
+# how often each trigger is what abandoned a turn
+jq -r .trigger ~/.local/state/spill/spills.jsonl | sort | uniq -c | sort -rn
+```
+
+A record is written in one piece, so several `spill` processes spilling at the same
+moment cannot splice their lines together — an append is atomic against other appends,
+but only for a single write.
+
+If the log cannot be written, spill says so once and carries on: thresholds being
+tuned from a file that has quietly stopped growing is worse than having no file.
+
 Three things worth knowing:
 
 - The abandoned tier's **conversation is discarded**, so the next tier never inherits
@@ -591,6 +659,7 @@ single-model agent cannot offer:
 | `/retry [tier]` | Send the last turn again, here or somewhere else |
 | `/drop` | Discard the active tier's own conversation and start it fresh |
 | `/sticky <on\|off>` | Whether a spill keeps the lower tier for the session |
+| `/why` | Why the last tier was abandoned, counter by counter |
 | `/cost` | Tokens and cache reads so far, tier by tier |
 | `/context` | What actually gets sent on each turn, and how large it has grown |
 | `/compact` | Fold earlier turns into a short ledger to shrink what is sent |

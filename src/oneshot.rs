@@ -15,6 +15,7 @@ use crate::agent::{AgentConfig, AgentEvent};
 use crate::config::Config;
 use crate::preset::Library;
 use crate::provider::Usage;
+use crate::stalls::SpillLog;
 
 /// Exit codes, matching what the shell and CI expect.
 pub const EXIT_OK: i32 = 0;
@@ -27,6 +28,13 @@ pub struct Options {
     pub json: bool,
     /// Let the model write files and run commands without asking.
     pub yolo: bool,
+    /// Where spills are recorded, or `None` for the platform's state directory.
+    ///
+    /// Injectable because the alternative was found the hard way: a test that
+    /// runs this path wrote to the real spill log of whoever ran the suite, from
+    /// several threads at once. Anything that reaches the filesystem needs a way
+    /// to be pointed somewhere disposable.
+    pub log: Option<SpillLog>,
 }
 
 /// What the run produced, for the caller to print.
@@ -38,6 +46,12 @@ pub struct Outcome {
     /// The tier that answered, and any the run spilled through on the way.
     pub answered_by: Option<String>,
     pub escalations: Vec<String>,
+    /// Tiers that came within one step of being abandoned and were not.
+    ///
+    /// Reported to a script for the same reason it is shown in the interface: a
+    /// near miss is the evidence that a threshold is either about to cost
+    /// somebody a turn or is set too loosely to ever catch anything.
+    pub near_misses: Vec<String>,
     pub failure: Option<String>,
 }
 
@@ -56,6 +70,7 @@ impl Outcome {
             "stopReason": self.stop_reason,
             "answeredBy": self.answered_by,
             "escalations": self.escalations,
+            "nearMisses": self.near_misses,
             "usage": self.usage.map(|usage| json!({
                 "inputTokens": usage.prompt_tokens,
                 "outputTokens": usage.completion_tokens,
@@ -66,6 +81,11 @@ impl Outcome {
         });
         serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
     }
+}
+
+/// The spill log in the platform's state directory, when there is one.
+fn default_log() -> Option<SpillLog> {
+    SpillLog::default_path().map(SpillLog::at)
 }
 
 /// Run one prompt to completion through the tier chain.
@@ -107,6 +127,10 @@ pub async fn run(library: &Library, config: &Config, options: &Options) -> Outco
             // and a script that picked up yesterday's conversation because it
             // happened to run in the same directory would be a trap.
             store: None,
+            // The spill log is a different question, and gets the same answer as
+            // the interactive path: a script whose turn was handed to another
+            // model is exactly the case nobody is watching to notice.
+            log: options.log.clone().or_else(default_log),
         },
         chain,
         Arc::new(Registry::with_default_tools()),
@@ -147,6 +171,13 @@ pub async fn run(library: &Library, config: &Config, options: &Options) -> Outco
             AgentEvent::Finished { stop_reason } => {
                 outcome.stop_reason = stop_reason;
                 break;
+            }
+            // The counters behind a stall go to the spill log, which is where a
+            // script can read them; what a pipeline needs on the stream is the
+            // move, which `Escalated` and `Consulted` already carry.
+            AgentEvent::Stalled { .. } => {}
+            AgentEvent::AlmostStalled { tier, miss } => {
+                outcome.near_misses.push(format!("{tier} {}", miss.sentence()));
             }
             AgentEvent::Exhausted { reason } => {
                 outcome.failure = Some(format!("no tier could answer: {reason}"));
@@ -251,12 +282,39 @@ mod tests {
         ))
     }
 
+    /// Options whose spill log goes to a temporary directory.
+    ///
+    /// Never the platform default: these tests run the real one-shot path, and
+    /// writing to the state directory of whoever is running the suite means a
+    /// test run silently fills their log — which is what happened.
     fn options(prompt: &str) -> Options {
+        static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        let dir = DIR.get_or_init(|| tempfile::tempdir().expect("tempdir"));
         Options {
             prompt: prompt.to_string(),
             json: false,
             yolo: false,
+            log: Some(SpillLog::at(dir.path().join("spills.jsonl"))),
         }
+    }
+
+    #[test]
+    fn the_test_options_never_point_at_the_real_log() {
+        // The guard for the bug this file caused: these tests run the real
+        // one-shot path, so the only thing standing between a test run and the
+        // spill log of whoever runs it is this helper. Pinned because the
+        // failure is invisible — a green suite that quietly appends to a file
+        // the user is tuning from.
+        let options = options("anything");
+        let chosen = options.log.as_ref().expect("the helper sets a log");
+        let real = SpillLog::default_path();
+
+        assert!(chosen.path().is_absolute(), "{}", chosen.path().display());
+        assert_ne!(
+            Some(chosen.path().to_path_buf()),
+            real,
+            "a test would write to the real spill log"
+        );
     }
 
     #[tokio::test]

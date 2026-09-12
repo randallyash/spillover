@@ -318,6 +318,7 @@ async fn run_turn(workspace: &std::path::Path, chain: FallbackChain) -> Vec<Agen
             cancel: Canceller::default(),
             // Nothing about this fixture is about surviving a restart.
             store: None,
+            log: None,
         },
         chain,
         Arc::new(Registry::with_default_tools()),
@@ -988,6 +989,7 @@ async fn a_write_made_through_the_loop_can_be_put_back() {
             max_steps: DEFAULT_MAX_STEPS,
             cancel: Canceller::default(),
             store: None,
+            log: None,
         },
         chain,
         Arc::new(Registry::with_default_tools()),

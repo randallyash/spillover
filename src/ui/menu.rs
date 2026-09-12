@@ -24,13 +24,19 @@ use crate::ui::theme::Theme;
 /// that can be spared.
 const MENU_MAX_WIDTH: u16 = 96;
 const MENU_MIN_WIDTH: u16 = 40;
-/// Rows of menu, before it starts scrolling.
+/// Rows of menu before it starts scrolling: one more than the catalogue holds.
+///
+/// Derived from the catalogue rather than written down, because the two drifting
+/// apart is exactly how a command becomes unreachable without anyone noticing —
+/// a hard-coded 12 once hid `/quit` the same way. The menu scrolls, so a command
+/// below the fold is still reachable; the point of the extra row is that adding
+/// one should not be what puts another out of sight.
 ///
 /// A ceiling rather than a target: what actually decides is the room above the
-/// prompt, so the menu never pushes the conversation off screen. It is one more
-/// than the catalogue needs, so a command added later shows up rather than
-/// silently scrolling out of reach.
-const MENU_MAX_ROWS: usize = 14;
+/// prompt, so the menu never pushes the conversation off screen.
+fn menu_max_rows() -> usize {
+    commands::CATALOGUE.len() + 1
+}
 
 /// The command menu, sitting on top of the prompt.
 pub fn render_menu(frame: &mut Frame, area: Rect, app: &App, theme: &Theme, prompt: Rect) {
@@ -47,7 +53,7 @@ pub fn render_menu(frame: &mut Frame, area: Rect, app: &App, theme: &Theme, prom
     // space between the top of the frame and the prompt, so the menu cannot
     // cover the prompt it belongs to.
     let above = prompt.y.saturating_sub(area.y).saturating_sub(3).max(1) as usize;
-    let rows = matches.len().min(MENU_MAX_ROWS).min(above).max(1);
+    let rows = matches.len().min(menu_max_rows()).min(above).max(1);
     let height = rows as u16 + 3;
 
     // Sits directly above the prompt when there is room, and drops to the

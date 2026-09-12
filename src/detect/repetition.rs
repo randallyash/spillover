@@ -15,6 +15,22 @@ const MAX_TRACKED: usize = 4_096;
 /// Repeats below this are not a loop, whatever the configuration says.
 const MIN_THRESHOLD: usize = 2;
 
+/// What the detector has seen so far.
+///
+/// The counts are kept rather than only the verdict, because "it looped" and
+/// "how close did it come" are different questions and only the second one can
+/// be tuned. A verdict thrown away at the threshold leaves nothing to read after
+/// the fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepetitionCounters {
+    /// The run of identical consecutive lines currently standing.
+    pub consecutive: usize,
+    /// The worst count any single 12-token span has reached.
+    pub span_repeats: usize,
+    /// The configured threshold both of those are measured against.
+    pub threshold: usize,
+}
+
 pub struct RepetitionDetector {
     threshold: usize,
     /// Text seen since the last complete line, which may be split mid-word.
@@ -34,6 +50,19 @@ impl RepetitionDetector {
             consecutive: 0,
             recent_tokens: VecDeque::new(),
             span_counts: HashMap::new(),
+        }
+    }
+
+    /// How close it came, for a turn that ended without looping.
+    ///
+    /// `span_repeats` is the worst any one span reached rather than the count for
+    /// the span that happens to be current, because that is the figure that says
+    /// how near a loop the answer wandered.
+    pub fn counters(&self) -> RepetitionCounters {
+        RepetitionCounters {
+            consecutive: self.consecutive,
+            span_repeats: self.span_counts.values().copied().max().unwrap_or(0),
+            threshold: self.threshold,
         }
     }
 

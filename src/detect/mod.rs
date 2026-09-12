@@ -8,7 +8,7 @@ pub mod progress;
 pub mod repetition;
 
 use std::fmt;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::config::Limits;
 use crate::detect::repetition::RepetitionDetector;
@@ -209,6 +209,59 @@ impl fmt::Display for StuckReason {
     }
 }
 
+/// Which of the two allowances was in force at the end of an attempt.
+///
+/// Worth naming, because the same silence means opposite things either side of
+/// the first frame: before it, a model may still be loading its weights; after
+/// it, a stream that has stopped has stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    /// Nothing had arrived yet.
+    FirstToken,
+    /// Something had arrived, and then it went quiet.
+    Idle,
+}
+
+impl fmt::Display for Phase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::FirstToken => "first token",
+            Self::Idle => "idle",
+        })
+    }
+}
+
+/// How the waiting went, for a turn that ended either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timing {
+    /// The gap that came closest to its own allowance.
+    pub worst_gap_ms: u64,
+    /// The allowance that gap was measured against — not the other one. A long
+    /// start is normal against the first-token budget and nearly fatal against
+    /// the idle one, so the pair is the only honest way to say how close it was.
+    pub worst_allowance_ms: u64,
+    pub first_token_ms: u64,
+    pub idle_ms: u64,
+    /// The budget the worst gap was measured against.
+    ///
+    /// The phase that applied *to that wait*, not the one in force when the
+    /// attempt ended: those are different, and pairing a gap with the other
+    /// budget's name is how a report ends up calling a ten-second first-token
+    /// allowance an idle one.
+    pub worst_phase: Phase,
+}
+
+impl Timing {
+    /// How much of its own allowance the worst wait used.
+    ///
+    /// `None` when nothing was ever waited on, which is not the same as a wait of
+    /// zero and must not read as a near miss.
+    pub fn worst_fraction(&self) -> Option<f64> {
+        (self.worst_allowance_ms > 0)
+            .then(|| self.worst_gap_ms as f64 / self.worst_allowance_ms as f64)
+    }
+}
+
 /// Watches one streaming attempt for signs that it has gone wrong.
 ///
 /// Two different allowances matter: before anything has arrived, a slow start is
@@ -219,6 +272,18 @@ pub struct Watchdog {
     first_token: Duration,
     idle: Duration,
     alive: bool,
+    /// When the current request began, for measuring the wait for its first frame.
+    started: Instant,
+    /// When the last frame of this request arrived, or `None` before any has.
+    ///
+    /// Cleared per request rather than carried across: the gap between one
+    /// request's last frame and the next one's first would otherwise include the
+    /// tool call that ran in between, which can be minutes long and has nothing
+    /// to do with how the model is behaving.
+    last_frame: Option<Instant>,
+    /// The gap that came closest to its own allowance, that allowance, and the
+    /// budget the two of them belong to.
+    worst: Option<(Duration, Duration, Phase)>,
 }
 
 impl Watchdog {
@@ -228,6 +293,82 @@ impl Watchdog {
             first_token: Duration::from_millis(limits.first_token_timeout_ms),
             idle: Duration::from_millis(limits.idle_timeout_ms),
             alive: false,
+            started: Instant::now(),
+            last_frame: None,
+            worst: None,
+        }
+    }
+
+    /// Start timing one request, keeping what is already known about the tier.
+    ///
+    /// `alive` deliberately survives: a server that answered once is warm, so
+    /// the next request gets the shorter idle budget rather than the generous
+    /// first-token one again. The worst wait survives too — it is the attempt's
+    /// figure, and an attempt is several requests.
+    pub fn begin_request(&mut self) {
+        self.started = Instant::now();
+        self.last_frame = None;
+    }
+
+    /// How the waiting went.
+    pub fn timing(&self) -> Timing {
+        let (gap, allowance, phase) =
+            self.worst
+                .unwrap_or((Duration::ZERO, Duration::ZERO, Phase::FirstToken));
+        Timing {
+            worst_gap_ms: gap.as_millis() as u64,
+            worst_allowance_ms: allowance.as_millis() as u64,
+            first_token_ms: self.first_token.as_millis() as u64,
+            idle_ms: self.idle.as_millis() as u64,
+            worst_phase: phase,
+        }
+    }
+
+    /// Any frame at all, which is what keeps a request from being a stall.
+    ///
+    /// The gap is measured here rather than by a timer because this is the only
+    /// moment the figure is knowable: how long the silence lasted is the time
+    /// since the last frame, or since the request began when there has not been
+    /// one yet.
+    fn touch(&mut self) {
+        let now = Instant::now();
+        let since = self.last_frame.unwrap_or(self.started);
+        // Read before `alive` is set: the budget that applied *during* the wait
+        // is the one the wait should be judged and named against.
+        let allowance = self.allowance();
+        let phase = self.phase();
+        let gap = now.saturating_duration_since(since);
+        self.remember(gap, allowance, phase);
+        self.last_frame = Some(now);
+        self.alive = true;
+    }
+
+    fn remember(&mut self, gap: Duration, allowance: Duration, phase: Phase) {
+        let closer = match self.worst {
+            None => true,
+            Some((best, best_allowance, _)) => {
+                fraction(gap, allowance) > fraction(best, best_allowance)
+            }
+        };
+        if closer {
+            self.worst = Some((gap, allowance, phase));
+        }
+    }
+
+    /// A wait that ran out. The gap is the whole allowance, by definition.
+    pub fn timed_out(&mut self, waited: Duration) -> StuckReason {
+        let allowance = self.allowance();
+        let phase = self.phase();
+        self.remember(waited, allowance, phase);
+        Self::stall_reason(waited)
+    }
+
+    /// Which budget is in force: nothing has arrived, or it has gone quiet.
+    pub fn phase(&self) -> Phase {
+        if self.alive {
+            Phase::Idle
+        } else {
+            Phase::FirstToken
         }
     }
 
@@ -242,13 +383,18 @@ impl Watchdog {
 
     /// Any real frame from the server, printable or not, proves it is alive.
     pub fn note_activity(&mut self) {
-        self.alive = true;
+        self.touch();
     }
 
     /// Feed displayable text; returns a reason when the output has degenerated.
     pub fn feed(&mut self, text: &str) -> Option<StuckReason> {
-        self.alive = true;
+        self.touch();
         self.repetition.feed(text)
+    }
+
+    /// How close the answer came to looping, for one that did not.
+    pub fn repetition_counters(&self) -> repetition::RepetitionCounters {
+        self.repetition.counters()
     }
 
     pub fn stall_reason(waited: Duration) -> StuckReason {
@@ -256,6 +402,15 @@ impl Watchdog {
             seconds: waited.as_secs().max(1),
         }
     }
+}
+
+/// A gap as a share of its allowance, with a zero allowance treated as unmatched
+/// rather than as an infinite fraction.
+fn fraction(gap: Duration, allowance: Duration) -> f64 {
+    if allowance.is_zero() {
+        return if gap.is_zero() { 0.0 } else { f64::INFINITY };
+    }
+    gap.as_secs_f64() / allowance.as_secs_f64()
 }
 
 #[cfg(test)]
@@ -299,6 +454,51 @@ mod tests {
             .feed("same line\n")
             .expect("the third repeat should trip");
         assert!(matches!(reason, StuckReason::Repetition { repeats: 3, .. }));
+    }
+
+    #[test]
+    fn the_worst_wait_is_named_by_the_budget_it_was_measured_against() {
+        // The bug this pins was found by reading the screen, not by a test: the
+        // report paired a gap with the allowance that applied to it and then
+        // labelled it with the phase in force at the *end* of the attempt. Those
+        // differ as soon as a first frame arrives, so a local tier with a 10s
+        // first-token budget and a 20s idle one printed "0.0s of a 10.0s idle
+        // allowance" — the wrong budget's name on the wrong budget's number.
+        let mut watchdog = Watchdog::new(&Limits {
+            first_token_timeout_ms: 10_000,
+            idle_timeout_ms: 20_000,
+            max_repeat_run: 4,
+        });
+
+        // The first frame: that wait was a first-token wait, whatever the
+        // attempt looks like by the time it ends.
+        watchdog.note_activity();
+
+        let timing = watchdog.timing();
+        assert_eq!(
+            timing.worst_phase,
+            Phase::FirstToken,
+            "the wait was for the first token, so that is the budget to name"
+        );
+        assert_eq!(timing.worst_allowance_ms, 10_000);
+        assert_eq!(timing.idle_ms, 20_000, "which is not the idle budget");
+    }
+
+    #[test]
+    fn a_wait_that_happened_after_the_first_frame_is_an_idle_wait() {
+        // The other half: once something has arrived, the shorter idle budget is
+        // the one a silence is measured against.
+        let mut watchdog = Watchdog::new(&Limits {
+            first_token_timeout_ms: 10_000,
+            idle_timeout_ms: 20_000,
+            max_repeat_run: 4,
+        });
+        watchdog.note_activity();
+        watchdog.timed_out(Duration::from_millis(20_000));
+
+        let timing = watchdog.timing();
+        assert_eq!(timing.worst_phase, Phase::Idle);
+        assert_eq!(timing.worst_allowance_ms, 20_000);
     }
 
     #[test]

@@ -23,6 +23,7 @@ use crate::fallback::{FallbackChain, Tier};
 use crate::provider::{ChatRequest, Provider, StreamEvent, TurnSummary, Usage};
 use crate::session::{ChatMessage, Session, ToolCall};
 use crate::session_store::{SessionFile, SessionStore};
+use crate::stalls::{Counters, Miss, Policy, SpillEntry, SpillLog, Verdict};
 
 /// Default cap on tool steps in a single turn, so a model that keeps calling
 /// tools without concluding cannot spin forever.
@@ -259,6 +260,19 @@ pub enum AgentEvent {
     },
     /// Every tier was tried and none of them produced an answer.
     Exhausted { reason: String },
+    /// A tier was abandoned, with everything the decision was made from.
+    ///
+    /// Separate from `Spilling` and `Escalated`, which narrate the move: this is
+    /// the evidence, and it is what `/why` reads back. Sending it whether or not
+    /// the move happens is deliberate — a user asking why their turn was taken
+    /// away should get the same answer as one asking why it stopped.
+    Stalled { verdict: Box<Verdict> },
+    /// A turn that finished, having come within one step of being abandoned.
+    ///
+    /// Reported rather than kept quiet: an almost-failure is the only evidence
+    /// that a threshold is close to right, and a warning that is never seen
+    /// teaches nothing about whether it is.
+    AlmostStalled { tier: String, miss: Miss },
 }
 
 #[derive(Debug, Clone)]
@@ -273,6 +287,12 @@ pub struct AgentConfig {
     /// a run with nowhere to save has nothing to resume, rather than having a
     /// flag that has to be checked in the right places.
     pub store: Option<SessionStore>,
+    /// Where spills are recorded, or `None` to keep no record.
+    ///
+    /// Separate from `store` rather than derived from it, because the two answer
+    /// different questions: a one-shot run has no session to resume and every
+    /// reason to log why it spilled.
+    pub log: Option<SpillLog>,
 }
 
 /// A session to pick up where the last run left off.
@@ -302,6 +322,12 @@ struct Loop {
     /// contents. It is set by whichever tool last changed a file, so it always
     /// describes the *last* change rather than an older one.
     last_write: Option<Box<Undo>>,
+    /// Whether the spill log has already been reported as unwritable.
+    ///
+    /// Once per run: a full disk would otherwise print the same line on every
+    /// spill, and the point of saying it at all is that a log nobody knows is
+    /// broken is worse than no log.
+    log_warned: bool,
 }
 
 #[derive(Clone)]
@@ -355,6 +381,7 @@ pub fn spawn_seeded(
                 // with nothing to put back — which is honest, since the bytes it
                 // would restore were never written down.
                 last_write: None,
+                log_warned: false,
             },
             None => Loop {
                 session: Session::with_system_prompt(
@@ -364,6 +391,7 @@ pub fn spawn_seeded(
                 mode: Mode::default(),
                 last: None,
                 last_write: None,
+                log_warned: false,
             },
         };
 
@@ -444,6 +472,7 @@ async fn handle_command(
                 events,
                 &mut state.session,
                 &mut state.last_write,
+                &mut state.log_warned,
                 prompt,
             )
             .await;
@@ -604,6 +633,7 @@ async fn handle_command(
                 events,
                 &mut state.session,
                 &mut state.last_write,
+                &mut state.log_warned,
                 last.prompt,
             )
             .await;
@@ -817,9 +847,17 @@ async fn run_turn(
     events: &UnboundedSender<AgentEvent>,
     session: &mut Session,
     last_write: &mut Option<Box<Undo>>,
+    log_warned: &mut bool,
     prompt: String,
 ) {
     session.push(ChatMessage::user(prompt));
+    // Which turn of the conversation this is, counted the way a person would:
+    // in things they asked for.
+    let turn = session
+        .messages()
+        .iter()
+        .filter(|message| message.role == crate::session::Role::User)
+        .count();
     chain.begin_turn();
     let checkpoint = session.messages().len();
     // A cancel from a previous turn must not stop this one.
@@ -830,15 +868,13 @@ async fn run_turn(
     let mut consulted: Vec<consult::Previous> = Vec::new();
 
     loop {
-        let (label, outcome) = {
+        let (label, tier_id, outcome, counters) = {
             let tier = chain.active();
-            (
-                tier.label.clone(),
-                try_tier(
-                    config, tier, mode, registry, approver, events, session, last_write,
-                )
-                .await,
+            let (outcome, counters) = try_tier(
+                config, tier, mode, registry, approver, events, session, last_write,
             )
+            .await;
+            (tier.label.clone(), tier.id.clone(), outcome, counters)
         };
 
         // Reported before the outcome is judged. Whatever this tier spent is
@@ -855,6 +891,16 @@ async fn run_turn(
 
         match outcome {
             Attempt::Answered { stop_reason, .. } => {
+                // A turn that stayed can still have been close, and a near miss
+                // nobody is told about teaches nothing about whether the
+                // thresholds are right. Sent before the finish so the aside lands
+                // above the answer rather than after it.
+                if let Some(miss) = counters.closest_miss() {
+                    let _ = events.send(AgentEvent::AlmostStalled {
+                        tier: short(&label).to_string(),
+                        miss,
+                    });
+                }
                 let _ = events.send(AgentEvent::Finished { stop_reason });
                 return;
             }
@@ -868,6 +914,18 @@ async fn run_turn(
                 return;
             }
             Attempt::Stuck(reason, _) => {
+                // Built here, before the move is decided, so the evidence is on
+                // record whether the turn is handed over, consulted about, or
+                // simply ends — and identical to what the log gets.
+                let verdict = Verdict {
+                    tier_id,
+                    tier_name: short(&label).to_string(),
+                    reason: reason.clone(),
+                    counters,
+                };
+                let _ = events.send(AgentEvent::Stalled {
+                    verdict: Box::new(verdict.clone()),
+                });
                 let from = label;
                 // Read out of the driver before it can be borrowed mutably below.
                 // Taken rather than read, so a one-shot request applies to one
@@ -938,6 +996,15 @@ async fn run_turn(
                             nth: consulted.len() as u32,
                             of: cap,
                         });
+                        record_spill(
+                            config,
+                            log_warned,
+                            events,
+                            &verdict,
+                            turn,
+                            chain.consultant().map(|tier| tier.id.clone()),
+                            Policy::Consult,
+                        );
 
                         // Back to the same tier, with the answer in hand.
                         continue;
@@ -969,16 +1036,76 @@ async fn run_turn(
                             to: next.label.clone(),
                             reason: reason.summary(),
                         });
+                        record_spill(
+                            config,
+                            log_warned,
+                            events,
+                            &verdict,
+                            turn,
+                            Some(next.id.clone()),
+                            Policy::Escalate,
+                        );
                         compact_before_falling(session, chain, events);
                     }
                     None => {
                         let _ = events.send(AgentEvent::Exhausted {
                             reason: reason.summary(),
                         });
+                        // Logged even though nothing took over, because this is
+                        // the only ending a single-tier setup can have and its
+                        // thresholds are the ones most worth tuning.
+                        record_spill(
+                            config,
+                            log_warned,
+                            events,
+                            &verdict,
+                            turn,
+                            None,
+                            Policy::Ended,
+                        );
                         return;
                     }
                 }
             }
+        }
+    }
+}
+
+/// Write one spill, and say so once if the log cannot be written.
+///
+/// A log that has quietly stopped is worse than no log: the thresholds would go
+/// on being tuned from a file that is no longer growing. So a failure is
+/// announced — once per run, because a full disk would otherwise repeat it on
+/// every spill — and the turn carries on regardless.
+#[allow(clippy::too_many_arguments)]
+fn record_spill(
+    config: &AgentConfig,
+    warned: &mut bool,
+    events: &UnboundedSender<AgentEvent>,
+    verdict: &Verdict,
+    turn: usize,
+    to: Option<String>,
+    policy: Policy,
+) {
+    let Some(log) = config.log.as_ref() else {
+        return;
+    };
+
+    let entry = SpillEntry::from_verdict(
+        verdict,
+        crate::stalls::timestamp(std::time::SystemTime::now()),
+        turn,
+        to,
+        policy,
+    );
+
+    if let Err(error) = log.append(&entry) {
+        if !*warned {
+            *warned = true;
+            let _ = events.send(AgentEvent::Notice(format!(
+                "could not write the spill log at {}: {error}",
+                log.path().display()
+            )));
         }
     }
 }
@@ -1171,7 +1298,7 @@ async fn try_tier(
     events: &UnboundedSender<AgentEvent>,
     session: &mut Session,
     last_write: &mut Option<Box<Undo>>,
-) -> Attempt {
+) -> (Attempt, Counters) {
     // A read-only turn is not offered the tools that could change anything. The
     // refusal in `run_tool` is what makes that a guarantee; this is what stops a
     // cooperative model from wasting turns on calls that would be refused.
@@ -1181,124 +1308,150 @@ async fn try_tier(
     // Every request this tier makes is billed, one per step, so the total is
     // carried across the loop rather than read off the last step.
     let mut spent: Option<Usage> = None;
+    // How many requests have been made, which is what the step budget is spent
+    // in. Counted rather than derived from the loop index, because the answer a
+    // cancel gives at the top of a step is one less than the answer a completed
+    // request gives, and both are read by the report.
+    let mut steps_used = 0;
 
-    for _step in 0..config.max_steps {
-        // Stopped between steps, so a cancel that arrives while tools are being
-        // run does not buy another round trip.
-        if config.cancel.is_cancelled() {
-            return Attempt::Cancelled(spent);
-        }
-
-        let request = ChatRequest {
-            model: tier.model.clone(),
-            messages: session.messages().to_vec(),
-            tools: tools.clone(),
-        };
-
-        let (result, observed) = stream_turn(
-            &tier.provider,
-            request,
-            events,
-            &mut watchdog,
-            &config.cancel,
-            TurnKind::Normal,
-        )
-        .await;
-
-        // Folded in before anything else can return, so a request that produced
-        // a tool call — or one whose output is about to be discarded — still
-        // counts what it cost. Exactly one figure is taken per request, never
-        // both, so a request cannot be counted twice.
-        let summary = match result {
-            Ok(summary) => {
-                // The finished response's own total is the better number; what
-                // was observed on the way is the fallback for a provider that
-                // reported as it went.
-                crate::provider::accumulate(&mut spent, summary.usage.or(observed));
-                summary
+    let attempt = 'attempt: {
+        for step in 0..config.max_steps {
+            steps_used = step;
+            // Stopped between steps, so a cancel that arrives while tools are being
+            // run does not buy another round trip.
+            if config.cancel.is_cancelled() {
+                break 'attempt Attempt::Cancelled(spent);
             }
-            Err(StuckReason::Cancelled) => {
-                // Nothing finished, so whatever the tier reported before the
-                // stop is what it spent — and it is owed either way.
-                crate::provider::accumulate(&mut spent, observed);
-                return Attempt::Cancelled(spent);
-            }
-            Err(reason) => {
-                crate::provider::accumulate(&mut spent, observed);
-                return Attempt::Stuck(reason, spent);
-            }
-        };
 
-        session.push(ChatMessage::assistant(
-            summary.text.clone(),
-            summary.tool_calls.clone(),
-        ));
-
-        if summary.tool_calls.is_empty() {
-            return Attempt::Answered {
-                stop_reason: summary.stop_reason.clone(),
-                usage: spent,
+            let request = ChatRequest {
+                model: tier.model.clone(),
+                messages: session.messages().to_vec(),
+                tools: tools.clone(),
             };
-        }
 
-        for call in summary.tool_calls.clone() {
-            let outcome = run_tool(
-                mode,
-                registry,
-                approver,
-                &config.workspace,
-                &call,
+            let (result, observed) = stream_turn(
+                &tier.provider,
+                request,
                 events,
+                &mut watchdog,
                 &config.cancel,
+                TurnKind::Normal,
             )
             .await;
 
-            let outcome = match outcome {
-                ToolRun::Done(outcome) => outcome,
-                ToolRun::Cancelled => {
-                    // The assistant message above is already in the session and
-                    // names this call, and a provider rejects a call with no
-                    // result. So the cancellation is recorded as the result
-                    // rather than left as a gap: the conversation stays valid,
-                    // and the next turn knows what became of it.
-                    session.push(ChatMessage::tool_result(
-                        call.id.clone(),
-                        "the user cancelled before this finished.",
-                    ));
-                    return Attempt::Cancelled(spent);
+            // A request has now been made, whatever became of it.
+            steps_used = step + 1;
+
+            // Folded in before anything else can return, so a request that produced
+            // a tool call — or one whose output is about to be discarded — still
+            // counts what it cost. Exactly one figure is taken per request, never
+            // both, so a request cannot be counted twice.
+            let summary = match result {
+                Ok(summary) => {
+                    // The finished response's own total is the better number; what
+                    // was observed on the way is the fallback for a provider that
+                    // reported as it went.
+                    crate::provider::accumulate(&mut spent, summary.usage.or(observed));
+                    summary
+                }
+                Err(StuckReason::Cancelled) => {
+                    // Nothing finished, so whatever the tier reported before the
+                    // stop is what it spent — and it is owed either way.
+                    crate::provider::accumulate(&mut spent, observed);
+                    break 'attempt Attempt::Cancelled(spent);
+                }
+                Err(reason) => {
+                    crate::provider::accumulate(&mut spent, observed);
+                    break 'attempt Attempt::Stuck(reason, spent);
                 }
             };
 
-            // The means to reverse this, if it changed a file. Lifted out before
-            // the result moves into the session, and only for a write that
-            // succeeded — the tool leaves it `None` otherwise.
-            let mut outcome = outcome;
-            if let Some(undo) = outcome.undo.take() {
-                *last_write = Some(undo);
+            session.push(ChatMessage::assistant(
+                summary.text.clone(),
+                summary.tool_calls.clone(),
+            ));
+
+            if summary.tool_calls.is_empty() {
+                break 'attempt Attempt::Answered {
+                    stop_reason: summary.stop_reason.clone(),
+                    usage: spent,
+                };
             }
 
-            // Classified before the result moves into the session, so the kind of
-            // failure is available to the detector. `Other` for anything
-            // unrecognised, which is judged by the tier's own allowance rather
-            // than a tighter one.
-            let failure = outcome
-                .is_error
-                .then(|| ErrorClass::classify(&outcome.content));
-            if let Some(reason) = progress.record(&call.name, &call.arguments, failure) {
-                return Attempt::Stuck(reason, spent);
+            for call in summary.tool_calls.clone() {
+                let outcome = run_tool(
+                    mode,
+                    registry,
+                    approver,
+                    &config.workspace,
+                    &call,
+                    events,
+                    &config.cancel,
+                )
+                .await;
+
+                let outcome = match outcome {
+                    ToolRun::Done(outcome) => outcome,
+                    ToolRun::Cancelled => {
+                        // The assistant message above is already in the session and
+                        // names this call, and a provider rejects a call with no
+                        // result. So the cancellation is recorded as the result
+                        // rather than left as a gap: the conversation stays valid,
+                        // and the next turn knows what became of it.
+                        session.push(ChatMessage::tool_result(
+                            call.id.clone(),
+                            "the user cancelled before this finished.",
+                        ));
+                        break 'attempt Attempt::Cancelled(spent);
+                    }
+                };
+
+                // The means to reverse this, if it changed a file. Lifted out before
+                // the result moves into the session, and only for a write that
+                // succeeded — the tool leaves it `None` otherwise.
+                let mut outcome = outcome;
+                if let Some(undo) = outcome.undo.take() {
+                    *last_write = Some(undo);
+                }
+
+                // Classified before the result moves into the session, so the kind of
+                // failure is available to the detector. `Other` for anything
+                // unrecognised, which is judged by the tier's own allowance rather
+                // than a tighter one.
+                let failure = outcome
+                    .is_error
+                    .then(|| ErrorClass::classify(&outcome.content));
+                if let Some(reason) = progress.record(&call.name, &call.arguments, failure) {
+                    break 'attempt Attempt::Stuck(reason, spent);
+                }
+                // The result goes back even when it is an error or a refusal, so the
+                // model can see what happened instead of retrying blindly.
+                session.push(ChatMessage::tool_result(call.id.clone(), outcome.content));
             }
-            // The result goes back even when it is an error or a refusal, so the
-            // model can see what happened instead of retrying blindly.
-            session.push(ChatMessage::tool_result(call.id.clone(), outcome.content));
         }
-    }
 
-    Attempt::Stuck(
-        StuckReason::StepLimit {
-            steps: config.max_steps,
-        },
-        spent,
-    )
+        Attempt::Stuck(
+            StuckReason::StepLimit {
+                steps: config.max_steps,
+            },
+            spent,
+        )
+    };
+
+    // Read after the loop rather than at each exit: the counters are the
+    // detectors' own state, so they describe the attempt wherever it ended and
+    // there is no second copy to keep in step with the first.
+    // `steps_used` is moved out of the loop above, so this is the one place the
+    // figure is turned into a report.
+    let counters = Counters {
+        steps_used,
+        steps_allowed: config.max_steps,
+        repetition: watchdog.repetition_counters(),
+        progress: progress.counters(),
+        timing: watchdog.timing(),
+    };
+
+    (attempt, counters)
 }
 
 /// Which entry point of a provider a turn runs through.
@@ -1327,6 +1480,9 @@ async fn stream_turn(
     cancel: &Canceller,
     kind: TurnKind,
 ) -> (Result<TurnSummary, StuckReason>, Option<Usage>) {
+    // Timing is per request: the gap since the previous request's last frame
+    // would include the tool call that ran in between.
+    watchdog.begin_request();
     let (delta_tx, mut delta_rx) = mpsc::unbounded_channel::<StreamEvent>();
     let provider = provider.clone();
     let mut task = tokio::spawn(async move {
@@ -1375,7 +1531,7 @@ async fn stream_turn(
             received = tokio::time::timeout(allowance, delta_rx.recv()) => {
                 match received {
                     // Nothing at all arrived within this tier's allowance.
-                    Err(_) => break Err(Watchdog::stall_reason(allowance)),
+                    Err(_) => break Err(watchdog.timed_out(allowance)),
                     // The stream closed; the join above now holds the answer.
                     Ok(None) => continue,
                     Ok(Some(event)) => {
@@ -1702,6 +1858,7 @@ mod tests {
             // Most tests are about a turn, not about what outlives the process;
             // the ones that are set a store on the config they build.
             store: None,
+            log: None,
         }
     }
 
@@ -1716,6 +1873,7 @@ mod tests {
             max_steps,
             cancel: cancel.clone(),
             store: None,
+            log: None,
         };
         (config, cancel)
     }
@@ -2582,6 +2740,91 @@ mod tests {
         }
     }
 
+    /// A two-tier chain whose first tier repeats itself and whose second
+    /// answers, with the ids a log would name.
+    fn looping_into_a_second(times: usize) -> (FallbackChain, Arc<Loops>) {
+        let looping = Loops::new("the same line", times);
+        let mut first = Tier::new(
+            "Local (http://10.0.0.1:1234/v1)".to_string(),
+            "m0".to_string(),
+            looping.clone(),
+            Limits::default(),
+        );
+        first.id = "local".to_string();
+        let mut second = Tier::new(
+            "Frontier".to_string(),
+            "m1".to_string(),
+            Quiet::new("answered"),
+            Limits::default(),
+        );
+        second.id = "frontier".to_string();
+        (
+            FallbackChain::new(vec![first, second], false).expect("a chain"),
+            looping,
+        )
+    }
+
+    /// The same, with one tier, so a stall has nowhere to go.
+    fn looping_alone(times: usize) -> FallbackChain {
+        let mut only = Tier::new(
+            "Local".to_string(),
+            "m0".to_string(),
+            Loops::new("the same line", times),
+            Limits::default(),
+        );
+        only.id = "local".to_string();
+        FallbackChain::new(vec![only], false).expect("a chain")
+    }
+
+    /// A run whose spills are recorded, and the file they land in.
+    fn loop_over_logging(
+        dir: &std::path::Path,
+        chain: FallbackChain,
+    ) -> (
+        UnboundedSender<Command>,
+        UnboundedReceiver<AgentEvent>,
+        std::path::PathBuf,
+    ) {
+        let path = dir.join("spills.jsonl");
+        let mut config = config(dir, DEFAULT_MAX_STEPS);
+        config.log = Some(crate::stalls::SpillLog::at(path.clone()));
+        let (tx, rx) = spawn(
+            config,
+            chain,
+            Arc::new(Registry::with_default_tools()),
+            Arc::new(AlwaysApprove::default()),
+        );
+        (tx, rx, path)
+    }
+
+    /// Every record in a spill log, in order.
+    fn spills(path: &std::path::Path) -> Vec<serde_json::Value> {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        text.lines()
+            .map(|line| serde_json::from_str(line).expect("each line is a record"))
+            .collect()
+    }
+
+    fn verdicts(events: &[AgentEvent]) -> Vec<&Verdict> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Stalled { verdict } => Some(verdict.as_ref()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn near_misses(events: &[AgentEvent]) -> Vec<(String, Miss)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::AlmostStalled { tier, miss } => Some((tier.clone(), *miss)),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Collect whatever the agent emits, stopping once it goes quiet.
     ///
     /// Most commands answer with a notice and no turn, so there is no terminal
@@ -2889,6 +3132,322 @@ mod tests {
         assert_eq!(consulted(&events).len(), 1, "{events:?}");
         assert_eq!(driver.request_count(), 2);
         assert_eq!(consultant.request_count(), 1);
+    }
+
+    // ---- the stall call, made inspectable ----------------------------------
+
+    #[tokio::test]
+    async fn a_stall_is_reported_with_the_counters_behind_it() {
+        // The point of the whole thing: the reason says what tripped, and the
+        // counters say how close everything else came. A reason on its own is
+        // not arguable, and a user who cannot argue with it turns it off.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (chain, looping) = looping_into_a_second(4);
+        let (tx, mut rx) = loop_over(dir.path(), chain);
+
+        tx.send(Command::Prompt("go".to_string())).expect("send");
+        let events = collect(&mut rx).await;
+
+        let verdict = verdicts(&events);
+        assert_eq!(verdict.len(), 1, "one stall, one verdict: {events:?}");
+        let verdict = verdict[0];
+
+        assert!(
+            matches!(verdict.reason, StuckReason::Repetition { repeats: 4, .. }),
+            "{:?}",
+            verdict.reason
+        );
+        assert_eq!(verdict.counters.repetition.threshold, 4);
+        assert_eq!(
+            verdict.counters.steps_used, 1,
+            "it never got past the first request"
+        );
+        assert_eq!(verdict.counters.steps_allowed, DEFAULT_MAX_STEPS);
+        assert_eq!(verdict.counters.progress.failure_run, 0);
+        assert_eq!(looping.requests(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_verdict_names_the_tier_without_its_address() {
+        // The report is read by a person, and the address belongs in the
+        // session panel; repeating it in every line is how one line becomes
+        // three.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (chain, _) = looping_into_a_second(4);
+        let (tx, mut rx) = loop_over(dir.path(), chain);
+
+        tx.send(Command::Prompt("go".to_string())).expect("send");
+        let events = collect(&mut rx).await;
+        let verdict = verdicts(&events)[0];
+
+        assert_eq!(verdict.tier_name, "Local");
+        assert!(
+            !verdict.report().contains("http://"),
+            "no address in the report: {}",
+            verdict.report()
+        );
+        assert_eq!(verdict.tier_id, "local", "but the log keeps the real id");
+    }
+
+    #[tokio::test]
+    async fn a_verdict_arrives_whether_or_not_the_turn_was_handed_over() {
+        // A turn that ends because there is nowhere to go is still a stall, and
+        // is the only ending a single-tier setup can have. Withholding the
+        // evidence for it would make `/why` useless to exactly that user.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (tx, mut rx) = loop_over(dir.path(), looping_alone(4));
+
+        tx.send(Command::Prompt("go".to_string())).expect("send");
+        let events = collect(&mut rx).await;
+
+        assert_eq!(verdicts(&events).len(), 1, "{events:?}");
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Exhausted { .. })),
+            "and the turn still says it ran out of tiers: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_clean_turn_has_nothing_to_explain() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (chain, _) = one_tier("a perfectly ordinary answer");
+        let (tx, mut rx) = loop_over(dir.path(), chain);
+
+        tx.send(Command::Prompt("go".to_string())).expect("send");
+        let events = collect(&mut rx).await;
+
+        assert!(verdicts(&events).is_empty(), "{events:?}");
+        assert!(near_misses(&events).is_empty(), "{events:?}");
+    }
+
+    // ---- turns that nearly went the same way -------------------------------
+
+    #[tokio::test]
+    async fn a_turn_that_stayed_is_reported_when_it_was_one_repeat_away() {
+        // Three repeats against an allowance of four: one more and the turn
+        // would have been taken away. Silent almost-failures are what make a
+        // threshold impossible to set.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (chain, _) = looping_into_a_second(3);
+        let (tx, mut rx) = loop_over(dir.path(), chain);
+
+        tx.send(Command::Prompt("go".to_string())).expect("send");
+        let events = collect(&mut rx).await;
+
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Finished { .. })),
+            "it answered: {events:?}"
+        );
+        assert_eq!(
+            near_misses(&events),
+            vec![(
+                "Local".to_string(),
+                Miss::Repeats {
+                    seen: 3,
+                    allowed: 4
+                }
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_two_short_of_the_allowance_says_nothing() {
+        // The warning has to mean something. A tier that repeated itself twice
+        // against an allowance of four is not about to be abandoned, and saying
+        // so every turn would be noise.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (chain, _) = looping_into_a_second(2);
+        let (tx, mut rx) = loop_over(dir.path(), chain);
+
+        tx.send(Command::Prompt("go".to_string())).expect("send");
+        let events = collect(&mut rx).await;
+
+        assert!(near_misses(&events).is_empty(), "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn a_stall_does_not_also_report_a_near_miss() {
+        // The warning is for turns that stayed. One that was abandoned has the
+        // verdict instead, and saying both would be two lines about one thing.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (chain, _) = looping_into_a_second(4);
+        let (tx, mut rx) = loop_over(dir.path(), chain);
+
+        tx.send(Command::Prompt("go".to_string())).expect("send");
+        let events = collect(&mut rx).await;
+
+        assert_eq!(verdicts(&events).len(), 1);
+        assert!(near_misses(&events).is_empty(), "{events:?}");
+    }
+
+    // ---- the record on disk ------------------------------------------------
+
+    #[tokio::test]
+    async fn a_spill_is_logged_with_its_trigger_and_both_tiers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (chain, _) = looping_into_a_second(4);
+        let (tx, mut rx, path) = loop_over_logging(dir.path(), chain);
+
+        tx.send(Command::Prompt("go".to_string())).expect("send");
+        let _ = collect(&mut rx).await;
+
+        let records = spills(&path);
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0]["trigger"], "repetition");
+        assert_eq!(records[0]["from"], "local");
+        assert_eq!(records[0]["to"], "frontier");
+        assert_eq!(records[0]["policy"], "escalate");
+        assert_eq!(records[0]["turn"], 1);
+    }
+
+    #[tokio::test]
+    async fn the_log_carries_the_numbers_a_threshold_is_moved_with() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (chain, _) = looping_into_a_second(4);
+        let (tx, mut rx, path) = loop_over_logging(dir.path(), chain);
+
+        tx.send(Command::Prompt("go".to_string())).expect("send");
+        let _ = collect(&mut rx).await;
+
+        let record = &spills(&path)[0];
+        assert_eq!(record["repeats"]["lines"], 4);
+        assert_eq!(record["repeats"]["allowed"], 4);
+        assert_eq!(record["steps"]["used"], 1);
+        assert_eq!(record["steps"]["allowed"], DEFAULT_MAX_STEPS);
+        // The allowances themselves, because these are the numbers that get
+        // changed and the counts mean nothing without them.
+        assert!(record["wait"]["first_token_ms"].as_u64().unwrap() > 0);
+        assert!(record["wait"]["idle_ms"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn a_consult_is_logged_as_a_consult_rather_than_a_handover() {
+        // Which of the two ran is the question the log exists to answer, and
+        // they are indistinguishable from the trigger alone.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (chain, _, _) = consultable(2);
+        let (tx, mut rx, path) = loop_over_logging(dir.path(), chain);
+
+        tx.send(Command::Prompt("go".to_string())).expect("send");
+        let _ = collect(&mut rx).await;
+
+        let records = spills(&path);
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0]["policy"], "consult");
+        assert_eq!(records[0]["from"], "Local");
+        assert_eq!(records[0]["to"], "DeepSeek");
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_ended_for_want_of_a_tier_logs_no_destination() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (tx, mut rx, path) = loop_over_logging(dir.path(), looping_alone(4));
+
+        tx.send(Command::Prompt("go".to_string())).expect("send");
+        let _ = collect(&mut rx).await;
+
+        let records = spills(&path);
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0]["policy"], "ended");
+        assert!(records[0]["to"].is_null(), "{}", records[0]);
+        assert_eq!(records[0]["trigger"], "repetition");
+    }
+
+    #[tokio::test]
+    async fn a_clean_turn_writes_nothing_to_the_log() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (chain, _) = one_tier("an ordinary answer");
+        let (tx, mut rx, path) = loop_over_logging(dir.path(), chain);
+
+        tx.send(Command::Prompt("go".to_string())).expect("send");
+        let _ = collect(&mut rx).await;
+
+        assert!(
+            !path.exists(),
+            "the log is a record of spills, so a clean turn creates no file"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_spills_in_one_session_are_two_records() {
+        // Appended, not overwritten: the file is what a pattern is read from.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (tx, mut rx, path) = loop_over_logging(dir.path(), looping_alone(4));
+
+        for _ in 0..2 {
+            tx.send(Command::Prompt("go".to_string())).expect("send");
+            let _ = collect(&mut rx).await;
+        }
+
+        assert_eq!(spills(&path).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_unwritable_log_is_reported_once_and_the_turn_carries_on() {
+        // A log that has quietly stopped is worse than no log, because the
+        // thresholds would go on being tuned from a file that is not growing.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("spills.jsonl");
+        // A directory where the file should be: whatever the platform, this
+        // cannot be opened for appending.
+        std::fs::create_dir_all(&path).expect("make a directory");
+
+        let mut config = config(dir.path(), DEFAULT_MAX_STEPS);
+        config.log = Some(crate::stalls::SpillLog::at(path));
+        let (tx, mut rx) = spawn(
+            config,
+            looping_alone(4),
+            Arc::new(Registry::with_default_tools()),
+            Arc::new(AlwaysApprove::default()),
+        );
+
+        let mut all = Vec::new();
+        for _ in 0..2 {
+            tx.send(Command::Prompt("go".to_string())).expect("send");
+            all.extend(collect(&mut rx).await);
+        }
+
+        // Two spills happened, and the complaint is made once: a full disk
+        // would otherwise print the same line on every stall of the session.
+        let complaints: Vec<String> = notices(&all)
+            .into_iter()
+            .filter(|note| note.contains("spill log"))
+            .collect();
+        assert_eq!(complaints.len(), 1, "{complaints:?}");
+        assert!(
+            complaints[0].contains("spills.jsonl"),
+            "it should say which file: {complaints:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_log_that_cannot_be_written_does_not_stop_the_turn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("spills.jsonl");
+        std::fs::create_dir_all(&path).expect("make a directory");
+
+        let mut config = config(dir.path(), DEFAULT_MAX_STEPS);
+        config.log = Some(crate::stalls::SpillLog::at(path));
+        let (tx, mut rx) = spawn(
+            config,
+            one_tier("the answer anyway").0,
+            Arc::new(Registry::with_default_tools()),
+            Arc::new(AlwaysApprove::default()),
+        );
+
+        tx.send(Command::Prompt("go".to_string())).expect("send");
+        let events = collect(&mut rx).await;
+
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Finished { .. })),
+            "the turn is not the log's business: {events:?}"
+        );
     }
 
     #[tokio::test]
@@ -3354,6 +3913,53 @@ mod tests {
     }
 
     // ---- cancelling -------------------------------------------------------
+
+    /// Emits one line over and over, which is the shape the repetition detector
+    /// exists to catch. `times` below the tier's allowance ends in an answer and
+    /// is how a near miss is provoked.
+    struct Loops {
+        line: String,
+        times: usize,
+        requests: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Loops {
+        fn new(line: &str, times: usize) -> Arc<Self> {
+            Arc::new(Self {
+                line: line.to_string(),
+                times,
+                requests: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        fn requests(&self) -> usize {
+            self.requests.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl Provider for Loops {
+        fn describe(&self) -> String {
+            "loops".to_string()
+        }
+
+        async fn stream(
+            &self,
+            _request: ChatRequest,
+            events: UnboundedSender<StreamEvent>,
+        ) -> Result<TurnSummary, ProviderError> {
+            self.requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            for _ in 0..self.times {
+                let _ = events.send(StreamEvent::Text(format!("{}\n", self.line)));
+            }
+            Ok(TurnSummary {
+                text: self.line.clone(),
+                stop_reason: Some("end_turn".to_string()),
+                ..TurnSummary::default()
+            })
+        }
+    }
 
     /// Talks forever without repeating itself, so the watchdog never trips and
     /// the only thing that can end the turn is a cancel.
@@ -4332,6 +4938,7 @@ mod tests {
             mode: Mode::Plan,
             last: None,
             last_write: None,
+            log_warned: false,
         };
 
         let agent_config = AgentConfig {
@@ -4339,6 +4946,7 @@ mod tests {
             max_steps: DEFAULT_MAX_STEPS,
             cancel: Canceller::default(),
             store: None,
+            log: None,
         };
         let file = snapshot(&agent_config, &state);
 

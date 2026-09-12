@@ -217,6 +217,25 @@ fn active_tier(app: &App) -> &str {
 
 /// A tier label without its parenthetical detail: "Local (http://…)" becomes
 /// "Local". The address belongs in the session panel, not in a one-line rail.
+/// A path with the home directory folded to `~`.
+///
+/// The one place this is done, so a path reads the same in a notice, in the
+/// session panel, and in the answer to `/why`. A full `/home/name/...` is long
+/// enough to push a line over the width it is shown in, and the home directory
+/// is the part that says the least.
+pub fn short_path(path: &std::path::Path) -> String {
+    let Some(home) = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()) else {
+        return path.display().to_string();
+    };
+    if path == home {
+        return "~".to_string();
+    }
+    match path.strip_prefix(&home) {
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
+    }
+}
+
 pub fn short_label(label: &str) -> &str {
     match label.find(" (") {
         Some(cut) => &label[..cut],

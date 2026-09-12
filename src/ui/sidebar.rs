@@ -323,17 +323,7 @@ fn cached(app: &App) -> String {
 
 /// Replace a home-directory prefix with `~`, the way a shell would show it.
 fn tilde(path: &str) -> String {
-    let Some(home) = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()) else {
-        return path.to_string();
-    };
-    let home = home.display().to_string();
-    if path == home {
-        return "~".to_string();
-    }
-    match path.strip_prefix(&format!("{home}/")) {
-        Some(rest) => format!("~/{rest}"),
-        None => path.to_string(),
-    }
+    crate::ui::short_path(std::path::Path::new(path))
 }
 
 #[cfg(test)]

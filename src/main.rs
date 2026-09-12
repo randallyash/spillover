@@ -5,6 +5,7 @@ mod app;
 mod commands;
 mod config;
 mod detect;
+mod docs;
 mod doctor;
 mod event;
 mod fallback;
@@ -17,6 +18,7 @@ mod session;
 mod session_store;
 mod setup;
 mod spawn;
+mod stalls;
 mod text;
 mod tiers;
 mod ui;
@@ -188,7 +190,11 @@ async fn main() {
         prompt,
         json: cli.output_format == OutputFormat::Json,
         yolo: cli.yolo,
+        // `None` means the platform's state directory, which is what the real
+        // binary wants; only a test has anywhere else to put it.
+        log: None,
     };
+
     let outcome = oneshot::run(&preset::Library::embedded(), &config, &options).await;
 
     if options.json {
@@ -440,6 +446,10 @@ async fn start_agent(config: &Config, resume: Option<&SessionFile>) -> AgentStar
     // rather than ending the run.
     let store = SessionStore::for_workspace(&workspace).ok();
 
+    // The same reasoning, and the same shape: a record of why turns were handed
+    // over, kept only when there is somewhere to keep it.
+    let log = crate::stalls::SpillLog::default_path().map(crate::stalls::SpillLog::at);
+
     let (approval_tx, approval_rx) = mpsc::unbounded_channel();
     // Created here and shared, so the interface can stop a turn the agent is in
     // the middle of.
@@ -450,6 +460,7 @@ async fn start_agent(config: &Config, resume: Option<&SessionFile>) -> AgentStar
             max_steps: crate::agent::DEFAULT_MAX_STEPS,
             cancel: canceller.clone(),
             store,
+            log,
         },
         chain,
         Arc::new(Registry::with_default_tools()),

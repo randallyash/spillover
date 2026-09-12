@@ -76,6 +76,11 @@ pub const CATALOGUE: &[Spec] = &[
         summary: "What gets sent on each turn, and how large it has grown",
     },
     Spec {
+        name: "why",
+        arg: Arg::None,
+        summary: "Why the last tier was abandoned, with the numbers behind it",
+    },
+    Spec {
         name: "compact",
         arg: Arg::None,
         summary: "Fold earlier turns into a short ledger to shrink what is sent",

@@ -18,6 +18,24 @@ use crate::detect::{ErrorClass, StuckReason};
 /// Below this, the "pattern" is just normal tool use.
 const MIN_THRESHOLD: usize = 2;
 
+/// What the detector has seen so far.
+///
+/// As with repetition: the counters are the tuning material, and they only exist
+/// while the attempt does. A verdict on its own says what tripped, never what
+/// nearly did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProgressCounters {
+    /// Identical calls — same tool, same arguments — currently in a row.
+    pub same_run: usize,
+    /// Consecutive failures currently standing, whatever they were.
+    pub failure_run: usize,
+    /// The same failure currently repeating, and how many times.
+    pub error_run: usize,
+    pub error_class: Option<ErrorClass>,
+    /// The configured allowance both runs are measured against.
+    pub threshold: usize,
+}
+
 pub struct ProgressDetector {
     threshold: usize,
     last_call: Option<(String, String)>,
@@ -45,6 +63,17 @@ impl ProgressDetector {
             last_failed_tool: String::new(),
             error_streak: None,
             error_run: 0,
+        }
+    }
+
+    /// How close it came, for a turn that ended without tripping.
+    pub fn counters(&self) -> ProgressCounters {
+        ProgressCounters {
+            same_run: self.same_run,
+            failure_run: self.failure_run,
+            error_run: self.error_run,
+            error_class: self.error_streak.as_ref().map(|(_, class, _)| *class),
+            threshold: self.threshold,
         }
     }
 

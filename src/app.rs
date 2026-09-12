@@ -13,6 +13,7 @@ use crate::commands::{self, Input};
 use crate::config::Config;
 use crate::config::OnStuck;
 use crate::session_store::SessionFile;
+use crate::stalls::Verdict;
 
 /// How much of the prompt a single paste may add, in characters.
 ///
@@ -213,6 +214,12 @@ pub struct App {
     turn_usage: Option<crate::provider::Usage>,
     /// User turns completed.
     pub turns: u32,
+    /// The most recent stall and everything the verdict was made from.
+    ///
+    /// One, not a history: `/why` answers "why was my turn taken away", and that
+    /// question is about the stall that just happened. The log file is where the
+    /// history lives.
+    pub last_stall: Option<Verdict>,
 }
 
 impl App {
@@ -255,6 +262,7 @@ impl App {
             usage_history: Vec::new(),
             turn_usage: None,
             turns: 0,
+            last_stall: None,
         }
     }
 
@@ -794,6 +802,24 @@ impl App {
                     message.text.push_str(&chunk);
                 }
             }
+            AgentEvent::Stalled { verdict } => {
+                // Nothing is shown here: the handoff or the consult narrates
+                // itself, and a second line saying the same thing in different
+                // words is noise. This is kept so `/why` can answer with the
+                // numbers rather than with the sentence already on screen.
+                self.last_stall = Some(*verdict);
+            }
+            AgentEvent::AlmostStalled { tier, miss } => {
+                self.streaming = None;
+                // One line, and it has to stay one: this lands in the middle of
+                // a transcript, and a warning that wraps is a wall. Hence the
+                // counters as "3 of 4" rather than a sentence about what would
+                // have happened, and the tersest possible pointer at `/why`.
+                self.messages.push(Message::system(format!(
+                    "nearly spilled · {tier} {} · /why",
+                    miss.sentence()
+                )));
+            }
             AgentEvent::ToolStarted { name, preview } => {
                 self.streaming = None;
                 // A tool call's arguments arrive as structure, never as text, so
@@ -1080,6 +1106,8 @@ impl App {
 
             "cost" => self.messages.push(Message::system(self.describe_cost())),
 
+            "why" => self.messages.push(Message::system(self.describe_why())),
+
             // These need the chain or the conversation, which the agent owns.
             "escalate" => {
                 send(self, Command::Escalate);
@@ -1211,6 +1239,25 @@ impl App {
     ///
     /// Reachable from the golden-loop fixture, which is the one test that can
     /// assert on real tokens having been spent across a real spill.
+    /// `/why`: the last stall, with every counter it was decided against.
+    pub(crate) fn describe_why(&self) -> String {
+        let Some(verdict) = self.last_stall.as_ref() else {
+            return "nothing has spilled this session, so there is nothing to explain".to_string();
+        };
+
+        let mut out = verdict.report();
+        // Saying where the record is, because the report answers one stall and
+        // the log is what answers a pattern of them.
+        match crate::stalls::SpillLog::default_path() {
+            Some(path) => out.push_str(&format!(
+                "\n\nevery spill is recorded at {}",
+                crate::ui::short_path(&path)
+            )),
+            None => out.push_str("\n\nno state directory, so spills are not being recorded"),
+        }
+        out
+    }
+
     pub(crate) fn describe_cost(&self) -> String {
         if self.usage_by_tier.is_empty() {
             return "nothing has been spent yet".to_string();
@@ -2293,6 +2340,163 @@ mod tests {
         assert_eq!(app.tokens_out, 4);
         assert_eq!(app.cache_read, 14_848);
         assert_eq!(app.cache_write, 0);
+    }
+
+    // ---- /why -------------------------------------------------------------
+
+    use crate::stalls::Miss;
+
+    fn a_stall_verdict() -> Verdict {
+        Verdict {
+            tier_id: "local".into(),
+            tier_name: "Looping Local".into(),
+            reason: crate::detect::StuckReason::RepeatedToolError {
+                tool: "read_file".into(),
+                class: crate::detect::ErrorClass::NotFound,
+                times: 3,
+            },
+            counters: crate::stalls::Counters {
+                steps_used: 5,
+                steps_allowed: 12,
+                repetition: crate::detect::repetition::RepetitionCounters {
+                    consecutive: 1,
+                    span_repeats: 1,
+                    threshold: 4,
+                },
+                progress: crate::detect::progress::ProgressCounters {
+                    same_run: 1,
+                    failure_run: 3,
+                    error_run: 3,
+                    error_class: Some(crate::detect::ErrorClass::NotFound),
+                    threshold: 4,
+                },
+                timing: crate::detect::Timing {
+                    worst_gap_ms: 900,
+                    worst_allowance_ms: 30_000,
+                    first_token_ms: 120_000,
+                    idle_ms: 30_000,
+                    worst_phase: crate::detect::Phase::Idle,
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn why_with_nothing_to_explain_says_so() {
+        let mut app = new_app();
+        type_and_send(&mut app, "/why");
+
+        assert!(
+            last_message(&app).contains("nothing has spilled"),
+            "{}",
+            last_message(&app)
+        );
+    }
+
+    #[test]
+    fn why_reports_the_last_stall_with_its_counters() {
+        let mut app = new_app();
+        app.handle_agent_event(AgentEvent::Stalled {
+            verdict: Box::new(a_stall_verdict()),
+        });
+        type_and_send(&mut app, "/why");
+
+        let report = last_message(&app);
+        assert!(report.contains("Looping Local"), "{report}");
+        assert!(
+            report.contains("read_file failed 3 times"),
+            "the verdict leads: {report}"
+        );
+        assert!(report.contains("5 of 12 used"), "{report}");
+        assert!(
+            report.contains("identical line(s)"),
+            "the counters that did not fire are the point: {report}"
+        );
+    }
+
+    #[test]
+    fn why_says_where_the_record_of_every_spill_is() {
+        // One stall is answered by the report; a pattern of them is answered by
+        // the file, so the file has to be findable from here.
+        let mut app = new_app();
+        app.handle_agent_event(AgentEvent::Stalled {
+            verdict: Box::new(a_stall_verdict()),
+        });
+        type_and_send(&mut app, "/why");
+
+        let report = last_message(&app);
+        assert!(
+            report.contains("spills.jsonl") || report.contains("no state directory"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn why_reports_the_most_recent_stall_not_the_first() {
+        let mut app = new_app();
+        app.handle_agent_event(AgentEvent::Stalled {
+            verdict: Box::new(a_stall_verdict()),
+        });
+        app.handle_agent_event(AgentEvent::Stalled {
+            verdict: Box::new(Verdict {
+                tier_id: "frontier".into(),
+                tier_name: "Frontier".into(),
+                reason: crate::detect::StuckReason::StepLimit { steps: 12 },
+                ..a_stall_verdict()
+            }),
+        });
+        type_and_send(&mut app, "/why");
+
+        let report = last_message(&app);
+        assert!(report.contains("Frontier"), "{report}");
+        assert!(!report.contains("Looping Local"), "{report}");
+    }
+
+    #[test]
+    fn a_near_miss_is_shown_as_an_aside_in_the_transcript() {
+        let mut app = new_app();
+        app.handle_agent_event(AgentEvent::AlmostStalled {
+            tier: "Local".into(),
+            miss: Miss::Repeats {
+                seen: 3,
+                allowed: 4,
+            },
+        });
+
+        let line = last_message(&app);
+        assert!(line.contains("nearly spilled"), "{line}");
+        assert!(line.contains("Local"), "{line}");
+        assert!(
+            line.contains("repeated the same line 3 of 4 times"),
+            "{line}"
+        );
+        assert!(
+            line.contains("/why"),
+            "it should say where the numbers are: {line}"
+        );
+        assert!(!line.contains("http://"), "notices use short names: {line}");
+    }
+
+    #[test]
+    fn a_near_miss_is_worth_exactly_one_line() {
+        // One line is the requirement, not merely a preference: this lands in
+        // the middle of a transcript, and a wrapped warning is a wall.
+        let mut app = new_app();
+        app.handle_agent_event(AgentEvent::AlmostStalled {
+            tier: "Local".into(),
+            miss: Miss::SameCall {
+                seen: 3,
+                allowed: 4,
+            },
+        });
+
+        let line = last_message(&app);
+        assert_eq!(line.lines().count(), 1, "{line:?}");
+        assert!(
+            line.chars().count() <= 110,
+            "{} chars: {line}",
+            line.chars().count()
+        );
     }
 
     // ---- slash commands ---------------------------------------------------
