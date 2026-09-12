@@ -525,6 +525,17 @@ mod tests {
     use super::*;
     use crate::detect::{ErrorClass, Phase};
 
+    /// The README with its line endings normalised.
+    ///
+    /// Git checks the file out with CRLF on Windows, and `include_str!` embeds
+    /// the bytes as they are — so a sample copied out of it has `\r\n` where the
+    /// program's own output has `\n`, and the same content compares unequal on
+    /// one platform and not another. The invariant is about what the text says,
+    /// never about how the file happens to be stored.
+    fn readme() -> String {
+        include_str!("../README.md").replace("\r\n", "\n")
+    }
+
     fn counters() -> Counters {
         Counters {
             steps_used: 1,
@@ -941,9 +952,8 @@ decided from:
 
         assert_eq!(verdict.report(), expected);
         // And the README is showing this, not an invented version of it.
-        let readme = include_str!("../README.md");
         assert!(
-            readme.contains(expected),
+            readme().contains(expected),
             "the README no longer shows the real report"
         );
     }
@@ -984,9 +994,8 @@ decided from:
         };
 
         let written = entry.to_json().to_string();
-        let readme = include_str!("../README.md");
         assert!(
-            readme.contains(&written),
+            readme().contains(&written),
             "the README no longer shows the record that is actually written:\n{written}"
         );
     }
