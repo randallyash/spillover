@@ -20,6 +20,13 @@ use crate::ui::{short_label, spinner};
 /// would cost more than it says.
 const BADGE_MIN_WIDTH: usize = 56;
 
+/// The cells a rate needs, held back on any rail wide enough for the badge.
+///
+/// Sized for a four-digit figure because a fast hosted stream reaches those, and
+/// a reserve that only fitted three digits would put the vanishing act back at
+/// the moment the model sped up.
+const RATE_RESERVE: usize = " ~0000 tok/s".len();
+
 pub fn render(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let line = rail(app, theme, area.width);
     frame.render_widget(Paragraph::new(line), area);
@@ -35,9 +42,10 @@ pub fn rail(app: &App, theme: &Theme, width: u16) -> Line<'static> {
     let badge = badge(app, theme);
     let badge_width: usize = badge.iter().map(Span::width).sum();
     // Only reserve room for the badge on a terminal that can afford both it and
-    // the chain; otherwise the chain would shorten to make space for a word.
+    // the chain; otherwise the chain would shorten to make space for a word. The
+    // rate is reserved along with it, and always, whether or not one is showing.
     let reserve = if budget >= BADGE_MIN_WIDTH {
-        badge_width + 2
+        badge_width + 2 + RATE_RESERVE
     } else {
         0
     };
@@ -84,6 +92,26 @@ pub fn rail(app: &App, theme: &Theme, width: u16) -> Line<'static> {
     // balance the wordmark on the left instead of trailing off mid-line.
     let used: usize = head.iter().map(Span::width).sum();
     if badge_width > 0 && used + badge_width + 2 <= budget {
+        // The rate was originally left to ride on whatever padding the chain left
+        // over, on the reasoning that the chain and the state word both say more
+        // than an estimate. That was wrong, and the reason is worth keeping: the
+        // chain re-measures itself against the width and steps up to a longer
+        // form the moment one fits, so at some widths the leftover shrank below
+        // the number and the rate disappeared — at *exactly* the widths where the
+        // chain grew, and back again when it grew enough to have room to spare.
+        // A figure that comes and goes with the size of the terminal reads as a
+        // figure that does not exist, which is the one thing this must not do.
+        //
+        // So it is given a slot of its own in the reserve above. `slack` is now
+        // positive by construction wherever the badge is drawn at all, and this
+        // check is the belt to that pair of braces.
+        let mut badge = badge;
+        let mut badge_width = badge_width;
+        if let Some(spans) = rate_spans(app, theme, budget - used - badge_width - 2) {
+            badge_width += spans.iter().map(Span::width).sum::<usize>();
+            badge.extend(spans);
+        }
+
         head.push(Span::styled(
             " ".repeat(budget - used - badge_width),
             theme.faint,
@@ -94,9 +122,36 @@ pub fn rail(app: &App, theme: &Theme, width: u16) -> Line<'static> {
     Line::from(head)
 }
 
+/// The streaming rate, when there is one and the padding can hold it.
+///
+/// `slack` is what the chain and the state word have left over, so a rail with no
+/// room to spare shows no rate rather than a shorter chain.
+fn rate_spans(app: &App, theme: &Theme, slack: usize) -> Option<Vec<Span<'static>>> {
+    let value = app.stream_rate()?;
+    let span = Span::styled(format!(" {}", rate(value)), theme.faint);
+
+    (span.width() <= slack).then(|| vec![span])
+}
+
+/// A rate, to the precision it has earned: whole tokens once there are ten of
+/// them, and a tenth below that, where the difference between 2 and 2.5 is the
+/// difference between usable and not.
+///
+/// The tilde is not decoration. This figure is inferred from characters rather
+/// than counted, and the rail is the only place it appears, so it is marked rather
+/// than left to read as something a tier reported.
+fn rate(value: f64) -> String {
+    if value >= 10.0 {
+        format!("~{value:.0} tok/s")
+    } else {
+        format!("~{value:.1} tok/s")
+    }
+}
+
 /// What the app is doing, at the far right of the rail. The spinner lives here
-/// rather than beside the wordmark so there is exactly one moving thing on the
-/// top line, and it is next to the word it belongs to.
+/// rather than beside the wordmark so the top line moves in one place, next to the
+/// word it belongs to — and the streaming rate hangs off it for the same reason,
+/// rather than sitting somewhere of its own.
 fn badge(app: &App, theme: &Theme) -> Vec<Span<'static>> {
     if app.active_tier_name().is_none() {
         return Vec::new();
@@ -466,5 +521,174 @@ mod tests {
     fn clamping_to_nothing_draws_nothing() {
         let spans = vec![Span::raw("abc")];
         assert!(clamp(spans, 0).is_empty());
+    }
+
+    /// A busy app mid-reply: `chars` characters in over `ticks` redraws.
+    fn streaming_app(labels: &[&str], chars: usize, ticks: u64) -> App {
+        let mut app = app_with(labels);
+        app.busy = true;
+        app.tick = 100;
+        app.pretend_to_stream(chars, ticks);
+        app
+    }
+
+    #[test]
+    fn the_rail_shows_the_rate_while_the_model_writes() {
+        // 360 characters is 90 tokens at the assumed ratio, over the 3.6s in which
+        // they arrived.
+        let app = streaming_app(&["Local"], 360, 40);
+        let text = text_of(&rail(&app, &Theme::default(), 200));
+
+        assert!(text.contains("working"), "{text}");
+        assert!(text.contains("~25 tok/s"), "{text}");
+        // Marked as an estimate, because it is one: no tier reported this.
+        assert!(text.contains('~'), "{text}");
+    }
+
+    #[test]
+    fn a_rail_with_nothing_arriving_shows_no_rate() {
+        let mut app = app_with(&["Local"]);
+        app.busy = true;
+        app.tick = 100;
+        let text = text_of(&rail(&app, &Theme::default(), 200));
+
+        assert!(text.contains("working"), "{text}");
+        assert!(!text.contains("tok/s"), "{text}");
+        assert!(!text.contains('~'), "{text}");
+    }
+
+    #[test]
+    fn the_rate_gives_way_before_the_state_word_does() {
+        // Room for the chain and the word, but not the ~10 cells a rate needs on
+        // top. The word stays and the number goes: it says more.
+        let app = streaming_app(&["Local"], 360, 40);
+        assert!(app.stream_rate().is_some(), "the rate exists to be dropped");
+
+        let text = text_of(&rail(&app, &Theme::default(), 30));
+
+        assert!(text.contains("working"), "{text}");
+        assert!(!text.contains("tok/s"), "{text}");
+    }
+
+    #[test]
+    fn a_rail_with_a_rate_never_draws_wider_than_it_was_given() {
+        // The rate is padded into place with arithmetic rather than measured into
+        // it, so this is where it would overflow if the sum were wrong.
+        let app = streaming_app(&["Local (http://192.168.1.50:1234/v1)", "Grok"], 400, 20);
+        for width in [16u16, 24, 30, 40, 56, 60, 80, 120, 200] {
+            let line = rail(&app, &Theme::default(), width);
+            assert!(
+                line.width() <= width as usize,
+                "rail overflowed {width} cells at {}: {:?}",
+                line.width(),
+                text_of(&line)
+            );
+        }
+    }
+
+    #[test]
+    fn the_rate_keeps_the_state_word_on_the_right_edge() {
+        let app = streaming_app(&["Local"], 360, 40);
+        let text = text_of(&rail(&app, &Theme::default(), 200));
+
+        assert!(text.ends_with("~25 tok/s"), "{text:?}");
+    }
+
+    #[test]
+    fn a_rate_reads_whole_tokens_once_there_are_ten_of_them() {
+        assert_eq!(rate(38.4), "~38 tok/s");
+        assert_eq!(rate(10.0), "~10 tok/s");
+    }
+
+    #[test]
+    fn a_rate_below_ten_keeps_a_decimal() {
+        // Where the difference between 2 and 2.5 is the difference between usable
+        // and not, the whole number is not enough.
+        assert_eq!(rate(2.54), "~2.5 tok/s");
+        assert_eq!(rate(9.9), "~9.9 tok/s");
+    }
+
+    #[test]
+    fn a_rate_is_drawn_at_every_width_that_draws_the_badge() {
+        // The regression this pins: the rate used to ride on the chain's leftover
+        // padding, and the chain steps up to a longer form as the rail gets wider.
+        // Between 69 and 78 cells with this label the chain grew into the rate's
+        // space and the number silently vanished, then came back at 79 — so a
+        // waveform of a fast model looked like a terminal that could not show it.
+        //
+        // Wherever the state word is drawn there is room for the number, at every
+        // width, and that is the invariant rather than any particular width.
+        let app = streaming_app(
+            &["Local model (http://192.168.1.50:1234/v1)", "Grok"],
+            360,
+            40,
+        );
+        assert!(app.stream_rate().is_some(), "there is a rate to draw");
+
+        // Below BADGE_MIN_WIDTH the rail is chain-first by design and reserves
+        // nothing, so a short chain on a very narrow terminal can still carry the
+        // state word with no room for a number beside it. From there up the
+        // reserve is unconditional, and the number is drawn with the word.
+        for width in BADGE_MIN_WIDTH as u16..=200 {
+            let text = text_of(&rail(&app, &Theme::default(), width));
+            if text.contains("working") {
+                assert!(
+                    text.contains("tok/s"),
+                    "the badge is drawn at {width} cells but not the rate: {text:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_rate_does_not_widen_the_rail_it_is_reserved_on() {
+        // The reservation must not be spent twice, and the invariant above must
+        // not be bought by letting the badge push past the edge.
+        let app = streaming_app(
+            &["Local model (http://192.168.1.50:1234/v1)", "Grok"],
+            360,
+            40,
+        );
+        for width in 1u16..=200 {
+            let line = rail(&app, &Theme::default(), width);
+            assert!(
+                line.width() <= width as usize,
+                "rail overflowed {width} cells at {}",
+                line.width()
+            );
+        }
+    }
+
+    #[test]
+    fn the_reserved_slot_does_not_make_the_chain_re_flow() {
+        // Reserved, not spent, and reserved whether or not it is in use: the chain
+        // must read identically either way. The tempting alternative — reserving
+        // only while a rate exists — would re-flow the top line at every start and
+        // stop of the text, which is several times a turn.
+        let labels = ["Local model (http://192.168.1.50:1234/v1)", "Grok"];
+        let streaming = streaming_app(&labels, 360, 40);
+        let mut quiet = app_with(&labels);
+        quiet.busy = true;
+        quiet.tick = 100;
+
+        let with = text_of(&rail(&streaming, &Theme::default(), 120));
+        let without = text_of(&rail(&quiet, &Theme::default(), 120));
+
+        assert!(with.contains("tok/s"), "{with:?}");
+        assert!(!without.contains("tok/s"), "{without:?}");
+
+        // Everything up to the number itself — the wordmark, the chain in
+        // whichever form it fits, the state word — is the same on both rails.
+        let words = |text: &str| -> Vec<String> {
+            text.split_whitespace()
+                .take_while(|word| !word.starts_with('~'))
+                .map(str::to_string)
+                .collect()
+        };
+        assert_eq!(
+            words(&with),
+            words(&without),
+            "the chain must not shrink when the rate starts"
+        );
     }
 }

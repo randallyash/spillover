@@ -6,6 +6,61 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **A live `~42 tok/s` in the rail while a tier writes.** How fast a local model
+  actually goes is the number that decides whether it is worth keeping, and it belongs
+  on screen while the answer arrives rather than in a summary afterwards. It sits at the
+  right of the header beside the state word, and goes when the model stops.
+
+  It is inferred rather than counted, and the `~` says so. Tiers report tokens only when
+  they choose to, and at the end of a reply, so a figure that moves while the text
+  arrives has to come from the characters instead — divided by a ratio learned from any
+  turn that *did* report usage, so it settles toward the model in use rather than
+  assuming four characters to a token forever. Three things keep that learning honest: a
+  turn that called a tool is skipped, because tool arguments arrive as structure and
+  never stream as text, so its completion tokens would weigh more than the characters
+  counted and every rate after it would read high; a consult is skipped, because its
+  answer goes to a discard channel and the characters to hand are the driver's; and the
+  learned ratio is clamped, so one strange turn cannot spoil the session.
+
+  Timed from the first character of the message rather than from the request, so a local
+  model's prefill — seconds of loading and reading a long prompt before a single token —
+  is not charged to writing. That is the difference between a figure that describes
+  generation and one that makes a fast model look slow. The clock is the redraw tick,
+  which is an estimate as well: a tick the interface was too busy to take is skipped
+  rather than replayed, so a starved interface reads a little fast. Nothing is shown
+  until there is enough of a stream to divide by, because a number that swings is worse
+  than no number at all.
+
+  It holds a slot of its own on the rail, reserved whether or not a number is showing at
+  that moment, so the chain never re-flows to make space for it as the text starts and
+  stops — which is several times a turn. An earlier cut had it ride on whatever padding
+  the chain left over, which looked harmless and was not: the chain re-measures itself
+  against the width and steps up to a longer form the moment one fits, so at some widths
+  — 69 to 78 cells with a typical local label — the leftover shrank below the number and
+  the rate vanished, then reappeared as the terminal grew further. A figure that comes
+  and goes with the size of the terminal reads as a figure that does not exist, and the
+  rail is the only place it appears. Below 56 cells the rail is chain-first by design:
+  the number is given up rather than the chain shortened.
+
+### Fixed
+
+- **A model grinding against the same missing file is spilled on Windows too.** The
+  error classifier knew a missing file only by Unix wording, so on Windows — where the
+  same absent path reads "The system cannot find the file specified. (os error 2)" — the
+  identical failure was filed as an unknown one. Nothing accumulated, and the tighter
+  budget that spills a model walking into one obstacle rather than discovering several
+  never fired, leaving the guarantee quietly absent on that platform. It recognises that
+  wording now, and matches the error numbers parenthesised: a bare `os error 2` also
+  matches `os error 20`, which is ENOTDIR — a directory where a file was expected, not an
+  absence — so filing it as one would spill a model that is reading a directory listing.
+
+  The fixture that covers this asserted on Unix prose, which is why it passed here and
+  failed there; it asserts on the error number now. A test pinning the Windows wording
+  runs on every platform, so the next hole of this kind is caught before a push rather
+  than after it.
+
 ## [0.1.1] - 2026-09-11
 
 ### Added

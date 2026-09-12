@@ -33,6 +33,37 @@ const HISTORY: usize = 48;
 /// pause in the work.
 pub(crate) const HANDOFF_TICKS: u64 = 4;
 
+/// How often the interface redraws while a turn is running.
+///
+/// Fast enough that the spinner reads as motion rather than as a sequence of
+/// stills, slow enough that a redraw is nothing next to the model it is waiting
+/// on. It lives here rather than in the event loop because this file also
+/// *measures* in ticks — the streaming rate is characters against ticks — and a
+/// second copy of the figure could disagree with the first.
+pub const TICK: std::time::Duration = std::time::Duration::from_millis(90);
+
+/// Characters per token assumed until a turn reports real usage. English prose
+/// runs around four; code and tool arguments run lower, so the first reply that
+/// counts itself corrects this.
+const ASSUMED_CHARS_PER_TOKEN: f64 = 4.0;
+
+/// The band a learned ratio is kept in. A reply that reported two tokens for a
+/// long message, or a flood of them for a short one, would otherwise teach a
+/// ratio that makes every rate after it nonsense.
+const CHARS_PER_TOKEN_MIN: f64 = 2.0;
+const CHARS_PER_TOKEN_MAX: f64 = 8.0;
+
+/// Completion tokens a turn must report before its own ratio is allowed to teach
+/// anything. Below this the sample says less than the guess it would replace.
+const CALIBRATE_MIN_TOKENS: u64 = 20;
+
+/// The least stream a rate can be read from. A few characters over a fraction of
+/// a second divides out to a number that swings wildly without saying anything,
+/// so below either floor no rate is shown at all — which is honest in a way a
+/// noisy figure is not.
+const RATE_MIN_CHARS: usize = 24;
+const RATE_MIN_TICKS: u64 = 3;
+
 /// A handoff that has been announced and is still being shown.
 ///
 /// The beat is presentation only: the agent retries the moment the verdict
@@ -101,6 +132,19 @@ pub struct App {
     commands: Option<UnboundedSender<Command>>,
     /// Index of the assistant message currently being streamed into.
     streaming: Option<usize>,
+    /// Characters streamed into the message being written, and the tick its first
+    /// one arrived on. Reset when a new message starts, because a rate describes
+    /// the text arriving now rather than the turn that text is part of.
+    stream_chars: usize,
+    stream_started: Option<u64>,
+    /// How many characters of this model's output make a token. A conventional
+    /// guess until a turn reports real usage, and learned from one after that.
+    chars_per_token: f64,
+    /// Whether a tool has run during this turn. A tool call's arguments arrive as
+    /// structure rather than as text, so a reply that called one has completion
+    /// tokens the character count never saw; a ratio learned from it would read
+    /// every later rate high, so those turns are not allowed to teach.
+    tool_ran_this_turn: bool,
     /// Index of the notice for a tool that is still running. The transcript puts
     /// a spinner here instead of the arrow it was written with.
     pub running: Option<usize>,
@@ -183,6 +227,10 @@ impl App {
             should_quit: false,
             commands: None,
             streaming: None,
+            stream_chars: 0,
+            stream_started: None,
+            chars_per_token: ASSUMED_CHARS_PER_TOKEN,
+            tool_ran_this_turn: false,
             running: None,
             approval: None,
             busy: false,
@@ -343,6 +391,16 @@ impl App {
     #[cfg(test)]
     pub fn record_usage(&mut self, usage: &crate::provider::Usage) {
         self.record_usage_on(None, usage);
+    }
+
+    /// Put the app in the state a streaming reply leaves it in, so the rail can be
+    /// asked to draw a rate with no model behind it: `chars` characters arriving
+    /// over the last `ticks` redraws.
+    #[cfg(test)]
+    pub fn pretend_to_stream(&mut self, chars: usize, ticks: u64) {
+        self.streaming = Some(0);
+        self.stream_chars = chars;
+        self.stream_started = Some(self.tick.saturating_sub(ticks));
     }
 
     /// Whether a tier is being narrated as abandoned right now, and which one.
@@ -637,6 +695,78 @@ impl App {
         self.scroll_back = 0;
     }
 
+    /// How fast the model is writing, in tokens per second.
+    ///
+    /// Estimated rather than counted, and the reason is worth stating: tokens are
+    /// reported only by the tiers that choose to report them, and at the end of a
+    /// reply, so a figure that moves while the text arrives has to come from the
+    /// characters instead. What it divides by is learned from any turn that did
+    /// report real usage (`learn_chars_per_token`) and is a conventional guess
+    /// until one has.
+    ///
+    /// The clock starts at the first character of the message being written rather
+    /// than at the request, so a local model's prefill — which for a long prompt is
+    /// seconds of reading before a single token — is not charged to writing. That
+    /// is the difference between a figure that describes generation and one that
+    /// makes a fast model look slow.
+    ///
+    /// `None` when no text is arriving, which is most of the time, and until there
+    /// is enough of a stream for the answer to mean anything.
+    ///
+    /// The clock is the redraw tick rather than a wall clock, since that is what
+    /// this file already measures in — and a tick the loop was too busy to take is
+    /// skipped rather than replayed, so a starved interface reads a little fast.
+    pub fn stream_rate(&self) -> Option<f64> {
+        // Nothing is being written, so there is no rate to report.
+        self.streaming?;
+
+        // And until the first character has arrived there is no clock to time it
+        // against either.
+        let started = self.stream_started?;
+        let ticks = self.tick.saturating_sub(started);
+        if ticks < RATE_MIN_TICKS || self.stream_chars < RATE_MIN_CHARS {
+            return None;
+        }
+
+        let seconds = ticks as f64 * TICK.as_secs_f64();
+        let tokens = self.stream_chars as f64 / self.chars_per_token;
+
+        Some(tokens / seconds)
+    }
+
+    /// Learn what a token is worth in characters from a reply that reported one.
+    ///
+    /// The divisor is the one part of the estimate that can be *known* rather than
+    /// assumed, and this is where it stops being assumed. The gates are what make
+    /// the comparison fair:
+    ///
+    /// - A turn that ran a tool is skipped, because its completion tokens include
+    ///   the call's arguments, which never stream as text — the ratio would come
+    ///   out low and every rate after it high.
+    /// - A consult is skipped, by requiring that the usage belongs to the tier
+    ///   that is answering: a consultant's answer goes to a discard channel, so
+    ///   the characters to hand belong to somebody else.
+    /// - A reply too short to be a measurement is skipped, and the result is
+    ///   clamped, so one strange turn cannot spoil the figure for the session.
+    ///
+    /// The measurement is taken rather than read, so a report is paired with the
+    /// stream it belongs to and a later one cannot reuse an earlier reply's
+    /// characters.
+    fn learn_chars_per_token(&mut self, tier: &str, completion_tokens: u64) {
+        let streamed = std::mem::take(&mut self.stream_chars);
+
+        if self.tool_ran_this_turn
+            || self.active_tier_name() != Some(tier)
+            || streamed == 0
+            || completion_tokens < CALIBRATE_MIN_TOKENS
+        {
+            return;
+        }
+
+        let measured = streamed as f64 / completion_tokens as f64;
+        self.chars_per_token = measured.clamp(CHARS_PER_TOKEN_MIN, CHARS_PER_TOKEN_MAX);
+    }
+
     pub fn handle_agent_event(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::Text(chunk) => {
@@ -649,15 +779,29 @@ impl App {
                         self.messages.push(Message::assistant(""));
                         let index = self.messages.len() - 1;
                         self.streaming = Some(index);
+                        // A new message is a new measurement: the rate describes
+                        // the text arriving now. Its clock starts at the first
+                        // character, not at the request, so the seconds a local
+                        // model spends reading the prompt are not charged to
+                        // writing and a fast model does not look slow.
+                        self.stream_chars = 0;
+                        self.stream_started = Some(self.tick);
                         index
                     }
                 };
+                self.stream_chars += chunk.chars().count();
                 if let Some(message) = self.messages.get_mut(index) {
                     message.text.push_str(&chunk);
                 }
             }
             AgentEvent::ToolStarted { name, preview } => {
                 self.streaming = None;
+                // A tool call's arguments arrive as structure, never as text, so
+                // from here this turn's completion tokens and its streamed
+                // characters are no longer the same thing. Remembered for the
+                // rest of the turn, because usage is reported per attempt and
+                // arrives after the tool has run.
+                self.tool_ran_this_turn = true;
                 self.messages.push(Message::system(format!(
                     "→ {name}  {}",
                     first_line(&preview)
@@ -688,12 +832,19 @@ impl App {
                 // counted twice: an attempt that was abandoned, one that
                 // answered, and a consult all arrive here.
                 self.record_usage_on(Some(&tier), &usage);
+                self.learn_chars_per_token(&tier, usage.completion_tokens);
                 crate::provider::accumulate(&mut self.turn_usage, Some(usage));
             }
             AgentEvent::Finished { stop_reason } => {
                 self.streaming = None;
                 self.running = None;
                 self.busy = false;
+                // The turn is over, so the next one starts with a clean sheet: a
+                // turn that ran a tool must not go on disqualifying the turns that
+                // follow it, and no measurement outlives the stream it described.
+                self.tool_ran_this_turn = false;
+                self.stream_chars = 0;
+                self.stream_started = None;
                 // The beat belongs to a turn that is still running. It has to be
                 // dropped here rather than left to expire on its own, because the
                 // tick counter stops when nothing is busy — a beat left set would
@@ -1002,6 +1153,9 @@ impl App {
                     self.cache_read = 0;
                     self.cache_write = 0;
                     self.turn_usage = None;
+                    self.tool_ran_this_turn = false;
+                    self.stream_chars = 0;
+                    self.stream_started = None;
                     self.scroll_back = 0;
                 }
             }
@@ -1468,6 +1622,223 @@ mod tests {
         assert!(texts.iter().any(|t| t.contains("✓ read_file")));
         // The trailing text must not be appended to the pre-tool message.
         assert_eq!(texts.last(), Some(&"done"));
+    }
+
+    /// Stream a reply of `chars` characters, long enough to clear the floor a rate
+    /// needs so that a test is about the rate rather than about the minimum.
+    fn send_chars(app: &mut App, chars: usize) {
+        app.handle_agent_event(AgentEvent::Text("x".repeat(chars)));
+    }
+
+    /// A completion report for the answering tier, as the agent sends one.
+    fn reports(app: &mut App, tier: &str, completion_tokens: u64) {
+        app.handle_agent_event(AgentEvent::Spent {
+            tier: tier.to_string(),
+            usage: crate::provider::Usage {
+                completion_tokens,
+                ..Default::default()
+            },
+        });
+    }
+
+    #[test]
+    fn no_rate_is_offered_until_there_is_a_stream_to_read() {
+        let (mut app, _commands) = attached_app();
+        type_and_send(&mut app, "hello");
+
+        assert!(
+            app.stream_rate().is_none(),
+            "a turn that has not started writing has no rate"
+        );
+
+        // Text on this very tick leaves no elapsed time to divide by.
+        send_chars(&mut app, 400);
+        assert!(app.stream_rate().is_none(), "nothing has elapsed yet");
+
+        // Enough time, but too few characters to be anything but noise.
+        app.stream_chars = 4;
+        app.tick = 100;
+        assert!(app.stream_rate().is_none(), "four characters is noise");
+    }
+
+    #[test]
+    fn the_rate_is_measured_from_the_first_chunk_not_from_the_request() {
+        let (mut app, _commands) = attached_app();
+        type_and_send(&mut app, "hello");
+
+        // The prompt has been in the model's hands for a while: a local model
+        // reading a long prompt spends seconds here before writing anything.
+        app.tick = 100;
+        send_chars(&mut app, 360);
+
+        // 360 characters at the assumed four to a token is 90 tokens, over the 3.6s
+        // since the first character arrived. Charging the prefill as well would
+        // report 90/12.6, and make every local model look slow.
+        app.tick = 140;
+        let rate = app.stream_rate().expect("a rate once text is arriving");
+
+        assert!(
+            (rate - 25.0).abs() < 0.01,
+            "expected 25 tok/s from the first chunk, got {rate}"
+        );
+    }
+
+    #[test]
+    fn each_message_is_measured_on_its_own_clock() {
+        let (mut app, _commands) = attached_app();
+        type_and_send(&mut app, "hello");
+
+        app.tick = 50;
+        send_chars(&mut app, 360);
+
+        // A tool ends the message. The answer after it is a different reply and is
+        // timed from its own first character, not from the one before the tool.
+        app.handle_agent_event(AgentEvent::ToolStarted {
+            name: "read_file".to_string(),
+            preview: "read notes.txt".to_string(),
+        });
+        app.tick = 200;
+        send_chars(&mut app, 360);
+        app.tick = 240;
+
+        let rate = app.stream_rate().expect("the answer is streaming");
+        assert!(
+            (rate - 25.0).abs() < 0.01,
+            "the tool's 110 ticks must not be charged to writing: {rate}"
+        );
+    }
+
+    #[test]
+    fn a_reply_that_counted_itself_teaches_what_a_token_weighs() {
+        let (mut app, _commands) = attached_app();
+        type_and_send(&mut app, "hello");
+        send_chars(&mut app, 300);
+
+        reports(&mut app, "Local model", 100);
+
+        assert_eq!(
+            app.chars_per_token, 3.0,
+            "300 characters for 100 tokens is three to a token"
+        );
+
+        // And the estimate uses it, which is the only reason to learn it: a fresh
+        // reply of the same 300 characters is 100 tokens, over 1.8s.
+        app.streaming = None;
+        app.tick = 100;
+        send_chars(&mut app, 300);
+        app.tick = 120;
+
+        let rate = app.stream_rate().expect("a rate");
+        assert!(
+            (rate - 55.56).abs() < 0.1,
+            "the learned ratio should be in use, not the guess: {rate}"
+        );
+    }
+
+    #[test]
+    fn a_turn_that_ran_a_tool_teaches_nothing() {
+        let (mut app, _commands) = attached_app();
+        type_and_send(&mut app, "hello");
+        send_chars(&mut app, 300);
+        app.handle_agent_event(AgentEvent::ToolStarted {
+            name: "read_file".to_string(),
+            preview: "read notes.txt".to_string(),
+        });
+
+        reports(&mut app, "Local model", 100);
+
+        assert_eq!(
+            app.chars_per_token, ASSUMED_CHARS_PER_TOKEN,
+            "the arguments never streamed, so the comparison is not fair"
+        );
+    }
+
+    #[test]
+    fn a_consult_does_not_teach_the_answering_tiers_ratio() {
+        let (mut app, _commands) = attached_app();
+        type_and_send(&mut app, "hello");
+        send_chars(&mut app, 300);
+
+        reports(&mut app, "DeepSeek", 100);
+
+        assert_eq!(
+            app.chars_per_token, ASSUMED_CHARS_PER_TOKEN,
+            "the characters to hand belong to the driver, not the consultant"
+        );
+    }
+
+    #[test]
+    fn a_reply_too_short_to_measure_teaches_nothing() {
+        let (mut app, _commands) = attached_app();
+        type_and_send(&mut app, "hello");
+        send_chars(&mut app, 300);
+
+        reports(&mut app, "Local model", CALIBRATE_MIN_TOKENS - 1);
+
+        assert_eq!(app.chars_per_token, ASSUMED_CHARS_PER_TOKEN);
+    }
+
+    #[test]
+    fn a_wild_ratio_is_kept_within_reason() {
+        let (mut app, _commands) = attached_app();
+        type_and_send(&mut app, "hello");
+
+        // Four thousand characters for twenty tokens is 200 to a token, which would
+        // report every rate afterwards at fifty times life size.
+        send_chars(&mut app, 4_000);
+        reports(&mut app, "Local model", CALIBRATE_MIN_TOKENS);
+        assert_eq!(app.chars_per_token, CHARS_PER_TOKEN_MAX);
+
+        // And the other way: a couple of tokens' worth of report against a long
+        // stream would make every later rate read low.
+        app.stream_chars = 300;
+        reports(&mut app, "Local model", 200);
+        assert_eq!(app.chars_per_token, CHARS_PER_TOKEN_MIN);
+    }
+
+    #[test]
+    fn a_report_cannot_reuse_an_earlier_replys_characters() {
+        let (mut app, _commands) = attached_app();
+        type_and_send(&mut app, "hello");
+        send_chars(&mut app, 300);
+        reports(&mut app, "Local model", 100);
+        assert_eq!(app.chars_per_token, 3.0);
+
+        // A second report for the same tier, with no new text behind it. If the
+        // first had not consumed the characters it was paired with, this would
+        // measure itself against them and read 6.0.
+        reports(&mut app, "Local model", 50);
+
+        assert_eq!(
+            app.chars_per_token, 3.0,
+            "a report is paired with its own stream, and only once"
+        );
+    }
+
+    #[test]
+    fn a_tool_in_one_turn_does_not_disqualify_the_next() {
+        let (mut app, _commands) = attached_app();
+        type_and_send(&mut app, "hello");
+        send_chars(&mut app, 300);
+        app.handle_agent_event(AgentEvent::ToolStarted {
+            name: "read_file".to_string(),
+            preview: "read notes.txt".to_string(),
+        });
+        app.handle_agent_event(AgentEvent::Finished {
+            stop_reason: Some("stop".to_string()),
+        });
+        assert_eq!(app.chars_per_token, ASSUMED_CHARS_PER_TOKEN);
+
+        // The next turn answers with prose and no tools, which is the fair sample
+        // the last turn could not be.
+        type_and_send(&mut app, "and now?");
+        send_chars(&mut app, 300);
+        reports(&mut app, "Local model", 100);
+
+        assert_eq!(
+            app.chars_per_token, 3.0,
+            "one turn's tools must not silence every turn after it"
+        );
     }
 
     #[test]

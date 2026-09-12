@@ -51,10 +51,25 @@ impl ErrorClass {
         let text = message.to_lowercase();
         let has = |needles: &[&str]| needles.iter().any(|needle| text.contains(needle));
 
-        if has(&["no such file", "does not exist", "command not found"]) {
+        if has(&[
+            "no such file",
+            "does not exist",
+            "command not found",
+            // Windows reports the same absence as "The system cannot find the
+            // file specified. (os error 2)", which shares none of the words
+            // above. Without these the identical missing file is filed as an
+            // unknown failure there, so a repeat never accumulates and the
+            // tighter budget for walking into one obstacle never fires.
+            "cannot find the file",
+            "cannot find path",
+            // Parenthesised on purpose: "os error 20" is ENOTDIR, which is a
+            // directory where a file was expected, not an absence. A bare
+            // "os error 2" would read as a prefix of it and misfile it.
+            "(os error 2)",
+        ]) {
             return Self::NotFound;
         }
-        if has(&["permission denied", "os error 13", "access is denied"]) {
+        if has(&["permission denied", "(os error 13)", "access is denied"]) {
             return Self::PermissionDenied;
         }
         if has(&[
@@ -352,6 +367,32 @@ mod tests {
         assert_eq!(
             ErrorClass::classify("could not write /etc/hosts: Permission denied (os error 13)"),
             ErrorClass::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn the_windows_wording_for_a_missing_file_is_the_same_fact() {
+        // The same absent file, reported by a Windows runner. Until these were
+        // recognised, three identical `read_file` failures on one missing file
+        // were filed as unknown failures there — so nothing accumulated and the
+        // tighter budget that spills a model stuck on one obstacle never fired.
+        for message in [
+            "could not read C:\\work\\a.rs: The system cannot find the file specified. (os error 2)",
+            "the system cannot find the file",
+            "cannot find path 'C:\\work\\a.rs' because it does not exist",
+        ] {
+            assert_eq!(
+                ErrorClass::classify(message),
+                ErrorClass::NotFound,
+                "{message}"
+            );
+        }
+        // The error number has to be paired with its class rather than merely
+        // contained in another: ENOTDIR is not an absence, and filing it as one
+        // would spill a model that is reading a directory listing.
+        assert_eq!(
+            ErrorClass::classify("could not read /x/a.rs: Not a directory (os error 20)"),
+            ErrorClass::Other
         );
     }
 

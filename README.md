@@ -463,6 +463,22 @@ state word at the far right spins while a turn is in flight. When the chain does
 the rail shortens the tier names, and then falls back to just the answering tier and its
 position ("2/3") rather than clipping the chain.
 
+That line also says how fast the model is going: `~42 tok/s` while text arrives, and
+`ready` when nothing is. The tilde is the honest part. A tier reports tokens only if it
+chooses to and only once it has finished, so a figure that moves has to be inferred from
+the characters coming back, divided by a ratio learned from any turn that did report real
+usage. The clock starts at the first character rather than at your prompt, because a local
+model spends its first seconds loading and reading — and counting that as writing is what
+makes a fast model look slow.
+
+The number keeps a slot of its own on the rail rather than taking whatever the chain
+happens to leave over. That is deliberate: the chain re-measures itself as the terminal
+changes size and steps up to a longer name the moment one fits, so a number riding on the
+leftover would keep being squeezed out — and then reappear as the terminal grew, which
+reads as the number not existing rather than as a narrow window. On a terminal too narrow
+to hold the chain, the state word and the number all at once, the chain and the word stay
+and the number is not shown.
+
 Below that is the conversation. The model's markdown is rendered rather than shown raw:
 headings take weight, inline code is styled, a fenced block becomes a framed box with its
 language on the top edge, bullets become dots, and a quote gets a bar down its side. A bar

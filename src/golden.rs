@@ -777,11 +777,15 @@ async fn a_model_stuck_on_a_missing_file_is_spilled() {
         .iter()
         .find(|message| message["role"] == "tool")
         .expect("the third result must be in the history");
+    // The wording around it is the platform's own — Windows says "The system
+    // cannot find the file specified" where Unix says "No such file or
+    // directory" — so the portable thing to pin is the error number, which is
+    // the part that means the same thing on both.
     assert!(
         result["content"]
             .as_str()
             .unwrap_or_default()
-            .contains("No such file or directory"),
+            .contains("(os error 2)"),
         "the real IO error is what the classifier read: {result:#?}"
     );
 

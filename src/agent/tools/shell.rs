@@ -244,17 +244,19 @@ mod tests {
         // A command can do anything — write a file, delete a tree, talk to the
         // network. There is no honest way to reverse that, so it offers nothing
         // rather than a partial reversal that would be worse than none.
-        let (shell, flag) = crate::provider::cli::portable_shell();
         let dir = tempfile::tempdir().expect("tempdir");
 
+        // A bare command, not a shell invocation: the tool already wraps what it
+        // is given in the platform's own shell. Naming `sh` here put
+        // `'echo hello'` in front of `cmd`, whose single quotes are not quoting
+        // at all, so the command failed and the test proved the opposite of its
+        // point.
         let outcome = RunShell
-            .run(
-                &json!({"command": format!("{shell} {flag} 'echo hello'")}),
-                dir.path(),
-            )
+            .run(&json!({"command": "echo hello"}), dir.path())
             .await;
 
         assert!(!outcome.is_error, "{}", outcome.content);
+        assert!(outcome.content.contains("hello"), "{}", outcome.content);
         assert!(
             outcome.undo.is_none(),
             "a shell command must never claim to be reversible"

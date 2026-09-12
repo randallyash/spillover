@@ -207,13 +207,6 @@ async fn main() {
 /// with room for a slow one.
 const MODELS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// How often the interface redraws while a turn is running.
-///
-/// Fast enough that the spinner reads as motion rather than as a sequence of
-/// stills, slow enough that a redraw is nothing next to the model it is waiting
-/// on.
-const TICK: std::time::Duration = std::time::Duration::from_millis(90);
-
 async fn run(mut config: Config) -> io::Result<()> {
     // Nothing configured. Look for a model that is already running before
     // asking anyone anything, and only interrupt with setup if there is nothing
@@ -303,7 +296,10 @@ async fn run(mut config: Config) -> io::Result<()> {
     let (tx, mut input_rx) = mpsc::unbounded_channel::<InputEvent>();
     event::spawn_input_thread(tx);
 
-    let mut ticker = tokio::time::interval(TICK);
+    // The redraw interval lives with the state it drives, because the interface
+    // also measures in ticks: the streaming rate is characters over ticks, and two
+    // copies of this figure could drift apart.
+    let mut ticker = tokio::time::interval(crate::app::TICK);
     // A redraw missed because the loop was busy should be skipped rather than
     // replayed in a burst to catch up.
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
