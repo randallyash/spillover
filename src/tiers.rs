@@ -7,7 +7,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::config::{Config, TierKind};
+use crate::config::{Config, TierClass, TierKind};
 use crate::fallback::{FallbackChain, Tier};
 use crate::preset::{Library, cli_spec, openai_settings};
 use crate::provider::Provider;
@@ -90,6 +90,25 @@ pub fn notes(library: &Library, config: &Config) -> Vec<String> {
     notes
 }
 
+/// Which class a configured tier belongs to.
+///
+/// One definition, shared with `doctor`, so the timeouts a report shows are the
+/// timeouts the agent will actually apply rather than a second guess at them.
+/// An endpoint whose URL cannot be resolved falls back to the hosted numbers,
+/// which is the conservative direction: it cannot accidentally grant the local
+/// grace period to something reached over the network.
+pub fn class_of(library: &Library, tier: &crate::config::Tier) -> TierClass {
+    match tier.kind {
+        TierKind::OpenAi => openai_settings(library, tier)
+            .map(|settings| TierClass::of_endpoint(&settings.base_url))
+            .unwrap_or(TierClass::Hosted),
+        // A CLI harness runs locally but reaches a remote model, and its first
+        // line of output includes the harness starting up. That is slow for
+        // reasons a local server is not, so it keeps the hosted numbers.
+        TierKind::Cli => TierClass::Hosted,
+    }
+}
+
 /// Build a provider for each configured tier, in order.
 ///
 /// Fails rather than skipping: a shortened chain is a fallback that never
@@ -122,9 +141,15 @@ pub async fn build(
                     }
                 };
 
+                // Where the endpoint lives decides the timeouts this tier is
+                // judged by: a model on the LAN may need a minute to load weights
+                // before its first token, where a hosted one that is silent for
+                // half a minute is simply broken.
+                let limits = tier.limits.resolve(class_of(library, tier));
                 let provider = OpenAiProvider::new(tier.display_name(), settings.base_url, api_key);
                 let label = provider.describe();
-                let mut built = Tier::new(label, model, Arc::new(provider), tier.limits.clone());
+                let mut built =
+                    Tier::with_id(tier.id.clone(), label, model, Arc::new(provider), limits);
                 built.on_stuck = tier.on_stuck;
                 built.consults_per_turn = tier.consults_per_turn;
                 tiers.push(built);
@@ -137,7 +162,13 @@ pub async fn build(
                 let model = spec.model.clone().unwrap_or_else(|| tier.id.clone());
                 let provider = CliProvider::new(tier.display_name(), spec, workspace.to_path_buf());
                 let label = provider.describe();
-                let mut built = Tier::new(label, model, Arc::new(provider), tier.limits.clone());
+                // A CLI harness runs locally but reaches a remote model, and its
+                // first line of output includes the harness starting up. That is
+                // slow for reasons a local server is not, so it keeps the hosted
+                // numbers rather than getting the local model's patience.
+                let limits = tier.limits.resolve(class_of(library, tier));
+                let mut built =
+                    Tier::with_id(tier.id.clone(), label, model, Arc::new(provider), limits);
                 built.on_stuck = tier.on_stuck;
                 built.consults_per_turn = tier.consults_per_turn;
                 tiers.push(built);

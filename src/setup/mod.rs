@@ -12,7 +12,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::config::{Limits, OnStuck, Tier, TierKind};
+use crate::config::{LimitOverrides, OnStuck, Tier, TierKind};
 use crate::preset::Library;
 use crate::setup::probe::{Found, Readiness, unserved_model};
 
@@ -749,6 +749,9 @@ fn make_tier(
         model_args: Vec::new(),
         extra_args: Vec::new(),
         approve_args: Vec::new(),
+        // Read-only flags come from the preset too, and only matter to a
+        // consult: a CLI that has none is never asked as a consultant.
+        read_only_args: Vec::new(),
         workdir_args: Vec::new(),
         // Session flags come from the preset, which is what makes continuity
         // work without the wizard knowing anything about it.
@@ -762,7 +765,10 @@ fn make_tier(
         // value depends on the model and the answer.
         on_stuck: OnStuck::default(),
         consults_per_turn: crate::config::DEFAULT_CONSULTS_PER_TURN,
-        limits: Limits::default(),
+        // No overrides: the tier's class decides the timeouts, so a local server
+        // found running gets the patience a local server needs without the wizard
+        // knowing anything about it.
+        limits: LimitOverrides::default(),
     }
 }
 

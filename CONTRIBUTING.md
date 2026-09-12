@@ -1,5 +1,24 @@
 # Contributing
 
+## Scope: the agent does not grow
+
+Seven tools — `read_file`, `list_dir`, `glob`, `grep`, `write_file`, `edit_file`,
+`run_shell` — and that is the budget for 0.1.x. No MCP, no browser, no image tools.
+
+Every tool is another way for a local model to loop, and another way for spill to
+drift into being a worse copy of the harnesses it exists to fall back from. The set
+is closed deliberately, and `the_tool_set_is_closed` in `src/agent/tools/mod.rs`
+fails if an eighth appears. That test failing is not a chore to be updated: it is
+the argument having to be made. If a tool is genuinely worth it, say in the commit
+what it buys that the seven do not.
+
+The same applies to slash commands: `commands.rs` has a test for the ones that
+belong to another tool's config or have no machinery here.
+
+What the agent *does* get is better behaviour from what it already has — a sharper
+detector, a clearer handoff, `/undo` for the last approved write. Prefer that to
+another verb.
+
 ## Development setup
 
 Requires Rust 1.85 or newer (edition 2024).

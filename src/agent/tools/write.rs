@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use crate::agent::tools::{Args, Risk, Tool, ToolOutcome, object_schema, resolve};
+use crate::agent::undo::Undo;
 
 pub struct WriteFile;
 
@@ -72,6 +73,12 @@ impl Tool for WriteFile {
             Err(error) => return error,
         };
         let path = resolve(workspace, raw);
+        let content = content.to_string();
+
+        // Read before the write, which is the only moment the old bytes exist.
+        // `content` is what will be there afterwards, so the fingerprint needs no
+        // read-back.
+        let undo = Undo::capture("write_file", path.clone(), content.as_bytes()).await;
 
         let previous = tokio::fs::metadata(&path).await.map(|m| m.len()).ok();
 
@@ -86,7 +93,7 @@ impl Tool for WriteFile {
             }
         }
 
-        if let Err(error) = tokio::fs::write(&path, content).await {
+        if let Err(error) = tokio::fs::write(&path, &content).await {
             return ToolOutcome::error(format!("could not write {}: {error}", path.display()));
         }
 
@@ -99,6 +106,10 @@ impl Tool for WriteFile {
             content.len(),
             path.display()
         ))
+        // Only on a successful write: a write that failed changed nothing, and
+        // offering to undo it would be offering to undo something that is not
+        // there.
+        .undoing(undo)
     }
 }
 
@@ -194,5 +205,63 @@ mod tests {
             .run(&json!({"path": "adir", "content": "x"}), dir.path())
             .await;
         assert!(outcome.is_error);
+    }
+
+    #[tokio::test]
+    async fn a_successful_write_hands_back_the_means_to_reverse_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("f.txt"), "the original").expect("write");
+
+        let outcome = WriteFile
+            .run(&json!({"path": "f.txt", "content": "junk"}), dir.path())
+            .await;
+
+        let undo = outcome.undo.expect("a write should be reversible");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).expect("read"),
+            "junk"
+        );
+        undo.restore().await.expect("and the undo should work");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).expect("read"),
+            "the original"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_created_file_is_remembered_as_having_had_nothing_there() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outcome = WriteFile
+            .run(
+                &json!({"path": "brand/new.txt", "content": "junk"}),
+                dir.path(),
+            )
+            .await;
+
+        let undo = outcome.undo.expect("even a creation can be undone");
+        undo.restore().await.expect("undone");
+        assert!(
+            !dir.path().join("brand/new.txt").exists(),
+            "the created file should be gone"
+        );
+        assert!(
+            !dir.path().join("brand").exists(),
+            "and so should the directory it created"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_write_that_failed_offers_nothing_to_undo() {
+        // Nothing changed, so there is nothing to put back — and offering to
+        // undo it would make `/undo` reach a write that never happened.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join("adir")).expect("mkdir");
+
+        let outcome = WriteFile
+            .run(&json!({"path": "adir", "content": "x"}), dir.path())
+            .await;
+
+        assert!(outcome.is_error);
+        assert!(outcome.undo.is_none(), "a failed write changed nothing");
     }
 }

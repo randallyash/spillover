@@ -75,6 +75,13 @@ api_key_env = "HF_TOKEN"
 # `session_args` to open one; a CLI that picks its own gets only `resume_args`,
 # and the id is read out of its output. Neither is shipped speculatively: a
 # preset without them works exactly as it did, sending the whole transcript.
+#
+# `read_only_args` is the flag that makes the CLI read-only for one run — a plan
+# mode, a sandbox policy, a Q&A mode. It is used only when this tier is the
+# consultant in a consult, and it is the only way to stop a CLI consultant from
+# acting instead of answering: spill can withhold tools from an endpoint, not
+# from a harness it does not run. Every flag below was checked against that
+# CLI's own `--help`, and a CLI with none is simply never consulted.
 
 [[cli]]
 id = "command-code"
@@ -85,6 +92,9 @@ args = ["-p", "{prompt}"]
 model_args = ["-m", "{model}"]
 extra_args = ["--output-format", "json"]
 approve_args = ["--yolo"]
+# Plan mode is read-only, which is what lets this tier answer a consult without
+# the power to edit anything the driver was doing.
+read_only_args = ["--plan"]
 # `cmd` has no flag to name a new session, but it prints the `sessionId` it chose
 # on its `run_start` event, and `--session <id>` resumes that transcript. So the
 # second turn onwards continues the conversation instead of resending it.
@@ -101,6 +111,7 @@ args = ["-p", "{prompt}"]
 model_args = ["-m", "{model}"]
 extra_args = ["--output-format", "streaming-json"]
 approve_args = ["--always-approve"]
+read_only_args = ["--permission-mode", "plan"]
 workdir_args = ["--cwd", "{workspace}"]
 # `-s` opens a session under a UUID we choose; `-r` resumes it.
 session_args = ["-s", "{session}"]
@@ -116,6 +127,7 @@ dialect = "plain"
 args = ["-p", "{prompt}"]
 model_args = ["--model", "{model}"]
 approve_args = ["--dangerously-skip-permissions"]
+read_only_args = ["--permission-mode", "plan"]
 
 [[cli]]
 id = "gemini"
@@ -124,6 +136,7 @@ bin = "gemini"
 dialect = "plain"
 args = ["-p", "{prompt}"]
 model_args = ["-m", "{model}"]
+read_only_args = ["--approval-mode", "plan"]
 
 [[cli]]
 id = "copilot"
@@ -142,11 +155,16 @@ dialect = "plain"
 args = ["-p", "{prompt}"]
 model_args = ["--model", "{model}"]
 approve_args = ["--yolo"]
+# "ask" is the read-only Q&A mode: it explains, it does not edit.
+read_only_args = ["--mode", "ask"]
 
 # Subcommand-style CLIs. Neither the model flag's position nor where an
 # unattended flag belongs relative to the subcommand could be verified, so
 # neither is shipped: the CLI keeps its own default model and its own
 # permissions, which is the safe way round. Both can be added in config.
+#
+# `-s read-only` *was* verified to parse after the prompt, so codex can still be
+# a consultant even though it cannot be made unattended here.
 
 [[cli]]
 id = "codex"
@@ -154,6 +172,7 @@ name = "Codex"
 bin = "codex"
 dialect = "plain"
 args = ["exec", "{prompt}"]
+read_only_args = ["--sandbox", "read-only"]
 
 [[cli]]
 id = "opencode"

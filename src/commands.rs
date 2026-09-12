@@ -86,6 +86,11 @@ pub const CATALOGUE: &[Spec] = &[
         summary: "Start a new conversation, keeping the tiers as they are",
     },
     Spec {
+        name: "undo",
+        arg: Arg::None,
+        summary: "Put back the last file an approved write changed",
+    },
+    Spec {
         name: "help",
         arg: Arg::None,
         summary: "Show every command and key",

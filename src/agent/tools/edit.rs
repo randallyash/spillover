@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use crate::agent::tools::{Args, Risk, Tool, ToolOutcome, object_schema, resolve};
+use crate::agent::undo::Undo;
 
 /// How many changed lines the preview will show.
 const MAX_PREVIEW_LINES: usize = 24;
@@ -140,6 +141,15 @@ impl Tool for EditFile {
             text.replacen(old, new, 1)
         };
 
+        // Both versions are already in hand here, so the means to reverse this
+        // costs nothing extra: the text that was read is the text to put back.
+        let undo = Undo::from_previous(
+            "edit_file",
+            path.clone(),
+            text.as_bytes(),
+            updated.as_bytes(),
+        );
+
         if let Err(error) = tokio::fs::write(&path, &updated).await {
             return ToolOutcome::error(format!("could not write {}: {error}", path.display()));
         }
@@ -151,6 +161,7 @@ impl Tool for EditFile {
             text.len(),
             updated.len()
         ))
+        .undoing(undo)
     }
 }
 
@@ -357,5 +368,47 @@ mod tests {
     fn an_empty_search_never_counts_as_a_match() {
         assert_eq!(count_matches("abc", ""), 0);
         assert_eq!(count_matches("aaa", "a"), 3);
+    }
+
+    #[tokio::test]
+    async fn an_edit_hands_back_the_bytes_it_replaced() {
+        // The read it already does to find the text is the same read that makes
+        // the undo possible, so this costs no extra IO at all.
+        let (_dir, workspace) = fixture("alpha\nbeta\ngamma\n");
+        let outcome = EditFile
+            .run(
+                &json!({"path": "f.txt", "old_string": "beta", "new_string": "BETA"}),
+                &workspace,
+            )
+            .await;
+
+        let undo = outcome.undo.expect("an edit should be reversible");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("f.txt")).expect("read"),
+            "alpha\nBETA\ngamma\n"
+        );
+
+        undo.restore().await.expect("the undo should work");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("f.txt")).expect("read"),
+            "alpha\nbeta\ngamma\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_edit_offers_nothing_to_undo() {
+        let (_dir, workspace) = fixture("x\nx\n");
+        let outcome = EditFile
+            .run(
+                &json!({"path": "f.txt", "old_string": "x", "new_string": "y"}),
+                &workspace,
+            )
+            .await;
+
+        assert!(outcome.is_error);
+        assert!(
+            outcome.undo.is_none(),
+            "nothing was written, so there is nothing to put back"
+        );
     }
 }

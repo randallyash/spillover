@@ -161,6 +161,50 @@ pub trait Provider: Send + Sync {
         events: UnboundedSender<StreamEvent>,
     ) -> Result<TurnSummary, ProviderError>;
 
+    /// Why this tier cannot answer a consult, if it cannot.
+    ///
+    /// A consult is one narrow question whose answer must be prose, and the
+    /// whole mechanic rests on the consultant being *unable* to act on it. An
+    /// `openai` tier is held to that by being sent no tools, so it has nothing
+    /// to call. A `cli` tier runs its own harness and its own tools, which
+    /// spill cannot withhold — the only lever is a flag that makes the run
+    /// read-only. A tier with no such flag is refused here, and the turn
+    /// escalates, rather than being asked politely and trusted to behave.
+    fn consult_refusal(&self) -> Option<String> {
+        None
+    }
+
+    /// Ask one narrow question and take only prose back.
+    ///
+    /// The default is the ordinary request, which is already the right shape
+    /// for an HTTP tier: it carries no tools, so there is nothing to call and
+    /// the answer can only be text. A CLI overrides this, because a request it
+    /// cannot see the tools of has to be constrained on the command line.
+    async fn consult(
+        &self,
+        request: ChatRequest,
+        events: UnboundedSender<StreamEvent>,
+    ) -> Result<TurnSummary, ProviderError> {
+        self.stream(request, events).await
+    }
+
+    /// The provider-side conversation this tier is following, if any.
+    ///
+    /// Only a delegated CLI has one: an HTTP endpoint is stateless, re-sent the
+    /// whole history every turn, and so has nothing to report. This exists so a
+    /// conversation can be written to disk and picked up again after a restart,
+    /// which is otherwise impossible — the id lives behind a lock inside the
+    /// provider and nothing else can see it.
+    fn session_id(&self) -> Option<String> {
+        None
+    }
+
+    /// Adopt the conversation this tier was following before the last restart.
+    ///
+    /// A stateless tier ignores it, which is the correct behaviour rather than a
+    /// shortcut: it has no conversation of its own to restore.
+    fn set_session(&self, _id: Option<String>) {}
+
     /// Forget any continued session, because this tier's conversation was
     /// discarded and it must not resume one that holds that output.
     ///

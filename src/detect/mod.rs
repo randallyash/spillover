@@ -13,6 +13,122 @@ use std::time::Duration;
 use crate::config::Limits;
 use crate::detect::repetition::RepetitionDetector;
 
+/// What kind of failure a tool reported.
+///
+/// The point of this is to tell a model that is stuck against one wall from a
+/// model having an unlucky run. Three different reads that *succeed* are work;
+/// three reads of a path that does not exist are the model guessing. Counting the
+/// kind is what separates them.
+///
+/// Classification reads the tool's own message, which this project writes: the
+/// file tools wrap `std::io::Error`, and the argument checks are ours. An
+/// unrecognised message is `Other` rather than a guess at a neighbouring class,
+/// because a wrong class would tighten a budget that has no business being tight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorClass {
+    /// The file or directory is not there.
+    NotFound,
+    /// The filesystem refused. Retrying the same call cannot help.
+    PermissionDenied,
+    /// The call itself was wrong — a missing argument, an empty string, a glob
+    /// that will not parse. The model has to fix its arguments.
+    InvalidArguments,
+    /// It ran out of time. Transient by nature, so it is judged more gently.
+    Timeout,
+    /// Anything not recognised.
+    Other,
+}
+
+impl ErrorClass {
+    /// Classify a failed tool's message.
+    ///
+    /// Ordered most specific first, and the needles are deliberately narrow: a
+    /// bare "not found" would also match "old_string was not found", which is the
+    /// model's argument being wrong rather than the file being absent. A needle
+    /// that is a substring of another class's message is a needle that will
+    /// eventually misfile one.
+    pub fn classify(message: &str) -> Self {
+        let text = message.to_lowercase();
+        let has = |needles: &[&str]| needles.iter().any(|needle| text.contains(needle));
+
+        if has(&["no such file", "does not exist", "command not found"]) {
+            return Self::NotFound;
+        }
+        if has(&["permission denied", "os error 13", "access is denied"]) {
+            return Self::PermissionDenied;
+        }
+        if has(&[
+            "missing required argument",
+            "was empty; pass the value",
+            "must not be empty",
+            "not a valid glob",
+            "old_string was not found",
+            "there is no tool called",
+            "was not valid json",
+        ]) {
+            return Self::InvalidArguments;
+        }
+        if has(&["did not finish within", "timed out", "timeout"]) {
+            return Self::Timeout;
+        }
+        Self::Other
+    }
+
+    /// How this reads in a one-line summary.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NotFound => "no such file",
+            Self::PermissionDenied => "permission denied",
+            Self::InvalidArguments => "bad arguments",
+            Self::Timeout => "timed out",
+            Self::Other => "failing",
+        }
+    }
+
+    /// Whether a repeat of this failure only counts when it is the *same* call.
+    ///
+    /// True for the classes that report on the world: three missing files at
+    /// three different paths are three different obstacles — which is exactly
+    /// what looking for a `.env`, a `Makefile` and a `pyproject.toml` looks like
+    /// — where three at the same path is one obstacle the model keeps walking
+    /// into.
+    ///
+    /// False for a malformed call, which is the model's own output being wrong
+    /// wherever it was aimed: a fourth bad argument is the same wall as the first
+    /// three, and the target says nothing about it.
+    pub fn needs_the_same_target(self) -> bool {
+        !matches!(self, Self::InvalidArguments)
+    }
+
+    /// How many times this class may repeat before it is a stall, when repeating
+    /// it is evidence of anything at all.
+    ///
+    /// `None` for the classes where it is not: a timeout may well work on the
+    /// next try, and an unrecognised failure is not known to mean anything.
+    /// Those are left entirely to the tier's own `max_repeat_run`, and a genuine
+    /// run of them is reported by the general failure rule rather than as one
+    /// wall.
+    ///
+    /// `Some` is never larger than the configured allowance, so this can only
+    /// make detection tighter and can never loosen a tier that configured itself
+    /// strictly. Three is the floor for the classes where repetition means the
+    /// model is not adapting: it has been shown the same thing three times.
+    pub fn repeat_budget(self, configured: usize) -> Option<usize> {
+        match self {
+            Self::NotFound | Self::PermissionDenied | Self::InvalidArguments => {
+                Some(configured.min(3))
+            }
+            Self::Timeout | Self::Other => None,
+        }
+    }
+}
+
+impl fmt::Display for ErrorClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StuckReason {
     /// Output degenerated into the same line or span over and over.
@@ -21,6 +137,16 @@ pub enum StuckReason {
     RepeatedToolCall { tool: String, times: usize },
     /// Consecutive tool calls all failed, so it is not learning from them.
     RepeatedToolFailure { tool: String, times: usize },
+    /// The same kind of failure, from the same tool, over and over.
+    ///
+    /// Stronger evidence than `RepeatedToolFailure`: a general run of failures
+    /// can be bad luck, where the *same* failure repeating says the model has
+    /// been shown the same wall and is not adapting to it.
+    RepeatedToolError {
+        tool: String,
+        class: ErrorClass,
+        times: usize,
+    },
     /// No frame arrived within the tier's allowance.
     Stall { seconds: u64 },
     /// The whole step budget went by without a final answer.
@@ -48,6 +174,9 @@ impl StuckReason {
             }
             Self::RepeatedToolFailure { tool, times } => {
                 format!("{tool} failed {times} times in a row")
+            }
+            Self::RepeatedToolError { tool, class, times } => {
+                format!("{tool} failed {times} times with the same error ({class})")
             }
             Self::Stall { seconds } => format!("went quiet for {seconds}s"),
             Self::StepLimit { steps } => {
@@ -206,5 +335,108 @@ mod tests {
     fn display_matches_the_summary() {
         let reason = StuckReason::StepLimit { steps: 5 };
         assert_eq!(reason.to_string(), reason.summary());
+    }
+
+    // ---- classifying a failure --------------------------------------------
+
+    #[test]
+    fn a_wrapped_io_error_is_classified_by_the_error_underneath() {
+        // The exact shape read_file produces: our own wrapper, then the OS error
+        // that says which kind of failure this actually is.
+        assert_eq!(
+            ErrorClass::classify(
+                "could not read /home/x/a.rs: No such file or directory (os error 2)"
+            ),
+            ErrorClass::NotFound
+        );
+        assert_eq!(
+            ErrorClass::classify("could not write /etc/hosts: Permission denied (os error 13)"),
+            ErrorClass::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn a_refusal_and_a_malformed_call_are_both_the_models_own_doing() {
+        for message in [
+            "missing required argument \"path\" (expected a string)",
+            "path was empty; pass the value you intended",
+            "old_string must not be empty; give the text you want to replace",
+            "\"src/*.rs\" is not a valid glob: unexpected end of input",
+            "old_string was not found in /x/a.rs; read the file and match its text exactly",
+            "there is no tool called \"read\"",
+        ] {
+            assert_eq!(
+                ErrorClass::classify(message),
+                ErrorClass::InvalidArguments,
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_killed_command_is_a_timeout() {
+        assert_eq!(
+            ErrorClass::classify("\"cargo test\" did not finish within 120s and was killed"),
+            ErrorClass::Timeout
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_failure_is_not_guessed_at() {
+        // The safe direction: an unknown message must not borrow a tighter
+        // budget from a class it might not belong to.
+        for message in [
+            "the search task failed: broken pipe",
+            "something went wrong",
+            "",
+        ] {
+            assert_eq!(
+                ErrorClass::classify(message),
+                ErrorClass::Other,
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dead_end_failure_earns_a_budget_and_a_transient_one_earns_none() {
+        // Three times is the point at which repeating yourself reads as not
+        // adapting. A timeout or an unknown failure has no budget of its own, so
+        // only the tier's general allowance applies to those.
+        assert_eq!(ErrorClass::NotFound.repeat_budget(4), Some(3));
+        assert_eq!(ErrorClass::PermissionDenied.repeat_budget(4), Some(3));
+        assert_eq!(ErrorClass::InvalidArguments.repeat_budget(4), Some(3));
+        assert_eq!(ErrorClass::Timeout.repeat_budget(4), None);
+        assert_eq!(ErrorClass::Other.repeat_budget(4), None);
+    }
+
+    #[test]
+    fn the_class_budget_never_raises_a_tier_that_asked_for_less() {
+        for class in [
+            ErrorClass::NotFound,
+            ErrorClass::PermissionDenied,
+            ErrorClass::InvalidArguments,
+            ErrorClass::Timeout,
+            ErrorClass::Other,
+        ] {
+            assert!(
+                class.repeat_budget(2).is_none_or(|budget| budget <= 2),
+                "{class:?} would loosen a tier that asked for two"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failure_about_the_world_needs_the_same_target_to_count() {
+        // Probing for files that are not there is investigation; a call the model
+        // got wrong is a mistake wherever it was aimed. Only the second may
+        // accumulate across different targets.
+        assert!(ErrorClass::NotFound.needs_the_same_target());
+        assert!(ErrorClass::PermissionDenied.needs_the_same_target());
+        assert!(ErrorClass::Timeout.needs_the_same_target());
+        assert!(
+            !ErrorClass::InvalidArguments.needs_the_same_target(),
+            "bad arguments are the model's own doing, whatever the target"
+        );
     }
 }

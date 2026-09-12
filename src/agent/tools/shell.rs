@@ -238,4 +238,26 @@ mod tests {
             "{preview}"
         );
     }
+
+    #[tokio::test]
+    async fn a_shell_command_offers_nothing_to_undo() {
+        // A command can do anything — write a file, delete a tree, talk to the
+        // network. There is no honest way to reverse that, so it offers nothing
+        // rather than a partial reversal that would be worse than none.
+        let (shell, flag) = crate::provider::cli::portable_shell();
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let outcome = RunShell
+            .run(
+                &json!({"command": format!("{shell} {flag} 'echo hello'")}),
+                dir.path(),
+            )
+            .await;
+
+        assert!(!outcome.is_error, "{}", outcome.content);
+        assert!(
+            outcome.undo.is_none(),
+            "a shell command must never claim to be reversible"
+        );
+    }
 }

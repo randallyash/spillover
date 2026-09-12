@@ -20,6 +20,18 @@ use crate::session::{ChatMessage, Role};
 /// How much of a CLI's stderr to keep for the error message.
 const MAX_STDERR: usize = 1_500;
 
+/// The hard instruction that leads a consult's prompt.
+///
+/// A CLI is launched read-only for a consult, and this is the other half of
+/// that: the flags are what the CLI enforces, and this says so plainly, so the
+/// model answers instead of trying to work around tools it has been told to
+/// use. It goes first, ahead of the evidence, because a CLI's own harness
+/// prompt is long and a request buried under it is a request it can ignore.
+const CONSULT_GUARD: &str = "You are being consulted, not asked to do the work. This run is \
+     read-only: your tools are disabled, so do not read, write, edit, search, or run anything, \
+     and do not ask to. Answer the question below in prose, in a single reply, using only what \
+     it already tells you.";
+
 #[derive(Debug, Clone)]
 pub struct CliSpec {
     pub bin: String,
@@ -31,6 +43,9 @@ pub struct CliSpec {
     pub extra_args: Vec<String>,
     /// Added only when the user has opted in to unattended runs.
     pub approve_args: Vec<String>,
+    /// Added only to a consult, to make the run read-only. Empty means this CLI
+    /// cannot be consulted at all.
+    pub read_only_args: Vec<String>,
     /// Added after everything else, for CLIs that want the directory spelled out.
     pub workdir_args: Vec<String>,
     /// Flags that open a session under an id spill chooses, with `{session}`
@@ -138,20 +153,31 @@ impl CliProvider {
         }
     }
 
-    fn build_args(&self, prompt: &str, session: &SessionCall) -> Vec<String> {
+    /// Substitute the placeholders an argument template may carry.
+    ///
+    /// Borrowed rather than owned so it can be reused across the several lists
+    /// that make up an invocation, and so the prompt is not copied per argument.
+    fn substituter<'a>(
+        &'a self,
+        prompt: &'a str,
+        session_id: &'a str,
+    ) -> impl Fn(&str) -> String + 'a {
         let workspace = self.workspace.display().to_string();
-        let model = self.spec.model.as_deref().unwrap_or_default();
+        let model = self.spec.model.clone().unwrap_or_default();
+        move |arg: &str| {
+            arg.replace("{prompt}", prompt)
+                .replace("{workspace}", &workspace)
+                .replace("{model}", &model)
+                .replace("{session}", session_id)
+        }
+    }
+
+    fn build_args(&self, prompt: &str, session: &SessionCall) -> Vec<String> {
         let session_id = match session {
             SessionCall::Fresh => "",
             SessionCall::Open(id) | SessionCall::Continue(id) => id,
         };
-
-        let substitute = |arg: &str| {
-            arg.replace("{prompt}", prompt)
-                .replace("{workspace}", &workspace)
-                .replace("{model}", model)
-                .replace("{session}", session_id)
-        };
+        let substitute = self.substituter(prompt, session_id);
 
         let mut args: Vec<String> = self.spec.args.iter().map(|a| substitute(a)).collect();
         if self.spec.model.is_some() {
@@ -173,6 +199,28 @@ impl CliProvider {
         args.extend(self.spec.workdir_args.iter().map(|a| substitute(a)));
         args
     }
+
+    /// The argument vector for a consult.
+    ///
+    /// Deliberately *not* `build_args` with a session of its own. A consult is
+    /// one stateless reply, so it carries no session flags — there is no
+    /// conversation to continue and no id worth recording. And it must never
+    /// carry the unattended flags: `--yolo` would hand back precisely the
+    /// power the read-only flags exist to remove, so a tier that normally runs
+    /// unattended is held to reading for this one call. What it does carry is
+    /// the tier's own invocation plus those read-only flags.
+    fn build_consult_args(&self, prompt: &str) -> Vec<String> {
+        let substitute = self.substituter(prompt, "");
+
+        let mut args: Vec<String> = self.spec.args.iter().map(|a| substitute(a)).collect();
+        if self.spec.model.is_some() {
+            args.extend(self.spec.model_args.iter().map(|a| substitute(a)));
+        }
+        args.extend(self.spec.extra_args.iter().map(|a| substitute(a)));
+        args.extend(self.spec.read_only_args.iter().map(|a| substitute(a)));
+        args.extend(self.spec.workdir_args.iter().map(|a| substitute(a)));
+        args
+    }
 }
 
 #[async_trait]
@@ -186,7 +234,6 @@ impl Provider for CliProvider {
         request: ChatRequest,
         events: UnboundedSender<StreamEvent>,
     ) -> Result<TurnSummary, ProviderError> {
-        let bin = self.spec.bin.clone();
         let session = self.plan_session();
         // A continued session already holds everything up to this turn, so
         // resending the transcript would duplicate the whole conversation in
@@ -197,6 +244,75 @@ impl Provider for CliProvider {
             _ => render_prompt(&request.messages),
         };
         let args = self.build_args(&prompt, &session);
+
+        let summary = self.run(args, events).await?;
+
+        if self.spec.captures_session() {
+            self.note_session(&summary);
+        }
+
+        Ok(summary)
+    }
+
+    /// One consult: the question led by the guard, and the run held read-only.
+    ///
+    /// `try_consult` refuses a consultant whose `consult_refusal` is set, so by
+    /// the time this runs there are read-only flags to add. Nothing here
+    /// touches this tier's session: a consult is a fresh, stateless reply, and
+    /// it must not leave the CLI holding a conversation that a later
+    /// escalation would resume as if it were the driver's.
+    async fn consult(
+        &self,
+        request: ChatRequest,
+        events: UnboundedSender<StreamEvent>,
+    ) -> Result<TurnSummary, ProviderError> {
+        let prompt = format!("{CONSULT_GUARD}\n\n{}", render_prompt(&request.messages));
+        let args = self.build_consult_args(&prompt);
+        self.run(args, events).await
+    }
+
+    fn consult_refusal(&self) -> Option<String> {
+        if !self.spec.read_only_args.is_empty() {
+            return None;
+        }
+        Some(
+            "it runs its own tools and has no read-only mode configured, so it could act instead \
+             of answering"
+                .to_string(),
+        )
+    }
+
+    fn session_id(&self) -> Option<String> {
+        self.session.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    fn set_session(&self, id: Option<String>) {
+        // An empty id is not a session: a CLI that reported a blank string would
+        // otherwise resume a conversation that cannot exist.
+        let id = id.filter(|value| !value.trim().is_empty());
+        if let Ok(mut slot) = self.session.lock() {
+            *slot = id;
+        }
+    }
+
+    fn forget_session(&self) {
+        if let Ok(mut slot) = self.session.lock() {
+            *slot = None;
+        }
+    }
+}
+
+impl CliProvider {
+    /// Spawn the CLI with these arguments and collect its answer.
+    ///
+    /// Shared by the ordinary path and the consult path, which differ only in
+    /// their arguments and in whether the run belongs to a session.
+    async fn run(
+        &self,
+        args: Vec<String>,
+        events: UnboundedSender<StreamEvent>,
+    ) -> Result<TurnSummary, ProviderError> {
+        let bin = self.spec.bin.clone();
 
         let mut child = crate::spawn::delegated_cli(&bin)
             .args(&args)
@@ -281,17 +397,7 @@ impl Provider for CliProvider {
             });
         }
 
-        if self.spec.captures_session() {
-            self.note_session(&summary);
-        }
-
         Ok(summary)
-    }
-
-    fn forget_session(&self) {
-        if let Ok(mut slot) = self.session.lock() {
-            *slot = None;
-        }
     }
 }
 
@@ -434,6 +540,7 @@ mod tests {
             model_args: vec!["-m".to_string(), "{model}".to_string()],
             extra_args: Vec::new(),
             approve_args: vec!["--yolo".to_string()],
+            read_only_args: Vec::new(),
             workdir_args: Vec::new(),
             session_args: Vec::new(),
             resume_args: Vec::new(),
@@ -821,6 +928,7 @@ mod tests {
             model_args: vec!["-m".to_string(), "{model}".to_string()],
             extra_args: vec!["--output-format".to_string(), "streaming-json".to_string()],
             approve_args: vec!["--always-approve".to_string()],
+            read_only_args: Vec::new(),
             workdir_args: vec!["--cwd".to_string(), "{workspace}".to_string()],
             session_args: Vec::new(),
             resume_args: Vec::new(),
@@ -870,6 +978,7 @@ mod tests {
             model_args: Vec::new(),
             extra_args: vec!["--output-format".to_string(), "json".to_string()],
             approve_args: vec!["--yolo".to_string()],
+            read_only_args: Vec::new(),
             workdir_args: Vec::new(),
             session_args: Vec::new(),
             resume_args: Vec::new(),
@@ -891,6 +1000,7 @@ mod tests {
             model_args: Vec::new(),
             extra_args: Vec::new(),
             approve_args: Vec::new(),
+            read_only_args: Vec::new(),
             workdir_args: Vec::new(),
             session_args: Vec::new(),
             resume_args: Vec::new(),
@@ -903,5 +1013,156 @@ mod tests {
             .build_args("a; rm -rf /tmp/x", &SessionCall::Fresh);
         // The dangerous text stays inside one argument.
         assert_eq!(args, vec!["-p", "a; rm -rf /tmp/x"]);
+    }
+
+    /// A CLI whose preset names a read-only mode, which is what makes it
+    /// consultable at all.
+    fn consult_spec(body: &str) -> CliSpec {
+        let mut spec = spec(body, Dialect::Plain);
+        spec.read_only_args = vec!["--permission-mode".to_string(), "plan".to_string()];
+        spec
+    }
+
+    #[test]
+    fn a_consult_carries_the_read_only_flags_and_nothing_that_widens_them() {
+        let mut spec = consult_spec("echo hi");
+        // Everything that could widen the child's powers, all present on the
+        // tier: a consult has to drop every one of them.
+        spec.approve_all = true;
+        spec.approve_args = vec!["--yolo".to_string()];
+        spec.session_args = vec!["-s".to_string(), "{session}".to_string()];
+        spec.resume_args = vec!["-r".to_string(), "{session}".to_string()];
+        spec.workdir_args = vec!["--cwd".to_string(), "{workspace}".to_string()];
+        let provider = CliProvider::new("grok", spec, PathBuf::from("/tmp"));
+
+        assert_eq!(
+            provider.build_consult_args("question"),
+            vec![
+                "-c",
+                "echo hi",
+                "question",
+                "--permission-mode",
+                "plan",
+                "--cwd",
+                "/tmp",
+            ],
+            "the read-only flags go in; --yolo and the session flags stay out"
+        );
+    }
+
+    #[test]
+    fn a_cli_without_a_read_only_flag_refuses_to_be_consulted() {
+        // The guarantee is that a consultant cannot act. A harness spill does
+        // not run cannot be stripped of its tools, so without a flag to hold it
+        // there is no consult to be had.
+        let plain = provider(spec("echo hi", Dialect::Plain), Path::new("/tmp"));
+        assert!(
+            plain.consult_refusal().is_some(),
+            "no read-only flag means no consult"
+        );
+
+        let guarded = provider(consult_spec("echo hi"), Path::new("/tmp"));
+        assert!(
+            guarded.consult_refusal().is_none(),
+            "a read-only flag is what makes a CLI consultable"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_consult_leads_with_the_guard_instruction() {
+        // The flags are what the CLI enforces; the guard is what tells the model
+        // why it has no tools. A prompt that did not open with it would let the
+        // CLI's own long harness prompt bury the request to answer rather than
+        // act.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = provider(consult_spec(echo_body()), dir.path());
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let summary = provider
+            .consult(
+                ChatRequest {
+                    model: "test-model".to_string(),
+                    messages: vec![ChatMessage::user("why is it stuck?")],
+                    tools: Vec::new(),
+                },
+                tx,
+            )
+            .await
+            .expect("the consult should succeed");
+
+        // `echo_body` prints the first two arguments and then the prompt.
+        let parts: Vec<&str> = summary.text.split('|').collect();
+        assert_eq!(parts[0], "--permission-mode", "the flag must be passed");
+        assert_eq!(parts[1], "plan");
+        assert!(
+            parts[2].starts_with("You are being consulted"),
+            "the guard must lead the prompt: {}",
+            parts[2]
+        );
+        assert!(
+            parts[2].contains("why is it stuck?"),
+            "the question must still be there: {}",
+            parts[2]
+        );
+    }
+
+    #[test]
+    fn the_followed_session_can_be_read_out_and_put_back() {
+        // The read/restore pair is what lets a conversation outlive the process:
+        // the id is otherwise sealed inside this provider.
+        let provider = provider(minting_spec("echo hi"), Path::new("/tmp"));
+        assert_eq!(provider.session_id(), None);
+
+        provider.set_session(Some("abc-123".to_string()));
+        assert_eq!(provider.session_id().as_deref(), Some("abc-123"));
+
+        // A blank id is not a conversation, and resuming one would send a flag
+        // naming nothing.
+        provider.set_session(Some("   ".to_string()));
+        assert_eq!(provider.session_id(), None);
+
+        provider.set_session(Some("abc-123".to_string()));
+        provider.set_session(None);
+        assert_eq!(provider.session_id(), None);
+    }
+
+    #[tokio::test]
+    async fn a_restored_session_is_resumed_rather_than_started_over() {
+        // The point of saving the id: the first turn after a restart continues
+        // the CLI's own conversation instead of flattening the whole transcript
+        // into its prompt and paying for all of it again.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = provider(minting_spec(echo_body()), dir.path());
+
+        provider.set_session(Some("from-last-time".to_string()));
+
+        let resumed: Vec<String> = turn(&provider, follow_up("second question"))
+            .await
+            .text
+            .split('|')
+            .map(str::to_string)
+            .collect();
+
+        assert_eq!(resumed[0], "-r", "it should resume, not open");
+        assert_eq!(resumed[1], "from-last-time");
+        assert_eq!(
+            resumed[2], "second question",
+            "only the new turn goes out, because the CLI already has the rest"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_forgotten_session_makes_the_next_turn_start_over() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = provider(minting_spec(echo_body()), dir.path());
+        provider.set_session(Some("stale".to_string()));
+
+        provider.forget_session();
+        assert_eq!(provider.session_id(), None, "forgetting clears the id");
+
+        let opened = turn(&provider, conversation("first question")).await;
+        let parts: Vec<&str> = opened.text.split('|').collect();
+        assert_eq!(parts[0], "-s", "a fresh session is opened");
+        assert!(parts[2].contains("first question"), "{}", parts[2]);
     }
 }

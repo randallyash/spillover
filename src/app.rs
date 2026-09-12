@@ -12,6 +12,7 @@ use crate::agent::{Canceller, Command, Mode};
 use crate::commands::{self, Input};
 use crate::config::Config;
 use crate::config::OnStuck;
+use crate::session_store::SessionFile;
 
 /// How much of the prompt a single paste may add, in characters.
 ///
@@ -26,10 +27,24 @@ const APPROVAL_PAGE: i32 = 10;
 /// How many turns of token history the session panel keeps for its sparkline.
 const HISTORY: usize = 48;
 
-/// How long the rail flashes a tier that was just spilled past, in redraws. At
-/// the event loop's 90ms tick this is a little under a second: long enough to
-/// catch the eye at the moment it matters, short enough not to become noise.
-const FLASH_TICKS: u64 = 10;
+/// How long the rail flashes the tier being abandoned, in redraws. At the event
+/// loop's 90ms tick this is ~360ms: enough that the reason registers rather than
+/// being a single frame nobody sees, short enough that it is a beat and not a
+/// pause in the work.
+pub(crate) const HANDOFF_TICKS: u64 = 4;
+
+/// A handoff that has been announced and is still being shown.
+///
+/// The beat is presentation only: the agent retries the moment the verdict
+/// lands, so nothing here delays the work. What it buys is that the reason is on
+/// screen before the tier below starts answering underneath it.
+#[derive(Debug, Clone, Copy)]
+pub struct Handoff {
+    /// The tier being abandoned, as a position in the rail.
+    pub from: Option<usize>,
+    /// The redraw counter at which the beat ends.
+    pub until: u64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -121,9 +136,11 @@ pub struct App {
     /// and the streaming caret, the only two things here that move by
     /// themselves.
     pub tick: u64,
-    /// The tick a tier was last spilled past on, so the rail can draw attention
-    /// to the move for a moment rather than only recording it.
-    pub escalated_at: Option<u64>,
+    /// The handoff currently being narrated, if one is.
+    /// Presentation only: it decides which tier the rail draws as being
+    /// abandoned, and for how long. The move itself has already happened by the
+    /// time this is set.
+    pub handoff: Option<Handoff>,
     /// The configured tiers, under the label the agent reports them by, so an
     /// escalation can be matched back to a position in the rail. Empty until
     /// the agent is attached.
@@ -179,7 +196,7 @@ impl App {
             menu_index: 0,
             help: false,
             tick: 0,
-            escalated_at: None,
+            handoff: None,
             tier_labels: Vec::new(),
             active_tier: 0,
             tier_failed: Vec::new(),
@@ -218,6 +235,32 @@ impl App {
     /// Where a tier sits in the configured chain.
     pub fn tier_index(&self, label: &str) -> Option<usize> {
         self.tier_labels.iter().position(|known| known == label)
+    }
+
+    /// Pick up where the last run in this workspace left off.
+    ///
+    /// Applied after `attach`, which is what fills in the tier mirror this needs
+    /// to bound the restored index against — a session saved when three tiers
+    /// were configured must not leave the rail pointing at a fourth that is no
+    /// longer there.
+    pub fn restore(&mut self, saved: &SessionFile, active_index: usize) {
+        self.sticky = saved.sticky;
+        self.on_stuck = saved.on_stuck;
+        self.mode = saved.mode;
+        self.active_tier = active_index.min(self.tier_labels.len().saturating_sub(1));
+
+        let resumed = render_session(&saved.messages);
+        let count = resumed.len();
+        self.messages.extend(resumed);
+
+        // Said out loud, because a transcript that appears from nowhere is
+        // confusing, and because the one thing a resumed session must not be is
+        // silent about being resumed.
+        self.messages.push(Message::system(format!(
+            "resumed this session — {count} message{}, last saved {}",
+            if count == 1 { "" } else { "s" },
+            ago(saved.saved_at)
+        )));
     }
 
     /// Note that a tier was spilled past.
@@ -302,11 +345,16 @@ impl App {
         self.record_usage_on(None, usage);
     }
 
-    /// Whether a tier was spilled past a moment ago, so the rail can flash the
-    /// move. Time here is the redraw counter, which only runs during a turn —
-    /// exactly the window an escalation happens in.
-    pub fn recently_escalated(&self) -> bool {
-        matches!(self.escalated_at, Some(at) if self.tick.saturating_sub(at) < FLASH_TICKS)
+    /// Whether a tier is being narrated as abandoned right now, and which one.
+    ///
+    /// Time here is the redraw counter, which only runs during a turn — exactly
+    /// the window a spill happens in. Reading it from the renderer rather than
+    /// clearing the field keeps the beat a pure function of the clock.
+    pub fn abandoning_tier(&self) -> Option<usize> {
+        match self.handoff {
+            Some(handoff) if self.tick < handoff.until => handoff.from,
+            _ => None,
+        }
     }
 
     /// The stuck policy actually in force, for the rail to state.
@@ -646,9 +694,11 @@ impl App {
                 self.streaming = None;
                 self.running = None;
                 self.busy = false;
-                // The flash belongs to the turn that was running; once it is
-                // over, the move is history rather than news.
-                self.escalated_at = None;
+                // The beat belongs to a turn that is still running. It has to be
+                // dropped here rather than left to expire on its own, because the
+                // tick counter stops when nothing is busy — a beat left set would
+                // freeze mid-flash until the next turn.
+                self.handoff = None;
                 if stop_reason.as_deref() == Some("length") {
                     self.messages.push(Message::system(
                         "! the model hit its output limit, so this answer is incomplete",
@@ -660,18 +710,30 @@ impl App {
                     self.messages.push(Message::system(line));
                 }
             }
-            AgentEvent::Escalated { from, to, reason } => {
-                // What the failing tier streamed is not what the next tier will
-                // continue from, so it must not sit in the transcript as though
-                // it were an answer.
+            AgentEvent::Spilling { from, to, reason } => {
+                // The verdict has landed, so the attempt's partial output is dead
+                // matter and goes now — doing it here rather than at `Escalated`
+                // keeps the transcript index of the line below stable.
                 self.discard_streaming_message();
                 self.running = None;
-                self.fail_tier(&from);
-                self.activate_tier(&to);
-                self.escalated_at = Some(self.tick);
+
+                // Narrated before the move rather than with it. The tier is
+                // already stopped when this arrives; what the beat buys is that
+                // the reason is on screen for a moment before the next tier's
+                // answer starts arriving under it.
                 self.messages.push(Message::system(format!(
                     "✗ {from} {reason} — spilling over to {to}"
                 )));
+                self.handoff = Some(Handoff {
+                    from: self.tier_index(&from),
+                    until: self.tick.saturating_add(HANDOFF_TICKS),
+                });
+            }
+            AgentEvent::Escalated { from, to, .. } => {
+                // The narration and the flash were started by `Spilling`, which
+                // always precedes this. All that is left is to record the move.
+                self.fail_tier(&from);
+                self.activate_tier(&to);
             }
             AgentEvent::Cancelled { tier } => {
                 // The half-streamed answer never reached the conversation, so
@@ -681,7 +743,7 @@ impl App {
                 self.streaming = None;
                 self.running = None;
                 self.busy = false;
-                self.escalated_at = None;
+                self.handoff = None;
                 // A modal can only be up while a turn runs, so stopping the turn
                 // takes it down too. The reply channel is already gone.
                 self.approval = None;
@@ -734,7 +796,7 @@ impl App {
                 self.streaming = None;
                 self.running = None;
                 self.busy = false;
-                self.escalated_at = None;
+                self.handoff = None;
                 self.messages
                     .push(Message::system(format!("✗ no tier could answer: {reason}")));
                 // Every tier that was tried had been billed for it.
@@ -946,6 +1008,11 @@ impl App {
             "context" => {
                 send(self, Command::Context);
             }
+            "undo" => {
+                // Nothing to do here: the pre-image lives with the agent, which
+                // is what ran the tool, and the result comes back as a notice.
+                send(self, Command::Undo);
+            }
 
             // `commands::parse` only produces names from the catalogue, so this
             // is unreachable; it is a message rather than a panic because a
@@ -986,8 +1053,11 @@ impl App {
         out
     }
 
-    /// Where the session's tokens went, tier by tier.
-    fn describe_cost(&self) -> String {
+    /// Where the session's tokens went, tier by tier: what `/cost` shows.
+    ///
+    /// Reachable from the golden-loop fixture, which is the one test that can
+    /// assert on real tokens having been spent across a real spill.
+    pub(crate) fn describe_cost(&self) -> String {
         if self.usage_by_tier.is_empty() {
             return "nothing has been spent yet".to_string();
         }
@@ -1055,6 +1125,61 @@ fn usage_line(usage: &crate::provider::Usage) -> String {
         ));
     }
     line
+}
+
+/// Render a saved conversation into the transcript the interface draws.
+///
+/// Deliberately lossy: the session file holds the conversation the models saw,
+/// not the notices and spinners the interface showed while producing it. What
+/// comes back is what was said and what was run, which is what someone returning
+/// to a session needs to see, without replaying tool activity frame by frame.
+fn render_session(messages: &[crate::session::ChatMessage]) -> Vec<Message> {
+    use crate::session::Role as Wire;
+
+    let mut rendered = Vec::new();
+    for message in messages {
+        match message.role {
+            // There is exactly one system message and it is rebuilt on load;
+            // anything else here is not conversation.
+            Wire::System => continue,
+            Wire::User => rendered.push(Message {
+                role: Role::User,
+                text: message.content.clone(),
+            }),
+            Wire::Assistant => {
+                if !message.content.trim().is_empty() {
+                    rendered.push(Message {
+                        role: Role::Assistant,
+                        text: message.content.clone(),
+                    });
+                }
+                // A turn that only called tools has no text, so the calls are
+                // what happened and are shown as such rather than dropped.
+                for call in &message.tool_calls {
+                    rendered.push(Message::system(format!("⚙ {}", call.name)));
+                }
+            }
+            Wire::Tool => rendered.push(Message::system(format!(
+                "↳ {}",
+                first_line(&message.content)
+            ))),
+        }
+    }
+    rendered
+}
+
+/// How long ago something happened, in the few words a one-line notice wants.
+///
+/// Coarse on purpose: "3h ago" is the useful fact, and a timestamp precise to
+/// the second would be read as an audit trail rather than a greeting.
+fn ago(saved_at: u64) -> String {
+    let seconds = crate::session_store::now_epoch().saturating_sub(saved_at);
+    match seconds {
+        0..=59 => "just now".to_string(),
+        60..=3599 => format!("{}m ago", seconds / 60),
+        3600..=86_399 => format!("{}h ago", seconds / 3600),
+        _ => format!("{}d ago", seconds / 86_400),
+    }
 }
 
 fn welcome(config: &Config) -> String {
@@ -1369,6 +1494,14 @@ mod tests {
         type_and_send(&mut app, "hello");
         app.handle_agent_event(AgentEvent::Text("half an answer".to_string()));
 
+        // The move arrives in two parts, as the agent sends it: announced, then
+        // committed. The discarding belongs to the announcement, because the
+        // verdict is what makes the partial answer dead.
+        app.handle_agent_event(AgentEvent::Spilling {
+            from: "Local".to_string(),
+            to: "DeepSeek".to_string(),
+            reason: "repeated the same output 4 times".to_string(),
+        });
         app.handle_agent_event(AgentEvent::Escalated {
             from: "Local".to_string(),
             to: "DeepSeek".to_string(),
@@ -1660,42 +1793,9 @@ mod tests {
         assert_eq!(app.active_tier_name(), Some("Local model"));
     }
 
-    #[test]
-    fn an_escalation_flashes_briefly_and_then_settles() {
-        let (mut app, _commands) = attached_app();
-        app.handle_agent_event(AgentEvent::Escalated {
-            from: "Local model".to_string(),
-            to: "Local model".to_string(),
-            reason: "repeated itself".to_string(),
-        });
-        assert!(
-            app.recently_escalated(),
-            "the move should be marked at once"
-        );
-
-        app.tick += FLASH_TICKS;
-        assert!(
-            !app.recently_escalated(),
-            "the flash must not outstay its welcome"
-        );
-    }
-
-    #[test]
-    fn finishing_a_turn_ends_the_flash() {
-        let (mut app, _commands) = attached_app();
-        app.handle_agent_event(AgentEvent::Escalated {
-            from: "Local model".to_string(),
-            to: "Local model".to_string(),
-            reason: "repeated itself".to_string(),
-        });
-        assert!(app.recently_escalated());
-
-        // The flash belongs to the turn; once it is over, the move is history.
-        app.handle_agent_event(AgentEvent::Finished {
-            stop_reason: Some("end_turn".to_string()),
-        });
-        assert!(!app.recently_escalated());
-    }
+    // The flash a spill draws is covered by the beat tests near the end of this
+    // module: it is started by `Spilling` now rather than by `Escalated`, so the
+    // assertions live with the event that starts it.
 
     #[test]
     fn the_usage_history_keeps_only_the_recent_turns() {
@@ -2939,6 +3039,100 @@ mod tests {
     }
 
     #[test]
+    fn spilling_narrates_the_move_before_the_tier_is_abandoned() {
+        // The reason has to be on screen while the move is still a move. The
+        // tier is named by the agent, so the index is resolved from the labels.
+        let (mut app, _commands) = attached_app();
+        app.tier_labels = vec!["Local".to_string(), "DeepSeek".to_string()];
+
+        app.handle_agent_event(AgentEvent::Spilling {
+            from: "Local".to_string(),
+            to: "DeepSeek".to_string(),
+            reason: "repeated the same output 4 times".to_string(),
+        });
+
+        let said = last_message(&app);
+        assert!(said.contains("repeated the same output 4 times"), "{said}");
+        assert!(said.contains("spilling over to DeepSeek"), "{said}");
+        assert_eq!(
+            app.abandoning_tier(),
+            Some(0),
+            "the tier being abandoned should be the one drawn as going"
+        );
+        assert_eq!(
+            app.active_tier, 0,
+            "the move has not been committed yet — that is what makes it a beat"
+        );
+        assert!(
+            !app.tier_failed[0],
+            "and the tier is not marked spent until it actually is"
+        );
+    }
+
+    #[test]
+    fn the_beat_ends_on_its_own_after_a_few_frames() {
+        let (mut app, _commands) = attached_app();
+        app.tier_labels = vec!["Local".to_string(), "DeepSeek".to_string()];
+        app.handle_agent_event(AgentEvent::Spilling {
+            from: "Local".to_string(),
+            to: "DeepSeek".to_string(),
+            reason: "went quiet for 30s".to_string(),
+        });
+
+        app.tick += HANDOFF_TICKS;
+        assert_eq!(app.abandoning_tier(), None, "the beat is over");
+    }
+
+    #[test]
+    fn escalating_after_a_beat_records_the_move_without_a_second_line() {
+        // `Spilling` then `Escalated` is one event in two parts: the transcript
+        // must not say the same thing twice, and the tier ends up spent.
+        let (mut app, _commands) = attached_app();
+        app.tier_labels = vec!["Local".to_string(), "DeepSeek".to_string()];
+        let before = app.messages.len();
+
+        app.handle_agent_event(AgentEvent::Spilling {
+            from: "Local".to_string(),
+            to: "DeepSeek".to_string(),
+            reason: "repeated the same output 4 times".to_string(),
+        });
+        app.handle_agent_event(AgentEvent::Escalated {
+            from: "Local".to_string(),
+            to: "DeepSeek".to_string(),
+            reason: "repeated the same output 4 times".to_string(),
+        });
+
+        assert_eq!(
+            app.messages.len(),
+            before + 1,
+            "one line for one move: {:?}",
+            app.messages.iter().map(|m| &m.text).collect::<Vec<_>>()
+        );
+        assert!(app.tier_failed[0], "the tier is spent now");
+        assert_eq!(app.active_tier, 1, "and the next one is answering");
+    }
+
+    #[test]
+    fn a_finished_turn_does_not_leave_the_beat_running() {
+        // The tick counter only advances while a turn is busy, so a beat left set
+        // after the turn would flash forever instead of expiring.
+        let (mut app, _commands) = attached_app();
+        app.tier_labels = vec!["Local".to_string(), "DeepSeek".to_string()];
+        app.handle_agent_event(AgentEvent::Spilling {
+            from: "Local".to_string(),
+            to: "DeepSeek".to_string(),
+            reason: "went quiet for 30s".to_string(),
+        });
+        assert!(app.abandoning_tier().is_some());
+
+        app.handle_agent_event(AgentEvent::Finished {
+            stop_reason: Some("end_turn".to_string()),
+        });
+
+        assert_eq!(app.abandoning_tier(), None, "no frozen flash");
+    }
+
+    #[test]
     fn the_answer_keys_still_work_with_a_scrolled_preview() {
         let (mut app, mut answer) = long_preview_approval();
         app.handle_key(press(KeyCode::PageDown));
@@ -2947,5 +3141,162 @@ mod tests {
 
         assert_eq!(answer.try_recv().expect("an answer"), Decision::Approve);
         assert!(app.approval.is_none());
+    }
+
+    // ---- resuming ---------------------------------------------------------
+
+    fn saved_session() -> SessionFile {
+        let mut saved = SessionFile::new("/tmp/example");
+        saved.sticky = false;
+        saved.on_stuck = Some(OnStuck::Consult);
+        saved.mode = Mode::Plan;
+        saved
+            .cli_sessions
+            .insert("grok".to_string(), "sess-1".to_string());
+        saved.messages = vec![
+            crate::session::ChatMessage::user("make the tests pass"),
+            crate::session::ChatMessage::assistant("Looking at it.", Vec::new()),
+            crate::session::ChatMessage::assistant(
+                "",
+                vec![crate::session::ToolCall {
+                    id: "call_1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+            ),
+            crate::session::ChatMessage::tool_result(
+                "call_1",
+                "error[E0308]: mismatched types\nmore",
+            ),
+        ];
+        saved
+    }
+
+    #[test]
+    fn resuming_brings_back_the_policy_the_mode_and_the_tier() {
+        let mut app = new_app();
+        app.attach(
+            tokio::sync::mpsc::unbounded_channel().0,
+            Canceller::default(),
+            &["Local".to_string(), "Grok".to_string()],
+            None,
+        );
+
+        app.restore(&saved_session(), 1);
+
+        assert!(!app.sticky, "the session's choice came back");
+        assert_eq!(app.on_stuck, Some(OnStuck::Consult));
+        assert_eq!(app.mode, Mode::Plan);
+        assert_eq!(app.active_tier, 1, "it is still on the tier it was using");
+    }
+
+    #[test]
+    fn resuming_says_that_it_resumed() {
+        // A transcript that appears from nowhere is confusing, so the one thing
+        // a resume must not be is silent about itself.
+        let mut app = new_app();
+        app.restore(&saved_session(), 0);
+
+        let last = app.messages.last().expect("a notice");
+        assert_eq!(last.role, Role::System);
+        assert!(last.text.contains("resumed this session"), "{}", last.text);
+    }
+
+    #[test]
+    fn a_saved_tier_that_is_no_longer_configured_cannot_point_past_the_rail() {
+        // The config may have shrunk since the session was written, and the rail
+        // must not be handed an index it cannot draw.
+        let mut app = new_app();
+        app.attach(
+            tokio::sync::mpsc::unbounded_channel().0,
+            Canceller::default(),
+            &["Local".to_string()],
+            None,
+        );
+
+        app.restore(&saved_session(), 7);
+
+        assert_eq!(app.active_tier, 0, "clamped to the only tier there is");
+    }
+
+    #[test]
+    fn restoring_renders_the_conversation_including_what_the_tools_did() {
+        let rendered = render_session(&saved_session().messages);
+        let text: String = rendered
+            .iter()
+            .map(|message| format!("{:?} {}\n", message.role, message.text))
+            .collect();
+
+        assert!(text.contains("make the tests pass"), "{text}");
+        assert!(text.contains("Looking at it."), "{text}");
+        assert!(
+            text.contains("read_file"),
+            "a turn that only called tools still happened: {text}"
+        );
+        assert!(
+            text.contains("error[E0308]"),
+            "the raw result is the useful part: {text}"
+        );
+    }
+
+    #[test]
+    fn a_restored_conversation_does_not_carry_a_prompt_it_was_not_run_under() {
+        let messages = vec![
+            crate::session::ChatMessage::system("You are in PLAN MODE"),
+            crate::session::ChatMessage::user("hello"),
+        ];
+        let rendered = render_session(&messages);
+
+        assert_eq!(rendered.len(), 1, "{rendered:?}");
+        assert_eq!(rendered[0].text, "hello");
+    }
+
+    #[test]
+    fn the_resume_notice_counts_the_messages_and_coarsely_says_when() {
+        let mut app = new_app();
+        app.restore(&saved_session(), 0);
+
+        let last = app.messages.last().expect("a notice");
+        assert!(last.text.contains("4 messages"), "{}", last.text);
+        assert!(
+            last.text.contains("just now"),
+            "written seconds ago: {}",
+            last.text
+        );
+    }
+
+    #[test]
+    fn undo_reaches_the_agent_and_leaves_the_chain_alone() {
+        // The pre-image lives with the agent, which is what ran the tool, so the
+        // interface's whole job here is to pass the command along.
+        let (mut app, mut commands) = attached_app();
+        let before = (app.active_tier, app.sticky, app.tier_failed.clone());
+
+        type_and_send(&mut app, "/undo");
+
+        assert_eq!(
+            commands.try_recv().expect("the command should be sent"),
+            Command::Undo
+        );
+        assert_eq!(
+            (app.active_tier, app.sticky, app.tier_failed.clone()),
+            before,
+            "undo is about the workspace, not the chain"
+        );
+    }
+
+    #[test]
+    fn undo_is_offered_in_the_command_menu() {
+        // It is in the catalogue, so the menu and the help overlay pick it up
+        // with nothing to keep in step.
+        let (mut app, _commands) = attached_app();
+        for ch in "/undo".chars() {
+            app.handle_key(press(KeyCode::Char(ch)));
+        }
+        assert!(
+            app.menu_matches().iter().any(|spec| spec.name == "undo"),
+            "{:?}",
+            app.menu_matches()
+        );
     }
 }

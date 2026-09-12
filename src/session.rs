@@ -31,7 +31,8 @@ impl Role {
 /// Arguments are kept as a string rather than parsed so a malformed or empty
 /// argument blob is reported to the model as a tool error instead of being
 /// silently dropped here.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
@@ -46,11 +47,16 @@ pub struct ToolSpec {
     pub parameters: serde_json::Value,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ChatMessage {
     pub role: Role,
     pub content: String,
+    // Omitted when empty so a plain exchange is stored as two short lines
+    // rather than carrying two structural nulls through the whole transcript.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
 }
 
@@ -105,12 +111,43 @@ impl Session {
         }
     }
 
+    /// Rebuild a session from a previous run: a fresh system prompt, then the
+    /// conversation that was saved under the old one.
+    ///
+    /// The prompt is passed in rather than restored because it is derived from
+    /// the mode and the workspace, and both of those are known at startup. A
+    /// saved prompt would be a stale copy of a decision already made elsewhere,
+    /// and resuming into plan mode's instructions while in build mode is a bug
+    /// waiting to happen.
+    pub fn restore(prompt: impl Into<String>, messages: Vec<ChatMessage>) -> Self {
+        let mut session = Self::with_system_prompt(prompt);
+        // Anything that claims to be a system message is dropped: there is
+        // exactly one, it is the one just built, and a second would be an
+        // instruction from nowhere.
+        session
+            .messages
+            .extend(messages.into_iter().filter(|m| m.role != Role::System));
+        session
+    }
+
     pub fn push(&mut self, message: ChatMessage) {
         self.messages.push(message);
     }
 
     pub fn messages(&self) -> &[ChatMessage] {
         &self.messages
+    }
+
+    /// The conversation, without the system prompt.
+    ///
+    /// This is what gets persisted: the prompt is reconstructed on the next
+    /// start, and storing it would only create a second copy to keep in step.
+    pub fn conversation(&self) -> Vec<ChatMessage> {
+        self.messages
+            .iter()
+            .filter(|message| message.role != Role::System)
+            .cloned()
+            .collect()
     }
 
     /// Drop everything after `len` messages.
@@ -673,5 +710,84 @@ mod tests {
         let clipped = clip(&line, 5);
         assert_eq!(clipped.chars().count(), 6, "five plus the ellipsis");
         assert!(clipped.ends_with('…'));
+    }
+
+    #[test]
+    fn a_conversation_survives_being_written_to_a_file() {
+        // These types are the on-disk format now, so a rename here silently
+        // changes the file every saved session is read from.
+        let messages = vec![
+            ChatMessage::user("read it"),
+            ChatMessage::assistant(
+                "reading",
+                vec![ToolCall {
+                    id: "call_1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: r#"{"path":"a.rs"}"#.to_string(),
+                }],
+            ),
+            ChatMessage::tool_result("call_1", "fn main() {}"),
+        ];
+
+        let text = serde_json::to_string(&messages).expect("serialize");
+        let back: Vec<ChatMessage> = serde_json::from_str(&text).expect("deserialize");
+        assert_eq!(back, messages);
+    }
+
+    #[test]
+    fn an_empty_tool_list_is_left_out_of_the_file_entirely() {
+        // Most messages carry no tools, and two structural nulls on each of them
+        // would be most of the file.
+        let text = serde_json::to_string(&ChatMessage::user("hello")).expect("serialize");
+        assert_eq!(text, r#"{"role":"user","content":"hello"}"#);
+    }
+
+    #[test]
+    fn restoring_rebuilds_the_prompt_and_keeps_the_conversation() {
+        let messages = vec![
+            ChatMessage::user("first"),
+            ChatMessage::assistant("answered", Vec::new()),
+        ];
+        let session = Session::restore("be brief", messages.clone());
+
+        assert_eq!(session.messages().len(), 3);
+        assert_eq!(session.messages()[0].role, Role::System);
+        assert_eq!(session.messages()[0].content, "be brief");
+        assert_eq!(&session.messages()[1..], messages.as_slice());
+    }
+
+    #[test]
+    fn restoring_drops_any_system_message_from_the_file() {
+        // A saved conversation is read back without the prompt that produced it,
+        // so anything claiming to be one is a stray instruction from nowhere.
+        let messages = vec![
+            ChatMessage::system("You are in PLAN MODE"),
+            ChatMessage::user("first"),
+        ];
+        let session = Session::restore("be brief", messages);
+
+        assert_eq!(session.messages().len(), 2);
+        assert_eq!(session.messages()[0].content, "be brief");
+        assert!(
+            !session
+                .messages()
+                .iter()
+                .any(|m| m.content.contains("PLAN MODE")),
+            "the stale prompt must not survive"
+        );
+    }
+
+    #[test]
+    fn the_conversation_is_what_gets_saved_and_excludes_the_prompt() {
+        let mut session = Session::with_system_prompt("be brief");
+        session.push(ChatMessage::user("first"));
+
+        let conversation = session.conversation();
+        assert_eq!(conversation.len(), 1);
+        assert_eq!(conversation[0].content, "first");
+        assert!(
+            !conversation.iter().any(|m| m.role == Role::System),
+            "the prompt is rebuilt on load rather than stored"
+        );
     }
 }

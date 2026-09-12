@@ -54,9 +54,13 @@ worth knowing about once the basics make sense.
 | --- | --- |
 | **Consult a tier instead of handing over** | Escalating changes which model you use for the rest of the session. `on_stuck = "consult"` keeps the cheap model driving and spends the big one on one narrow question, built from the raw tool error rather than from the stuck model's own account of the problem — and `/on-stuck consult` turns it on for the session without editing a file. See [Consulting instead of handing over](#consulting-instead-of-handing-over). |
 | **Plan mode** | `Shift+Tab` makes a turn read-only. Not asked for in a prompt — the write tools are withheld from the model, and a call for one is refused before it reaches your disk. See [Modes](#modes). |
-| **Commands** | `/tier`, `/escalate`, `/consult`, `/on-stuck`, `/retry`, `/drop`, `/sticky`, `/cost`, `/context`, `/compact`, `/clear`. Type `/` and they appear, with a description beside each. |
+| **Commands** | `/tier`, `/escalate`, `/consult`, `/on-stuck`, `/retry`, `/drop`, `/sticky`, `/cost`, `/context`, `/compact`, `/clear`, `/undo`. Type `/` and they appear, with a description beside each. |
 | **Cost you can see** | Tokens *and* cache reads, attributed per tier, with a sparkline of per-turn spend. A cross-tier fallback is a cache miss no design can avoid; this is where you find out what it cost. Counted per **request**, which is what a turn is made of — one per tool call, plus any spill or consult — so a turn that read four files is billed as five requests and reported as five. Cost is counted as the tier reports it rather than only off a finished response, so a tier that *failed* — stalled, looped, or stopped by you — still shows what it spent. |
 | **Session continuity** | A CLI tier keeps its own conversation across turns and receives only the new message, instead of the whole transcript being flattened into every prompt. |
+| **It remembers** | Quit and come back in the same directory and nothing is lost: the conversation, the tier you had settled on, whether one was pinned, the sticky choice, the stuck policy, and the mode. One session per workspace. `-p` neither reads nor writes one, so scripts stay stateless. See [It remembers](#it-remembers). |
+| **Undo the last write** | `/undo` puts back the file the last approved write changed, using the very bytes it showed you in the diff before it happened. It refuses when the file has moved on since, so it can never discard work done after — and it says why rather than guessing. See [Undoing a write](#undoing-a-write). |
+| **A handoff you can follow** | The reason a tier is being abandoned is announced *before* the move, with the tier's mark flashing in the rail, rather than appearing at the same instant as the next model's answer. Silence during a failover is how you end up distrusting it. |
+| **Judged on where it runs** | Timeouts are per class, not per tier: a model on your LAN gets 120s to load its weights and then only 30s of silence once it is streaming, where a hosted tier gets 30s and 60s. The *reason* for a stall narrows too — the same missing path three times is a stall, three different files being read is work. |
 | **Stopping a turn** | `Esc` stops it where it stands — including a tool mid-flight, so a build is killed rather than waited out — without changing which model you chose. |
 | **Compaction** | Earlier turns fold into a short ledger when a tier is abandoned, so the incoming model's cold read is small. The ledger keeps what the tools *did*, because a discarded conversation does not undo a written file. |
 | **Bracketed paste, scrolling diffs** | A multi-line paste arrives intact. A diff too long for the approval box scrolls, with its position shown, so you are never asked to approve something you cannot read. |
@@ -221,15 +225,42 @@ A turn is abandoned, and retried on the next tier, when the active tier:
 - **repeats itself** — the same line, or the same twelve-token span, often enough to
   be a loop rather than an answer;
 - **stops making progress** — the same tool call with identical arguments over and
-  over, or a run of tool calls that all fail;
+  over, a run of tool calls that all fail, or the *same kind* of failure from the same
+  tool three times. Reading three different files is work; reading the *same* missing
+  path three times is not, and looking for a `.env`, a `Makefile` and a
+  `pyproject.toml` that are not there is investigation rather than a stall — so a
+  file-shaped failure only counts when the path repeats, while a malformed call counts
+  across targets, because the target was never what was wrong;
 - **goes quiet** — no response at all within `first_token_timeout_ms`, or silence
   past `idle_timeout_ms` once it has started. A slow tool call is not a stall: any
   real response resets that clock;
 - **fails** — unreachable, an HTTP error, a broken stream;
 - **uses up its step budget** without reaching an answer.
 
-Thresholds are per tier, so an unhurried local model and a hosted one can be judged
-differently. In the transcript you see exactly what happened and where it moved to:
+Timeouts are per tier, and the defaults depend on where the model actually is, because
+one profile cannot fit both ends:
+
+| | first token | idle | |
+| --- | --- | --- | --- |
+| **local** — loopback, LAN, `.local` | 120s | 30s | time to load weights, then less patience once it is streaming |
+| **hosted** — anything over the network | 30s | 60s | silence means something is broken; a gap mid-answer does not |
+
+A `cli` tier is judged as hosted even though the process is local: its first line of
+output includes the harness starting up, which is slow for reasons a model server is
+not. Every value can be overridden per tier — and an omitted one now keeps its class's
+default rather than falling back to a global number:
+
+```toml
+[tier.limits]
+idle_timeout_ms = 45000   # this one only; the first-token budget stays local
+```
+
+`spill doctor` shows the timeouts a local tier actually got, and carries the class and
+both budgets for every tier in its JSON.
+
+In the transcript you see why a tier was given up on, and it is said *before* the move
+rather than with it — the tier's mark flashes in the rail for a beat as the reason
+appears, so the handoff is narrated rather than sudden:
 
 ```
 you     explain the parser
@@ -300,24 +331,29 @@ repeated. Never a summary written by the model that got stuck, because the model
 got stuck is the one that does not understand the problem. The answer comes back as
 advice, and the same tier carries on with it.
 
-The consultant is given **no tools**, so it cannot act — it has to answer, and the call
-is one round trip rather than an agent loop. That is what makes the answer prose, and it
-is why consult is the cheaper move when the answer is something the driver can act on.
+An endpoint consultant is given **no tools**, so it cannot act — it has to answer, and the
+call is one round trip rather than an agent loop. That is what makes the answer prose, and
+it is why consult is the cheaper move when the answer is something the driver can act on.
 
 It is not always the right move, so it falls back rather than insisting:
 
 - when the budget for the turn is spent, the turn **escalates** as it always did;
 - if the consult fails, is stopped, or comes back empty, the turn **escalates** too;
-- with no tier below, there is nobody to ask, so it **escalates**.
+- with no tier below, there is nobody to ask, so it **escalates**;
+- and a consultant that cannot be held read-only is not asked at all, so it **escalates**.
 
 A stuck turn is therefore never stranded, and consult can never cost more than the
 escalation it replaced.
 
-Two caveats worth stating plainly. A `cli` consultant runs its own harness and brings
-its own tools — spill cannot withhold them the way it can for an `openai` endpoint — so
-the question asks it not to act but cannot guarantee it; use an endpoint as the
-consultant if that matters. And a `cli` tier's consult is still a full agent run, so it
-is not the cheap call that consulting an endpoint is.
+A `cli` consultant runs its own harness and brings its own tools, which spill cannot
+withhold the way it can for an `openai` endpoint. So it is held read-only instead: it is
+launched with whatever read-only mode that CLI has — `--permission-mode plan`, `--sandbox
+read-only`, a Q&A mode, and so on — and a hard instruction not to act leads the question.
+The shipped presets set that flag wherever the CLI offers one. A CLI with no read-only
+mode is **never asked as a consultant**: the turn escalates instead, with the reason said
+out loud, rather than asking the model to behave when nothing enforces it. A `cli`
+consult is still a full agent run, though, so it is not the cheap call that consulting an
+endpoint is.
 
 ## One-shot use
 
@@ -485,6 +521,40 @@ why, so it can get on with the plan rather than retrying.
 
 ![spill in plan mode: the prompt box says so, and the answer is a plan](assets/plan.png)
 
+## It remembers
+
+Quit and come back in the same directory, and spill picks up where it left off: the
+conversation, the tier it had settled on, whether a tier was pinned, the sticky choice,
+the stuck policy, and the mode. A CLI tier's own conversation is kept too, so the next
+turn continues it rather than sending the whole transcript again.
+
+```
+> spill
+resumed this session — 42 messages, last saved 3h ago
+```
+
+Sessions are **per workspace directory**, so two projects keep two conversations. They
+live in your state directory — `~/.local/state/spill/sessions/` on Linux — one file per
+workspace, written `0600`. Deleting the file is a clean first run.
+
+This is why the transcript is stored rather than a pointer to it. A local model behind an
+`openai` tier has no server-side conversation at all: the whole history is re-sent on
+every turn, so the file on disk is the only record that exists. Resuming a local session
+would otherwise remember nothing.
+
+What is saved is the conversation the models saw, not the interface: tool spinners,
+notices, and escalation markers are not replayed, so a resumed transcript shows what was
+said and what was run without replaying the frames that produced it. Token and cost
+totals start fresh, since they describe a session rather than a workspace.
+
+`spill -p` never resumes and never writes — a script that picked up yesterday's
+conversation because it ran in the same directory would be a trap. `spill doctor` and
+`spill presets` do not touch the file either.
+
+`/clear` is still how you deliberately start over, and it clears what is on disk as well
+as what is on screen. Otherwise resuming would bring back the conversation you just
+dropped, which would make `/clear` a lie.
+
 ## Commands
 
 Type `/` to open the menu of everything below. `?` shows them alongside every key.
@@ -509,6 +579,7 @@ single-model agent cannot offer:
 | `/context` | What actually gets sent on each turn, and how large it has grown |
 | `/compact` | Fold earlier turns into a short ledger to shrink what is sent |
 | `/clear` | Start a new conversation, keeping the tiers as they are |
+| `/undo` | Put back the last file an approved write changed |
 | `/help`, `/quit` | The obvious two |
 
 Two details that matter:
@@ -528,15 +599,66 @@ Running low on context is not something you have to notice: when a tier is
 abandoned and the session has grown past a few turns, the history is compacted as
 part of spilling over, so the next tier starts from something small.
 
+### Undoing a write
+
+`/undo` puts back the file that the last approved write changed, using the bytes
+that were already read to show you the diff before it happened. It reaches **one
+write** and no further: after it, a second `/undo` says there is nothing to undo
+rather than working backwards through the session.
+
+```
+> /undo
+· restored src/a.rs (412 bytes, as it was before the write_file)
+
+> /undo                        # the write had created the file
+· removed src/a.rs and the 2 directories it created (created by the write_file)
+
+> /undo                        # somebody edited it in the meantime
+· src/a.rs has changed since that write — leaving it alone. Nothing was changed.
+```
+
+It refuses rather than guessing: if the file is not still exactly what the write
+left — because you edited it, or another tool did, or it was deleted — it says so
+and changes nothing. That is the whole safety story, and it is why `/undo` does not
+ask for approval first: you typed it, and the thing it protects you from is not
+yourself.
+
+It pairs with spilling over, which is why it is here at all. A tier that wrote junk
+and then looped is *abandoned* but its side effects are not undone — the next tier
+inherits a workspace containing them. `/undo` is how you take that back:
+
+```
+you     refactor the parser
+·       ✗ Looping Local repeated the same output 4 times — spilling over to DeepSeek
+spill   Recovered on the second tier.
+> /undo
+· restored src/parser.rs (2,104 bytes, as it was before the write_file)
+```
+
+Two limits worth knowing: it reaches only the **last** write, so a model that
+scattered junk across several files needs several rounds of spilling and undoing;
+and it covers the file tools only. A `run_shell` command can do anything, so there
+is no honest way to reverse one and `/undo` will not pretend otherwise.
+
 ## Status
 
 Working today: configuration and validation, the terminal UI, OpenAI-compatible
 streaming with model auto-discovery, the agent loop with seven tools and approval,
 stuck detection and tier escalation, consulting a tier instead of escalating,
-build and plan modes, slash commands, session continuity for CLI tiers, cost
-reporting per tier, delegated CLI tiers, the preset library, the setup wizard
-(which checks every tier before it will write), zero-config first run, `doctor`,
-and `-p`.
+build and plan modes, slash commands, session continuity for CLI tiers, sessions
+that survive a restart, `/undo`, per-class timeouts, cost reporting per tier,
+delegated CLI tiers, the preset library, the setup wizard (which checks every tier
+before it will write), zero-config first run, `doctor`, and `-p`.
+
+The awkward paths are pinned by fixtures that drive the real provider, detector and
+tools against a local endpoint instead of a live model — a model looping on the same
+line, a consult that fails, a model stuck on a missing file, and a hunt for files
+that are not there. A change that quietly breaks failover fails `cargo test` instead
+of reaching you.
+
+The tool set is deliberately closed at seven. No MCP client, no browser, no image
+generation in 0.1.x: a tool has to earn its place, and every tool added is another
+way for a small local model to get stuck.
 
 Not yet:
 

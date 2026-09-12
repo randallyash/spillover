@@ -3,7 +3,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::provider::dialect::Dialect;
@@ -126,7 +126,7 @@ impl fmt::Display for TierKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum OnStuck {
     /// Abandon this tier and hand the whole turn to the next one. The default,
@@ -178,6 +178,17 @@ pub struct Tier {
     pub extra_args: Vec<String>,
     #[serde(default)]
     pub approve_args: Vec<String>,
+    /// Flags that make this CLI read-only for a single run — a plan mode, a
+    /// sandbox policy, a Q&A mode.
+    ///
+    /// Used only for a consult. A CLI runs its own harness and its own tools,
+    /// which spill cannot withhold the way it can for an `openai` endpoint, so
+    /// a read-only flag is the only way to keep a consultant from acting
+    /// instead of answering. A tier with none is not consulted at all: the
+    /// turn escalates instead. The shipped presets set this wherever the CLI
+    /// has such a flag.
+    #[serde(default)]
+    pub read_only_args: Vec<String>,
     #[serde(default)]
     pub workdir_args: Vec<String>,
     /// Flags that open a session under an id spill chooses, with `{session}`
@@ -211,7 +222,7 @@ pub struct Tier {
     )]
     pub consults_per_turn: u32,
     #[serde(default)]
-    pub limits: Limits,
+    pub limits: LimitOverrides,
 }
 
 /// A missing cap takes the default; a present zero is refused.
@@ -239,23 +250,199 @@ impl Tier {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// The limits a tier is judged by at runtime.
+///
+/// `Default` is the **hosted** profile, and that is deliberate: it is what every
+/// tier got before there was more than one, so the call sites that do not care
+/// about the distinction — tests, and a tier built by hand — keep the behaviour
+/// they had. A tier from configuration gets its class's profile instead, through
+/// `LimitOverrides::resolve`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
-    #[serde(default = "default_first_token_timeout_ms")]
     pub first_token_timeout_ms: u64,
-    #[serde(default = "default_idle_timeout_ms")]
     pub idle_timeout_ms: u64,
-    #[serde(default = "default_max_repeat_run")]
     pub max_repeat_run: u32,
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        Self {
-            first_token_timeout_ms: default_first_token_timeout_ms(),
-            idle_timeout_ms: default_idle_timeout_ms(),
-            max_repeat_run: default_max_repeat_run(),
+        TierClass::Hosted.default_limits()
+    }
+}
+
+/// Where a tier's model actually is, which decides the timeouts it is judged by.
+///
+/// One profile cannot fit both ends: a 30B loading into a 5090's VRAM may need a
+/// minute before its first token, while a local server that goes quiet *once it
+/// is streaming* is more likely to have wedged than a hosted one is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TierClass {
+    /// A model server on this machine or the LAN.
+    Local,
+    /// Reached over the network — a hosted endpoint, or a CLI tier.
+    ///
+    /// A CLI harness runs locally but reaches a remote model, and its first line
+    /// of output includes the harness starting up (`cmd` pays ~15k tokens of its
+    /// own prompt on every call). That is slow for reasons a local server is not,
+    /// so a CLI keeps the hosted numbers.
+    Hosted,
+}
+
+impl TierClass {
+    /// Classify a tier by where its endpoint lives.
+    ///
+    /// Loopback, the private ranges, link-local, and mDNS names mean the model is
+    /// on this machine or the LAN. Anything else is reached over the network.
+    pub fn of_endpoint(base_url: &str) -> Self {
+        let host = host_of(base_url);
+        if is_local_host(&host) {
+            Self::Local
+        } else {
+            Self::Hosted
         }
+    }
+
+    /// The timeouts a tier of this class is judged by, before any overrides.
+    pub fn default_limits(self) -> Limits {
+        match self {
+            // Patient at the start, impatient once running: weights take time to
+            // load, but a local server that has gone quiet mid-answer has wedged.
+            Self::Local => Limits {
+                first_token_timeout_ms: 120_000,
+                idle_timeout_ms: 30_000,
+                max_repeat_run: default_max_repeat_run(),
+            },
+            // A hosted endpoint that says nothing for half a minute is broken;
+            // once it is answering, network variance is real and is forgiven.
+            Self::Hosted => Limits {
+                first_token_timeout_ms: 30_000,
+                idle_timeout_ms: 60_000,
+                max_repeat_run: default_max_repeat_run(),
+            },
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Hosted => "hosted",
+        }
+    }
+}
+
+/// The limits a tier's config asks for.
+///
+/// Every field is optional so an omitted value falls through to its *class*
+/// default rather than to one global number. A tier that writes only
+/// `idle_timeout_ms` keeps the patient first-token budget its locality implies,
+/// which is the whole point — that value is the one a slow 30B needs.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct LimitOverrides {
+    #[serde(default)]
+    pub first_token_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub idle_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub max_repeat_run: Option<u32>,
+}
+
+impl LimitOverrides {
+    /// The limits this tier runs under: its class's defaults, then whatever it
+    /// said itself.
+    pub fn resolve(&self, class: TierClass) -> Limits {
+        let base = class.default_limits();
+        Limits {
+            first_token_timeout_ms: self
+                .first_token_timeout_ms
+                .unwrap_or(base.first_token_timeout_ms),
+            idle_timeout_ms: self.idle_timeout_ms.unwrap_or(base.idle_timeout_ms),
+            max_repeat_run: self.max_repeat_run.unwrap_or(base.max_repeat_run),
+        }
+    }
+}
+
+/// The host part of a base URL, lowercased.
+///
+/// Hand-rolled rather than pulled from a URL crate: `base_url` is whatever the
+/// user wrote, it may have no scheme at all, and the only question being asked is
+/// whether the host is on this machine or the LAN.
+fn host_of(base_url: &str) -> String {
+    let rest = match base_url.find("://") {
+        Some(at) => &base_url[at + 3..],
+        None => base_url,
+    };
+
+    // Authority ends at the first path, query, or fragment.
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .rsplit('@') // credentials, if any, are not the host
+        .next()
+        .unwrap_or_default();
+
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        // A bracketed IPv6 literal: the port, if any, is outside the brackets.
+        match rest.find(']') {
+            Some(close) => &rest[..close],
+            None => rest,
+        }
+    } else {
+        match authority.rfind(':') {
+            Some(colon) => &authority[..colon],
+            None => authority,
+        }
+    };
+
+    host.trim().trim_end_matches('.').to_lowercase()
+}
+
+/// Whether a host names this machine or something on the LAN.
+fn is_local_host(host: &str) -> bool {
+    if host.is_empty() {
+        return false;
+    }
+    if host == "localhost" || host == "0.0.0.0" || host.ends_with(".localhost") {
+        return true;
+    }
+    // mDNS names resolve on the local link by definition.
+    if host.ends_with(".local") {
+        return true;
+    }
+    if host == "host.docker.internal" || host == "host.containers.internal" {
+        return true;
+    }
+
+    // IPv6: loopback, or unique-local (fc00::/7).
+    if host.contains(':') {
+        let first = host.split(':').next().unwrap_or_default();
+        return host == "::1"
+            || host.starts_with("::ffff:127.")
+            || first.starts_with("fd")
+            || first.starts_with("fc");
+    }
+
+    let octets: Vec<u8> = match host
+        .split('.')
+        .map(|part| part.parse::<u8>())
+        .collect::<Result<_, _>>()
+    {
+        Ok(octets) => octets,
+        // Not an IPv4 literal, so a name: only the names already matched above
+        // are known to be local, and a bare hostname could resolve anywhere.
+        Err(_) => return false,
+    };
+
+    match octets.as_slice() {
+        // 127.0.0.0/8 is a whole loopback block, not just .0.1.
+        [127, ..] => true,
+        [10, ..] => true,
+        // 172.16.0.0/12 — the third octet decides, so 172.32 is public.
+        [172, second, ..] => (16..=31).contains(second),
+        [192, 168, ..] => true,
+        // Link-local.
+        [169, 254, ..] => true,
+        _ => false,
     }
 }
 
@@ -277,12 +464,6 @@ fn default_true() -> bool {
 }
 fn default_workspace() -> String {
     "~".to_string()
-}
-fn default_first_token_timeout_ms() -> u64 {
-    30_000
-}
-fn default_idle_timeout_ms() -> u64 {
-    60_000
 }
 fn default_max_repeat_run() -> u32 {
     4
@@ -428,21 +609,24 @@ impl Config {
                 }
             }
 
-            if tier.limits.first_token_timeout_ms == 0 {
+            // Checked against the override rather than the resolved value: a zero
+            // is a mistake whoever wrote it, and the class defaults are never
+            // zero, so only something the user typed can fail here.
+            if tier.limits.first_token_timeout_ms == Some(0) {
                 return Err(ConfigError::Invalid(format!(
                     "tier \"{}\" has first_token_timeout_ms = 0, which would fail instantly; omit \
-                     it to accept the default",
+                     it to accept the default for its class",
                     tier.id
                 )));
             }
-            if tier.limits.idle_timeout_ms == 0 {
+            if tier.limits.idle_timeout_ms == Some(0) {
                 return Err(ConfigError::Invalid(format!(
                     "tier \"{}\" has idle_timeout_ms = 0, which would fail on the first quiet \
-                     moment; omit it to accept the default",
+                     moment; omit it to accept the default for its class",
                     tier.id
                 )));
             }
-            if tier.limits.max_repeat_run == 0 {
+            if tier.limits.max_repeat_run == Some(0) {
                 return Err(ConfigError::Invalid(format!(
                     "tier \"{}\" has max_repeat_run = 0, which disables repetition detection; omit \
                      it to accept the default",
@@ -479,7 +663,9 @@ mod tests {
         assert_eq!(config.tiers.len(), 1);
         assert_eq!(config.tiers[0].id, "local");
         assert_eq!(config.tiers[0].kind, TierKind::OpenAi);
-        assert_eq!(config.tiers[0].limits.max_repeat_run, 4);
+        // The example writes a `[tier.limits]` block, so these are the values a
+        // user would actually get; a tier that omits the block takes its class's.
+        assert_eq!(config.tiers[0].limits.max_repeat_run, Some(4));
         // The example documents consult but does not turn it on: the default has
         // to stay the behaviour that always works.
         assert_eq!(config.tiers[0].on_stuck, OnStuck::Escalate);
@@ -793,5 +979,151 @@ mod tests {
         let err = Config::load(Some(&PathBuf::from("/nonexistent/spill-config.toml")))
             .expect_err("explicit missing path must fail");
         assert!(err.to_string().contains("cannot read"), "got: {err}");
+    }
+
+    // ---- tier class and the timeouts it implies ---------------------------
+
+    #[test]
+    fn an_endpoint_on_this_machine_or_the_lan_is_local() {
+        for endpoint in [
+            "http://localhost:1234/v1",
+            "http://localhost/v1",
+            "http://127.0.0.1:1234/v1",
+            // The whole 127/8 block is loopback, not just .0.1.
+            "http://127.9.9.9:11434/v1",
+            "http://[::1]:1234/v1",
+            "http://0.0.0.0:8080/v1",
+            "http://10.0.0.5:1234/v1",
+            // 172.16.0.0/12 runs to 172.31.
+            "http://172.16.0.9:1234/v1",
+            "http://172.31.255.254:1234/v1",
+            "http://192.168.1.50:1234/v1",
+            "http://169.254.10.1/v1",
+            "http://my-box.local:1234/v1",
+            "http://host.docker.internal:1234/v1",
+            // Defensive: config rejects a scheme-less base_url today, but the
+            // classifier should not be the thing that gets that wrong.
+            "localhost:1234/v1",
+        ] {
+            assert_eq!(
+                TierClass::of_endpoint(endpoint),
+                TierClass::Local,
+                "{endpoint} should be local"
+            );
+        }
+    }
+
+    #[test]
+    fn anything_reached_over_the_network_is_hosted() {
+        for endpoint in [
+            "https://openrouter.ai/api/v1",
+            "https://api.x.ai/v1",
+            "http://192.0.2.10:1234/v1",
+            // Just outside the private /12 — the third octet decides.
+            "http://172.32.0.9:1234/v1",
+            "http://172.15.0.9:1234/v1",
+            "http://11.0.0.5:1234/v1",
+            "http://169.253.1.1/v1",
+            // A bare hostname could resolve anywhere, so it is not assumed local.
+            "http://my-server:1234/v1",
+            "not a url at all",
+            "",
+        ] {
+            assert_eq!(
+                TierClass::of_endpoint(endpoint),
+                TierClass::Hosted,
+                "{endpoint:?} should be hosted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_urls_credentials_and_port_are_not_mistaken_for_the_host() {
+        assert_eq!(
+            TierClass::of_endpoint("http://user:pass@localhost:1234/v1"),
+            TierClass::Local
+        );
+        assert_eq!(
+            TierClass::of_endpoint("https://user:pass@openrouter.ai/api/v1"),
+            TierClass::Hosted
+        );
+    }
+
+    #[test]
+    fn a_local_tier_is_patient_to_start_and_impatient_once_running() {
+        // The two halves of "stop a runaway local model without false spills": a
+        // 30B gets time to load its weights, and a server that goes quiet once it
+        // is streaming is given up on sooner than a hosted one would be.
+        let limits = TierClass::Local.default_limits();
+
+        assert_eq!(limits.first_token_timeout_ms, 120_000);
+        assert_eq!(limits.idle_timeout_ms, 30_000);
+        assert!(
+            limits.first_token_timeout_ms
+                > TierClass::Hosted.default_limits().first_token_timeout_ms,
+            "a local model must get more time to start than a hosted one"
+        );
+        assert!(
+            limits.idle_timeout_ms < TierClass::Hosted.default_limits().idle_timeout_ms,
+            "and less patience once it has started"
+        );
+    }
+
+    #[test]
+    fn a_tier_that_says_nothing_takes_its_class_defaults() {
+        let overrides = LimitOverrides::default();
+
+        assert_eq!(
+            overrides.resolve(TierClass::Local),
+            TierClass::Local.default_limits()
+        );
+        assert_eq!(
+            overrides.resolve(TierClass::Hosted),
+            Limits::default(),
+            "the hosted profile is what every tier got before classes existed"
+        );
+    }
+
+    #[test]
+    fn one_written_value_does_not_drag_the_others_to_a_global_default() {
+        // The case this design exists for: a local tier that sets only its idle
+        // budget must keep the patient first-token budget its locality implies,
+        // or the false spill it was trying to fix comes straight back.
+        let overrides = LimitOverrides {
+            idle_timeout_ms: Some(5_000),
+            ..LimitOverrides::default()
+        };
+        let limits = overrides.resolve(TierClass::Local);
+
+        assert_eq!(limits.idle_timeout_ms, 5_000, "what was written");
+        assert_eq!(
+            limits.first_token_timeout_ms, 120_000,
+            "what was not written still follows the class, not a global 30s"
+        );
+    }
+
+    #[test]
+    fn a_written_timeout_wins_over_the_class_default() {
+        let overrides = LimitOverrides {
+            first_token_timeout_ms: Some(7_000),
+            idle_timeout_ms: Some(8_000),
+            max_repeat_run: Some(9),
+        };
+        let limits = overrides.resolve(TierClass::Hosted);
+
+        assert_eq!(limits.first_token_timeout_ms, 7_000);
+        assert_eq!(limits.idle_timeout_ms, 8_000);
+        assert_eq!(limits.max_repeat_run, 9);
+    }
+
+    #[test]
+    fn the_shipped_example_still_writes_overrides_that_parse() {
+        // The example carries a [tier.limits] block, so the override path is the
+        // one the documented configuration actually exercises.
+        let config = parse(include_str!("../config.example.toml")).expect("valid");
+        let limits = config.tiers[0].limits.resolve(TierClass::Local);
+
+        assert_eq!(limits.first_token_timeout_ms, 30_000);
+        assert_eq!(limits.max_repeat_run, 4);
     }
 }

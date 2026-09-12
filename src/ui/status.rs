@@ -151,10 +151,11 @@ fn clamp(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
 
 fn tiers(app: &App, theme: &Theme, abbreviate: bool) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
-    // The moment a tier is spilled past, its mark is reversed for a beat. It is
-    // the single most important event in a session, and a static mark in a wall
-    // of grey is easy to miss.
-    let flash = app.recently_escalated();
+    // The tier being abandoned, for the length of the beat that announces it. It
+    // is the single most important event in a session, and a static mark in a
+    // wall of grey is easy to miss — but it belongs *before* the move, as the
+    // reason for it, rather than flashing after the fact.
+    let abandoning = app.abandoning_tier();
 
     for (index, label) in app.tier_labels.iter().enumerate() {
         if index > 0 {
@@ -163,6 +164,7 @@ fn tiers(app: &App, theme: &Theme, abbreviate: bool) -> Vec<Span<'static>> {
 
         let failed = app.tier_failed.get(index).copied().unwrap_or(false);
         let active = index == app.active_tier;
+        let going = abandoning == Some(index);
         let name = if abbreviate {
             short_label(label)
         } else {
@@ -171,17 +173,22 @@ fn tiers(app: &App, theme: &Theme, abbreviate: bool) -> Vec<Span<'static>> {
         let numbered = format!("{}. {name}", index + 1);
 
         // A failed tier is marked by a glyph as well as a color, so the rail
-        // survives a monochrome terminal and a colorblind reader alike.
-        if failed {
-            let style = if flash {
-                theme.tier_failed.add_modifier(Modifier::REVERSED)
+        // survives a monochrome terminal and a colorblind reader alike. The tier
+        // on its way out carries the same glyph, because that is what it is about
+        // to be — drawn in the warning color, reversed, so it reads as happening
+        // now rather than as having happened.
+        if going || failed {
+            let style = if going {
+                theme.warn.add_modifier(Modifier::REVERSED)
             } else {
                 theme.tier_failed
             };
             spans.push(Span::styled("✗ ", style));
         }
 
-        let style = if active {
+        let style = if going {
+            theme.warn.add_modifier(Modifier::REVERSED)
+        } else if active {
             theme.tier_active
         } else if failed {
             theme.tier_failed
@@ -215,6 +222,7 @@ fn active_only(app: &App, theme: &Theme) -> Vec<Span<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::{HANDOFF_TICKS, Handoff};
     use crate::config::Config;
 
     fn app_with(labels: &[&str]) -> App {
@@ -341,6 +349,53 @@ mod tests {
             "the failed tier needs a mark: {text}"
         );
         assert_eq!(app.active_tier, 1);
+    }
+
+    #[test]
+    fn the_tier_being_abandoned_flashes_before_it_settles() {
+        // The beat: while a handoff is being narrated the tier is drawn as
+        // *going*, in the warning color and reversed — before it is spent. Once
+        // the beat expires the same tier settles into the spent style.
+        let mut app = app_with(&["Local", "DeepSeek"]);
+        app.handoff = Some(Handoff {
+            from: Some(0),
+            until: HANDOFF_TICKS,
+        });
+
+        let during = rail(&app, &Theme::default(), 200);
+        let chip = during
+            .spans
+            .iter()
+            .find(|span| span.content.contains("1. Local"))
+            .expect("the abandoning tier");
+
+        assert!(
+            chip.style.add_modifier.contains(Modifier::REVERSED),
+            "it should be flashing: {:?}",
+            chip.style
+        );
+        assert!(
+            text_of(&during).contains("✗ 1. Local"),
+            "and carry the mark it is about to earn: {}",
+            text_of(&during)
+        );
+
+        // The beat over, and the move recorded.
+        app.tick = HANDOFF_TICKS;
+        app.fail_tier("Local");
+        app.activate_tier("DeepSeek");
+        let after = rail(&app, &Theme::default(), 200);
+        let settled = after
+            .spans
+            .iter()
+            .find(|span| span.content.contains("1. Local"))
+            .expect("the spent tier");
+
+        assert!(
+            !settled.style.add_modifier.contains(Modifier::REVERSED),
+            "the flash must not outstay its welcome: {:?}",
+            settled.style
+        );
     }
 
     #[test]

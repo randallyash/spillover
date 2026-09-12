@@ -8,10 +8,13 @@ mod detect;
 mod doctor;
 mod event;
 mod fallback;
+#[cfg(test)]
+mod golden;
 mod oneshot;
 mod preset;
 mod provider;
 mod session;
+mod session_store;
 mod setup;
 mod spawn;
 mod text;
@@ -40,10 +43,11 @@ use std::sync::Arc;
 
 use crate::agent::approval::{ApprovalRequest, UiApprover};
 use crate::agent::tools::Registry;
-use crate::agent::{AgentConfig, AgentEvent};
+use crate::agent::{AgentConfig, AgentEvent, Seed};
 use crate::app::{App, Message};
 use crate::config::Config;
 use crate::event::InputEvent;
+use crate::session_store::{SessionFile, SessionStore};
 use crate::setup::probe::Readiness;
 use crate::setup::{Step, Wizard};
 
@@ -250,6 +254,14 @@ async fn run(mut config: Config) -> io::Result<()> {
         }
     }
 
+    // A conversation from a previous run in this directory, if there is one.
+    // Read before the terminal is taken over so a damaged file is reported as
+    // ordinary output rather than corrupting the interface.
+    let workspace = config.general.workspace_path();
+    let saved = crate::session_store::SessionStore::for_workspace(&workspace)
+        .ok()
+        .and_then(|store| store.load());
+
     let mut app = App::new(config.clone());
     for note in first_run {
         app.messages.push(Message::system(note));
@@ -259,7 +271,9 @@ async fn run(mut config: Config) -> io::Result<()> {
     // failure reads as ordinary terminal output rather than a flash of UI.
     let mut agent_events = None;
     let mut approvals = None;
-    match start_agent(&config).await {
+    // Overwritten with the live chain's answer when the agent started.
+    let mut restored_tier = 0usize;
+    match start_agent(&config, saved.as_ref()).await {
         AgentStart::Ready(channels) => {
             app.attach(
                 channels.commands,
@@ -267,12 +281,19 @@ async fn run(mut config: Config) -> io::Result<()> {
                 &channels.tier_labels,
                 channels.warning,
             );
+            restored_tier = channels.active_index;
             agent_events = Some(channels.events);
             approvals = Some(channels.approvals);
         }
         AgentStart::Unavailable(message) => {
             app.messages.push(Message::system(message));
         }
+    }
+
+    // After `attach`, which seeds the tier mirror from the live chain: restoring
+    // first would be overwritten by it.
+    if let Some(saved) = &saved {
+        app.restore(saved, restored_tier);
     }
 
     let _guard = TerminalGuard::enter()?;
@@ -357,6 +378,8 @@ struct AgentChannels {
     /// The chain, in order, under the labels the agent reports tiers by, so the
     /// header rail can tell which one is answering.
     tier_labels: Vec<String>,
+    /// Which tier a resumed session left answering.
+    active_index: usize,
     /// Anything the user should know about tiers that were left out.
     warning: Option<String>,
 }
@@ -372,7 +395,11 @@ enum AgentStart {
 /// Every tier kind is supported and nothing is dropped quietly: a tier that
 /// cannot be built stops startup with the reason, rather than shortening the
 /// chain into a fallback that never happens.
-async fn start_agent(config: &Config) -> AgentStart {
+///
+/// `resume` is the session saved for this workspace, when there is one. It is
+/// what makes this the interactive path: a run that was given a session to
+/// resume is the same run that writes one back.
+async fn start_agent(config: &Config, resume: Option<&SessionFile>) -> AgentStart {
     let workspace = config.general.workspace_path();
     let library = crate::preset::Library::embedded();
 
@@ -381,28 +408,57 @@ async fn start_agent(config: &Config) -> AgentStart {
         Err(error) => return AgentStart::Unavailable(error),
     };
 
+    // Hand each tier back the conversation it was following, before the chain
+    // takes ownership of it. A tier with nothing saved is left alone, and a
+    // provider that has no conversation of its own ignores it entirely.
+    if let Some(saved) = resume {
+        for tier in &tiers {
+            tier.provider
+                .set_session(saved.cli_sessions.get(&tier.id).cloned());
+        }
+    }
+
     let notes = crate::tiers::notes(&library, config);
     let warning = (!notes.is_empty()).then(|| notes.join("\n"));
 
-    let chain = match crate::tiers::chain(config, tiers) {
+    let mut chain = match crate::tiers::chain(config, tiers) {
         Some(chain) => chain,
         None => return AgentStart::Unavailable("no usable tiers".to_string()),
     };
+    // Put the chain back the way the saved session left it, here rather than
+    // inside the agent task, so the index the interface needs is readable
+    // before the chain is handed over.
+    if let Some(saved) = resume {
+        chain.restore_state(&saved.chain_state());
+    }
     let tier_labels = chain.labels();
+    let active_index = chain.active_index();
+
+    let seed = resume.map(|saved| Seed {
+        messages: saved.messages.clone(),
+        mode: saved.mode,
+    });
+
+    // Where this session will be written. A failure to find a state directory
+    // is not fatal — the session simply is not kept — so it becomes `None`
+    // rather than ending the run.
+    let store = SessionStore::for_workspace(&workspace).ok();
 
     let (approval_tx, approval_rx) = mpsc::unbounded_channel();
     // Created here and shared, so the interface can stop a turn the agent is in
     // the middle of.
     let canceller = crate::agent::Canceller::default();
-    let (commands, events) = crate::agent::spawn(
+    let (commands, events) = crate::agent::spawn_seeded(
         AgentConfig {
             workspace,
             max_steps: crate::agent::DEFAULT_MAX_STEPS,
             cancel: canceller.clone(),
+            store,
         },
         chain,
         Arc::new(Registry::with_default_tools()),
         Arc::new(UiApprover::new(approval_tx)),
+        seed,
     );
 
     AgentStart::Ready(Box::new(AgentChannels {
@@ -411,6 +467,9 @@ async fn start_agent(config: &Config) -> AgentStart {
         approvals: approval_rx,
         cancel: canceller,
         tier_labels,
+        // Which tier a resumed session left answering, as a position in the
+        // chain the interface is mirroring.
+        active_index,
         warning,
     }))
 }

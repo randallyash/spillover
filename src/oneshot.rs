@@ -103,6 +103,10 @@ pub async fn run(library: &Library, config: &Config, options: &Options) -> Outco
             max_steps: crate::agent::DEFAULT_MAX_STEPS,
             // A one-shot run has nobody to press escape, so nothing cancels it.
             cancel: crate::agent::Canceller::default(),
+            // No session is written and none is resumed: `-p` is for scripts,
+            // and a script that picked up yesterday's conversation because it
+            // happened to run in the same directory would be a trap.
+            store: None,
         },
         chain,
         Arc::new(Registry::with_default_tools()),
@@ -179,7 +183,11 @@ pub async fn run(library: &Library, config: &Config, options: &Options) -> Outco
             }
             AgentEvent::ToolStarted { .. }
             | AgentEvent::ToolFinished { .. }
-            | AgentEvent::Notice(_) => {}
+            | AgentEvent::Notice(_)
+            // The announcement of a move that `Escalated` will report anyway; a
+            // one-shot run has no interface to narrate it to, and recording both
+            // would list every spill twice.
+            | AgentEvent::Spilling { .. } => {}
         }
     }
 

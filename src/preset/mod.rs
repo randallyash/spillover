@@ -52,6 +52,12 @@ pub struct Cli {
     pub extra_args: Vec<String>,
     #[serde(default)]
     pub approve_args: Vec<String>,
+    /// Flags that make this CLI read-only for one run, used only when the tier
+    /// is a consultant: spill cannot withhold tools from a harness it does not
+    /// run, so a flag is the only way to stop a consultant acting. Empty means
+    /// "this CLI cannot be consulted", and the turn escalates instead.
+    #[serde(default)]
+    pub read_only_args: Vec<String>,
     #[serde(default)]
     pub workdir_args: Vec<String>,
     /// Flags that open a session under an id spill chooses, `{session}`
@@ -275,6 +281,10 @@ pub fn cli_spec(library: &Library, tier: &Tier) -> Result<CliSpec, PresetError> 
             &tier.approve_args,
             preset.map(|preset| preset.approve_args.as_slice()),
         ),
+        read_only_args: choose(
+            &tier.read_only_args,
+            preset.map(|preset| preset.read_only_args.as_slice()),
+        ),
         workdir_args: choose(
             &tier.workdir_args,
             preset.map(|preset| preset.workdir_args.as_slice()),
@@ -386,6 +396,7 @@ mod tests {
                 .chain(&preset.model_args)
                 .chain(&preset.extra_args)
                 .chain(&preset.approve_args)
+                .chain(&preset.read_only_args)
                 .chain(&preset.workdir_args)
                 .chain(&preset.session_args)
                 .chain(&preset.resume_args);
@@ -677,6 +688,30 @@ preset = "nope""#,
         assert!(
             catalogue.contains("grok-4.6"),
             "it should suggest models: {catalogue}"
+        );
+    }
+
+    #[test]
+    fn a_preset_that_can_run_read_only_supplies_the_flag() {
+        // This is what lets the tier answer a consult without being able to
+        // touch the workspace, and it is the shipped default so nobody has to
+        // know the flag themselves.
+        let library = Library::embedded();
+        let spec = cli_spec(&library, &tier(r#"preset = "grok""#)).expect("grok should resolve");
+        assert_eq!(spec.read_only_args.join(" "), "--permission-mode plan");
+    }
+
+    #[test]
+    fn a_preset_with_no_read_only_mode_cannot_consult() {
+        // The other half of the same rule: a CLI that offers no way to be held
+        // read-only is left with an empty list, which is what makes the agent
+        // refuse to consult it rather than ask and hope.
+        let library = Library::embedded();
+        let spec =
+            cli_spec(&library, &tier(r#"preset = "opencode""#)).expect("opencode should resolve");
+        assert!(
+            spec.read_only_args.is_empty(),
+            "opencode has no read-only flag, so it cannot be a consultant"
         );
     }
 }

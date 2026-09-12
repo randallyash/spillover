@@ -17,6 +17,8 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
+use crate::agent::undo::Undo;
+
 use crate::session::ToolSpec;
 
 /// Upper bound on what a single tool may hand back to the model, so one huge
@@ -49,6 +51,18 @@ impl Risk {
 pub struct ToolOutcome {
     pub content: String,
     pub is_error: bool,
+    /// How to put back what this changed.
+    ///
+    /// `None` for a tool that changes nothing, and for one whose change cannot be
+    /// reversed at all — a shell command can do anything, so claiming it could be
+    /// undone would be worse than offering nothing. Only a *successful* write
+    /// carries one: a write that failed changed nothing to put back.
+    ///
+    /// Boxed because a `ToolOutcome` is also the error half of argument
+    /// validation, where it is returned by value on every call; holding the
+    /// snapshot inline made every one of those returns a hundred-odd bytes of
+    /// stack. The allocation happens once per write, which is nothing.
+    pub undo: Option<Box<Undo>>,
 }
 
 impl ToolOutcome {
@@ -56,6 +70,7 @@ impl ToolOutcome {
         Self {
             content: content.into(),
             is_error: false,
+            undo: None,
         }
     }
 
@@ -63,7 +78,17 @@ impl ToolOutcome {
         Self {
             content: message.into(),
             is_error: true,
+            undo: None,
         }
+    }
+
+    /// Attach the means to reverse this change.
+    ///
+    /// A builder rather than a constructor argument, so the two constructors
+    /// above stay as they are and no existing call site has to know about undo.
+    pub fn undoing(mut self, undo: Undo) -> Self {
+        self.undo = Some(Box::new(undo));
+        self
     }
 }
 
@@ -98,6 +123,13 @@ pub struct Registry {
 }
 
 impl Registry {
+    /// The whole agent. Seven tools, and that is the budget for 0.1.x.
+    ///
+    /// Every tool is another way for a local model to loop and another way for
+    /// spill to drift into being a worse copy of a harness it is not trying to
+    /// be, so the set is closed on purpose: no MCP, no browser, no image tools.
+    /// `the_tool_set_is_closed` fails if an eighth appears, which is the point —
+    /// a new tool should have to be argued for rather than added.
     pub fn with_default_tools() -> Self {
         let mut registry = Self::default();
         registry.add(read::ReadFile);
@@ -467,5 +499,37 @@ mod tests {
     #[test]
     fn small_output_passes_through_untouched() {
         assert_eq!(cap("short".to_string()), "short");
+    }
+
+    #[test]
+    fn the_tool_set_is_closed() {
+        // The rule, made mechanical. Seven tools is the budget for 0.1.x: every
+        // one is another way for a local model to loop and another way for spill
+        // to drift into being a worse copy of a harness it is not trying to be.
+        //
+        // This test failing is not a chore to be updated — it is the argument
+        // having to be made. If an eighth tool is genuinely worth it, delete this
+        // and say in the commit what it buys that the seven do not.
+        let registry = Registry::with_default_tools();
+        let mut names: Vec<String> = registry
+            .specs_permitting(Risk::Write)
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect();
+        names.sort();
+
+        assert_eq!(
+            names,
+            vec![
+                "edit_file",
+                "glob",
+                "grep",
+                "list_dir",
+                "read_file",
+                "run_shell",
+                "write_file",
+            ],
+            "the agent is these seven tools and no more"
+        );
     }
 }

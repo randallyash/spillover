@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use serde_json::json;
 
-use crate::config::{Config, OnStuck, TierKind};
+use crate::config::{Config, Limits, OnStuck, TierClass, TierKind};
 use crate::preset::{Library, cli_spec, openai_settings};
 use crate::setup::probe;
 
@@ -29,6 +29,14 @@ pub struct TierReport {
     /// choice was made: a diagnostic that cannot show which tiers consult cannot
     /// help anyone decide whether it is working.
     pub on_stuck: OnStuck,
+    /// Which timeouts this tier is judged by, once its class and its own
+    /// overrides are applied.
+    ///
+    /// Reported because the class is otherwise invisible: when a slow local model
+    /// is spilled over, the first question is whether it was given the local
+    /// grace period, and nothing else on screen answers it.
+    pub limits: Limits,
+    pub class: TierClass,
 }
 
 #[derive(Debug, Clone)]
@@ -97,6 +105,19 @@ impl Report {
                     width = width
                 ));
             }
+            // And only for a local tier, for the same reason: the hosted numbers
+            // were what every tier got before classes existed, so printing them
+            // everywhere would say nothing. A local tier is the case where the
+            // answer is not what you would have guessed.
+            if tier.class == TierClass::Local {
+                out.push_str(&format!(
+                    "      {:<width$}  limits: {} first token · {} idle (local)\n",
+                    "",
+                    seconds(tier.limits.first_token_timeout_ms),
+                    seconds(tier.limits.idle_timeout_ms),
+                    width = width
+                ));
+            }
         }
 
         let working = self.tiers.iter().filter(|tier| tier.reachable).count();
@@ -142,6 +163,11 @@ impl Report {
                 "detail": tier.detail,
                 "milliseconds": tier.milliseconds,
                 "onStuck": tier.on_stuck.to_string(),
+                // Carried for every tier, not only the local ones: prose should
+                // show what is notable, machine output should be complete.
+                "class": tier.class.label(),
+                "firstTokenTimeoutMs": tier.limits.first_token_timeout_ms,
+                "idleTimeoutMs": tier.limits.idle_timeout_ms,
             })).collect::<Vec<_>>(),
             "notes": self.notes,
         });
@@ -176,6 +202,16 @@ impl Report {
     }
 }
 
+/// A millisecond budget as the seconds a person would say, so the report reads
+/// "120s" rather than "120000".
+fn seconds(milliseconds: u64) -> String {
+    if milliseconds % 1_000 == 0 {
+        format!("{}s", milliseconds / 1_000)
+    } else {
+        format!("{}ms", milliseconds)
+    }
+}
+
 /// Check every configured tier, one after another, and collect what happened.
 pub async fn diagnose(library: &Library, config: &Config) -> Report {
     let mut tiers = Vec::new();
@@ -187,6 +223,9 @@ pub async fn diagnose(library: &Library, config: &Config) -> Report {
 
         let target = Report::target_of(library, tier);
         let detail = Report::detail_of(&readiness.detail, &target);
+        // Asked of the same function the agent builds with, so a report can never
+        // describe timeouts that differ from the ones in force.
+        let class = crate::tiers::class_of(library, tier);
 
         tiers.push(TierReport {
             id: tier.id.clone(),
@@ -197,6 +236,8 @@ pub async fn diagnose(library: &Library, config: &Config) -> Report {
             detail,
             milliseconds: elapsed.as_millis(),
             on_stuck: tier.on_stuck,
+            limits: tier.limits.resolve(class),
+            class,
         });
     }
 
@@ -239,6 +280,8 @@ mod tests {
             },
             milliseconds: 12,
             on_stuck: OnStuck::default(),
+            limits: Limits::default(),
+            class: TierClass::Hosted,
         }
     }
 

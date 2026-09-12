@@ -6,6 +6,14 @@ use crate::config::{Limits, OnStuck};
 use crate::provider::Provider;
 
 pub struct Tier {
+    /// The id this tier was configured under, which is what a saved session
+    /// refers to it by.
+    ///
+    /// The label is for people and is derived from the provider (a display name
+    /// plus an address), so it is neither unique nor stable; an index is stable
+    /// only until somebody reorders their config. The configured id is the one
+    /// durable name a tier has.
+    pub id: String,
     /// Shown to the user, e.g. "Mock Local (http://127.0.0.1:8731/v1)".
     pub label: String,
     /// The model this tier runs. Each tier names its own, so spilling over can
@@ -26,14 +34,19 @@ impl Tier {
     /// stuck policy, so this keeps it out of the way of what they do care about.
     /// A test that does care sets the two fields afterwards, which reads better
     /// than threading them through every call site.
+    ///
+    /// The id defaults to the label, which is enough for a tier that is never
+    /// written to a session file. Tiers built from configuration use `with_id`.
     pub fn new(
         label: impl Into<String>,
         model: impl Into<String>,
         provider: Arc<dyn Provider>,
         limits: Limits,
     ) -> Self {
+        let label = label.into();
         Self {
-            label: label.into(),
+            id: label.clone(),
+            label,
             model: model.into(),
             provider,
             limits,
@@ -41,6 +54,40 @@ impl Tier {
             consults_per_turn: crate::config::DEFAULT_CONSULTS_PER_TURN,
         }
     }
+
+    /// A tier that knows the id it was configured under, so a saved session can
+    /// find it again after a restart.
+    pub fn with_id(
+        id: impl Into<String>,
+        label: impl Into<String>,
+        model: impl Into<String>,
+        provider: Arc<dyn Provider>,
+        limits: Limits,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            ..Self::new(label, model, provider, limits)
+        }
+    }
+}
+
+/// The parts of a chain that outlive the process.
+///
+/// Tiers are named by configured id rather than by position so that reordering
+/// `config.toml` between runs does not quietly move the user to a different
+/// model. A name that no longer resolves is dropped on restore rather than
+/// treated as an error: a tier being removed from the config is an ordinary
+/// thing to have happened.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ChainState {
+    /// The tier that was answering.
+    pub active: Option<String>,
+    /// The tier the user pinned by hand, if any.
+    pub pinned: Option<String>,
+    /// Whether a failure keeps the lower tier for the rest of the session.
+    pub sticky: bool,
+    /// A stuck policy chosen for the session; `None` means each tier's own.
+    pub on_stuck: Option<OnStuck>,
 }
 
 /// A tier label without its parenthetical detail: "Local (http://…)" becomes
@@ -125,6 +172,12 @@ impl FallbackChain {
         self.tiers.iter().map(|tier| tier.label.clone()).collect()
     }
 
+    /// The tiers themselves, for asking each one about the conversation it is
+    /// holding.
+    pub fn tiers(&self) -> &[Tier] {
+        &self.tiers
+    }
+
     /// Whether a tier was chosen by hand rather than reached by falling.
     pub fn is_pinned(&self) -> bool {
         self.pinned.is_some()
@@ -132,6 +185,41 @@ impl FallbackChain {
 
     pub fn sticky(&self) -> bool {
         self.sticky
+    }
+
+    /// The part of this chain that is worth carrying across a restart.
+    pub fn state(&self) -> ChainState {
+        ChainState {
+            active: self.tiers.get(self.active).map(|tier| tier.id.clone()),
+            pinned: self
+                .pinned
+                .and_then(|index| self.tiers.get(index))
+                .map(|tier| tier.id.clone()),
+            sticky: self.sticky,
+            on_stuck: self.on_stuck,
+        }
+    }
+
+    /// Put a chain back the way a saved session left it.
+    ///
+    /// Names that no longer resolve are dropped rather than treated as an error:
+    /// a tier having been removed from the configuration is an ordinary thing to
+    /// have happened, and refusing to start over it would be worse than
+    /// forgetting which one was answering.
+    pub fn restore_state(&mut self, state: &ChainState) {
+        self.active = state
+            .active
+            .as_deref()
+            .and_then(|id| self.index_of(id))
+            .unwrap_or(0);
+        self.pinned = state.pinned.as_deref().and_then(|id| self.index_of(id));
+        self.sticky = state.sticky;
+        self.on_stuck = state.on_stuck;
+    }
+
+    /// The position of a tier by its configured id.
+    fn index_of(&self, id: &str) -> Option<usize> {
+        self.tiers.iter().position(|tier| tier.id == id)
     }
 
     pub fn set_sticky(&mut self, sticky: bool) {
@@ -681,6 +769,109 @@ mod tests {
             calls.load(std::sync::atomic::Ordering::SeqCst),
             3,
             "every tier must be told, or one would resume a discarded conversation"
+        );
+    }
+
+    /// A tier whose configured id is short and distinct from its label, which
+    /// is the case a saved session has to name it by.
+    fn named_tier(id: &str) -> Tier {
+        Tier::with_id(
+            id,
+            format!("{id} (stub)"),
+            format!("{id}-model"),
+            Arc::new(Stub("stub")),
+            Limits::default(),
+        )
+    }
+
+    #[test]
+    fn a_chain_is_saved_and_restored_by_name_rather_than_position() {
+        // The whole point of naming tiers by id: reordering the config between
+        // runs must not quietly move the user onto a different model.
+        let mut chain = FallbackChain::new(
+            vec![
+                named_tier("local"),
+                named_tier("deepseek"),
+                named_tier("grok"),
+            ],
+            true,
+        )
+        .expect("a chain");
+
+        chain.set_on_stuck(Some(OnStuck::Consult));
+        chain.pin(2).expect("pin the third tier");
+        let state = chain.state();
+
+        assert_eq!(state.active.as_deref(), Some("grok"));
+        assert_eq!(state.pinned.as_deref(), Some("grok"));
+        assert!(state.sticky);
+        assert_eq!(state.on_stuck, Some(OnStuck::Consult));
+
+        // The same tiers, in a different order.
+        let mut reordered = FallbackChain::new(
+            vec![
+                named_tier("grok"),
+                named_tier("local"),
+                named_tier("deepseek"),
+            ],
+            false,
+        )
+        .expect("a chain");
+        reordered.restore_state(&state);
+
+        assert_eq!(
+            reordered.active().id,
+            "grok",
+            "still the tier that was answering"
+        );
+        assert!(
+            reordered.is_pinned(),
+            "a hand-picked tier is still hand-picked"
+        );
+        assert_eq!(reordered.on_stuck(), OnStuck::Consult);
+        assert!(reordered.sticky(), "the session's sticky choice came back");
+    }
+
+    #[test]
+    fn a_tier_that_no_longer_exists_is_forgotten_rather_than_fatal() {
+        // Removing a tier from the config is an ordinary thing to have happened;
+        // refusing to start over it would be worse than forgetting which one it
+        // was.
+        let mut chain = FallbackChain::new(vec![named_tier("local")], true).expect("a chain");
+        let state = ChainState {
+            active: Some("retired".to_string()),
+            pinned: Some("also-retired".to_string()),
+            sticky: false,
+            on_stuck: Some(OnStuck::Escalate),
+        };
+
+        chain.restore_state(&state);
+
+        assert_eq!(
+            chain.active().id,
+            "local",
+            "it falls back to the first tier"
+        );
+        assert!(
+            !chain.is_pinned(),
+            "a pin on a tier that is gone is dropped"
+        );
+        assert!(!chain.sticky());
+    }
+
+    #[test]
+    fn a_chain_with_nothing_saved_restores_to_its_first_tier() {
+        let mut chain = FallbackChain::new(vec![named_tier("local"), named_tier("grok")], true)
+            .expect("a chain");
+
+        chain.pin(1).expect("pin");
+        chain.restore_state(&ChainState::default());
+
+        assert_eq!(chain.active_index(), 0);
+        assert!(!chain.is_pinned());
+        assert!(
+            !chain.sticky(),
+            "the empty state says what the file said, and the file has no opinion"
         );
     }
 }

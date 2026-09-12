@@ -4,21 +4,25 @@
 pub mod approval;
 pub mod consult;
 pub mod tools;
+pub mod undo;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::watch;
 
 use crate::agent::approval::{Approver, Decision};
 use crate::agent::tools::{Registry, Risk, ToolOutcome};
+use crate::agent::undo::Undo;
 use crate::config::OnStuck;
 use crate::detect::progress::ProgressDetector;
-use crate::detect::{StuckReason, Watchdog};
+use crate::detect::{ErrorClass, StuckReason, Watchdog};
 use crate::fallback::{FallbackChain, Tier};
 use crate::provider::{ChatRequest, Provider, StreamEvent, TurnSummary, Usage};
 use crate::session::{ChatMessage, Session, ToolCall};
+use crate::session_store::{SessionFile, SessionStore};
 
 /// Default cap on tool steps in a single turn, so a model that keeps calling
 /// tools without concluding cannot spin forever.
@@ -99,7 +103,8 @@ async fn cancelled(mut watcher: watch::Receiver<bool>) {
 /// places rather than one — the write tools are not offered, a call for one is
 /// refused anyway, and the system prompt says why. A read-only mode that relies
 /// on the model choosing to behave is not read-only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Mode {
     /// Everything the agent can do, with approval as configured.
     #[default]
@@ -185,6 +190,12 @@ pub enum Command {
     Clear,
     /// Report what is being sent each turn.
     Context,
+    /// Put back the last approved write.
+    ///
+    /// Reaches one write and no further. The user typed it, so it does not ask
+    /// again — what it does instead is refuse when the file has moved on since,
+    /// which is the safety that matters here.
+    Undo,
 }
 
 #[derive(Debug, Clone)]
@@ -206,6 +217,18 @@ pub enum AgentEvent {
     /// The active tier stalled, looped, or failed, so the same turn is being
     /// retried on the tier below it.
     Escalated {
+        from: String,
+        to: String,
+        reason: String,
+    },
+    /// The same move, announced before it happens.
+    ///
+    /// Sent the moment the verdict lands and before the attempt is discarded, so
+    /// the interface can say what is about to happen and why. A handoff that
+    /// arrives already complete reads as sudden; the reason is worth a beat of
+    /// its own, and the tier is already stopped when this is sent, so the beat
+    /// costs the retry nothing.
+    Spilling {
         from: String,
         to: String,
         reason: String,
@@ -244,6 +267,21 @@ pub struct AgentConfig {
     pub max_steps: usize,
     /// How a running turn is stopped from outside.
     pub cancel: Canceller,
+    /// Where the session is written so it can be resumed after a restart.
+    ///
+    /// `None` for one-shot mode. That is how "interactive only" is enforced:
+    /// a run with nowhere to save has nothing to resume, rather than having a
+    /// flag that has to be checked in the right places.
+    pub store: Option<SessionStore>,
+}
+
+/// A session to pick up where the last run left off.
+#[derive(Debug, Clone)]
+pub struct Seed {
+    /// The conversation, without the system prompt, which is rebuilt from the
+    /// restored mode.
+    pub messages: Vec<ChatMessage>,
+    pub mode: Mode,
 }
 
 /// The conversation and the chain, plus what it takes to run the last turn
@@ -257,6 +295,13 @@ struct Loop {
     mode: Mode,
     /// The turn most recently started, so it can be retried.
     last: Option<LastTurn>,
+    /// The last approved write, and the means to put it back.
+    ///
+    /// One, not a stack: an undo should be a predictable thing to reach for, and
+    /// keeping every write of a session would mean holding every file's previous
+    /// contents. It is set by whichever tool last changed a file, so it always
+    /// describes the *last* change rather than an older one.
+    last_write: Option<Box<Undo>>,
 }
 
 #[derive(Clone)]
@@ -275,15 +320,51 @@ pub fn spawn(
     registry: Arc<Registry>,
     approver: Arc<dyn Approver>,
 ) -> (UnboundedSender<Command>, UnboundedReceiver<AgentEvent>) {
+    spawn_seeded(config, chain, registry, approver, None)
+}
+
+/// The same, picking up a conversation saved by an earlier run.
+///
+/// A separate entry point rather than another argument on `spawn`, because
+/// every caller that starts fresh — one-shot mode, and the tests — would
+/// otherwise have to pass a `None` that means nothing to it.
+pub fn spawn_seeded(
+    config: AgentConfig,
+    chain: FallbackChain,
+    registry: Arc<Registry>,
+    approver: Arc<dyn Approver>,
+    seed: Option<Seed>,
+) -> (UnboundedSender<Command>, UnboundedReceiver<AgentEvent>) {
     let (command_tx, mut command_rx) = mpsc::unbounded_channel::<Command>();
     let (event_tx, event_rx) = mpsc::unbounded_channel::<AgentEvent>();
 
     tokio::spawn(async move {
-        let mut state = Loop {
-            session: Session::with_system_prompt(Mode::default().system_prompt(&config.workspace)),
-            chain,
-            mode: Mode::default(),
-            last: None,
+        let mut state = match seed {
+            Some(seed) => Loop {
+                // The system prompt is rebuilt rather than restored, so a
+                // conversation can never carry instructions from a mode it is
+                // no longer in.
+                session: Session::restore(
+                    seed.mode.system_prompt(&config.workspace),
+                    seed.messages,
+                ),
+                chain,
+                mode: seed.mode,
+                last: None,
+                // Undo does not survive a restart, so a resumed session starts
+                // with nothing to put back — which is honest, since the bytes it
+                // would restore were never written down.
+                last_write: None,
+            },
+            None => Loop {
+                session: Session::with_system_prompt(
+                    Mode::default().system_prompt(&config.workspace),
+                ),
+                chain,
+                mode: Mode::default(),
+                last: None,
+                last_write: None,
+            },
         };
 
         // A closed command channel means the app is shutting down.
@@ -296,6 +377,46 @@ pub fn spawn(
     });
 
     (command_tx, event_rx)
+}
+
+/// Everything about this session that is worth keeping.
+///
+/// A free function rather than a method so it can be checked without starting a
+/// loop and driving it into the right state first.
+fn snapshot(config: &AgentConfig, state: &Loop) -> SessionFile {
+    let chain = state.chain.state();
+
+    let mut file = SessionFile::new(config.workspace.clone());
+    file.active_tier = chain.active;
+    file.pinned_tier = chain.pinned;
+    file.sticky = chain.sticky;
+    file.on_stuck = chain.on_stuck;
+    file.mode = state.mode;
+    file.messages = state.session.conversation();
+    // Keyed by configured id, which is what will still name the same tier on
+    // the next start even if the file was reordered in between.
+    for tier in state.chain.tiers() {
+        if let Some(id) = tier.provider.session_id() {
+            file.cli_sessions.insert(tier.id.clone(), id);
+        }
+    }
+    file
+}
+
+/// Write the session out, reporting a failure rather than interrupting anything.
+///
+/// Losing a session is worth saying out loud — the user is about to find their
+/// history gone — but it is never a reason to abandon a turn that is working.
+fn persist(config: &AgentConfig, state: &Loop, events: &UnboundedSender<AgentEvent>) {
+    let Some(store) = &config.store else {
+        return;
+    };
+    if let Err(error) = store.save(&snapshot(config, state)) {
+        let _ = events.send(AgentEvent::Notice(format!(
+            "this session could not be saved to {} ({error}), so it will not be resumed next time",
+            store.path().display()
+        )));
+    }
 }
 
 /// Act on one thing the interface asked for.
@@ -322,6 +443,7 @@ async fn handle_command(
                 approver,
                 events,
                 &mut state.session,
+                &mut state.last_write,
                 prompt,
             )
             .await;
@@ -481,6 +603,7 @@ async fn handle_command(
                 approver,
                 events,
                 &mut state.session,
+                &mut state.last_write,
                 last.prompt,
             )
             .await;
@@ -561,7 +684,38 @@ async fn handle_command(
                 &state.chain,
             )));
         }
+
+        Command::Undo => {
+            // Taken rather than read, so one undo reaches one write: a second
+            // `/undo` says there is nothing left rather than flipping the file
+            // back and forth.
+            match state.last_write.take() {
+                Some(undo) => match undo.restore().await {
+                    Ok(said) => {
+                        let _ = events.send(AgentEvent::Notice(format!("· {said}")));
+                    }
+                    Err(refused) => {
+                        // Put back on a refusal: nothing was changed, so the
+                        // record is still the last write, and a user who undoes
+                        // their own edit by hand can try again.
+                        let _ = events.send(AgentEvent::Notice(format!("✗ {refused}")));
+                        state.last_write = Some(undo);
+                    }
+                },
+                None => {
+                    let _ = events.send(AgentEvent::Notice(
+                        "nothing to undo — /undo reaches only the last approved write".to_string(),
+                    ));
+                }
+            }
+        }
     }
+
+    // One write point for the whole session. Every command is here — a prompt
+    // runs its turn inside this function — so a completed turn, a tier change,
+    // a policy change, and `/clear` are all saved by the same call, and a future
+    // command cannot forget to save by not being listed anywhere.
+    persist(config, state, events);
 }
 
 /// What a `/tier` or `/retry` message shows when a name does not match.
@@ -662,6 +816,7 @@ async fn run_turn(
     approver: &Arc<dyn Approver>,
     events: &UnboundedSender<AgentEvent>,
     session: &mut Session,
+    last_write: &mut Option<Box<Undo>>,
     prompt: String,
 ) {
     session.push(ChatMessage::user(prompt));
@@ -679,7 +834,10 @@ async fn run_turn(
             let tier = chain.active();
             (
                 tier.label.clone(),
-                try_tier(config, tier, mode, registry, approver, events, session).await,
+                try_tier(
+                    config, tier, mode, registry, approver, events, session, last_write,
+                )
+                .await,
             )
         };
 
@@ -786,6 +944,18 @@ async fn run_turn(
                     }
                 }
 
+                // Announced before the attempt is discarded, so the interface can
+                // narrate the reason rather than presenting the move as a fait
+                // accompli. The tier below is read without escalating, because
+                // `escalate` is what commits the move and it has not happened yet.
+                if let Some(to) = chain.consultant().map(|tier| tier.label.clone()) {
+                    let _ = events.send(AgentEvent::Spilling {
+                        from: from.clone(),
+                        to,
+                        reason: reason.summary(),
+                    });
+                }
+
                 // Throw the failed attempt away before another model reads it.
                 session.truncate(checkpoint);
                 // A CLI tier may be holding a session that contains the output
@@ -862,13 +1032,28 @@ async fn try_consult(
     events: &UnboundedSender<AgentEvent>,
 ) -> Option<Answer> {
     let consultant = chain.consultant()?;
+
+    // A consult is one reply that cannot act, and everything below assumes it.
+    // An HTTP consultant is held to that by being sent no tools. A CLI runs its
+    // own harness, so the only lever is a read-only flag, and a CLI with none is
+    // refused here — with the reason said out loud — rather than asked politely
+    // and trusted. `None` escalates the turn, which is where a refusal belongs.
+    if let Some(reason) = consultant.provider.consult_refusal() {
+        let _ = events.send(AgentEvent::Notice(format!(
+            "{} cannot be consulted: {reason} — handing the turn over instead",
+            consultant.label
+        )));
+        return None;
+    }
+
     let question = consult::build(goal, reason, evidence, previous);
 
-    // No tools. For an `openai` tier that is what makes "the answer is prose"
-    // true rather than hoped for: it has nothing to call, so it must answer, and
-    // the call is one round trip rather than a tool loop. A `cli` tier runs its
-    // own harness and cannot be stripped of its tools this way, which is why the
-    // question asks it plainly not to act.
+    // No tools attached, which is what makes "the answer is prose" true for an
+    // HTTP consultant rather than hoped for: it has nothing to call, so it must
+    // answer, and the call is one round trip rather than a tool loop. A CLI
+    // consultant turns the same request into a read-only run with a hard
+    // instruction not to act, which is the most that can be done for a harness
+    // spill does not run.
     let request = ChatRequest {
         model: consultant.model.clone(),
         messages: vec![ChatMessage::user(question.question.clone())],
@@ -889,6 +1074,7 @@ async fn try_consult(
         &discard,
         &mut watchdog,
         &config.cancel,
+        TurnKind::Consult,
     )
     .await;
 
@@ -971,6 +1157,11 @@ fn compact_before_falling(
 }
 
 /// Give one tier the turn, up to the step limit.
+///
+/// The pieces of the loop arrive separately rather than as the loop itself: the
+/// tier is borrowed from the chain, so handing over `&mut Loop` would borrow it
+/// twice.
+#[allow(clippy::too_many_arguments)]
 async fn try_tier(
     config: &AgentConfig,
     tier: &Tier,
@@ -979,6 +1170,7 @@ async fn try_tier(
     approver: &Arc<dyn Approver>,
     events: &UnboundedSender<AgentEvent>,
     session: &mut Session,
+    last_write: &mut Option<Box<Undo>>,
 ) -> Attempt {
     // A read-only turn is not offered the tools that could change anything. The
     // refusal in `run_tool` is what makes that a guarantee; this is what stops a
@@ -1009,6 +1201,7 @@ async fn try_tier(
             events,
             &mut watchdog,
             &config.cancel,
+            TurnKind::Normal,
         )
         .await;
 
@@ -1076,7 +1269,22 @@ async fn try_tier(
                 }
             };
 
-            if let Some(reason) = progress.record(&call.name, &call.arguments, !outcome.is_error) {
+            // The means to reverse this, if it changed a file. Lifted out before
+            // the result moves into the session, and only for a write that
+            // succeeded — the tool leaves it `None` otherwise.
+            let mut outcome = outcome;
+            if let Some(undo) = outcome.undo.take() {
+                *last_write = Some(undo);
+            }
+
+            // Classified before the result moves into the session, so the kind of
+            // failure is available to the detector. `Other` for anything
+            // unrecognised, which is judged by the tier's own allowance rather
+            // than a tighter one.
+            let failure = outcome
+                .is_error
+                .then(|| ErrorClass::classify(&outcome.content));
+            if let Some(reason) = progress.record(&call.name, &call.arguments, failure) {
                 return Attempt::Stuck(reason, spent);
             }
             // The result goes back even when it is an error or a refusal, so the
@@ -1093,6 +1301,19 @@ async fn try_tier(
     )
 }
 
+/// Which entry point of a provider a turn runs through.
+///
+/// The two differ in more than a flag: an ordinary turn may use tools and loop,
+/// while a consult is one round trip of prose with no session behind it. Naming
+/// the distinction keeps `stream_turn`'s job — watchdogging and accounting —
+/// identical for both, which is what lets a consult be cut off and billed like
+/// any other attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnKind {
+    Normal,
+    Consult,
+}
+
 /// Stream one turn from one tier, cutting it off if it goes quiet or loops.
 ///
 /// The request runs as a task so that deciding to abandon it can also *stop*
@@ -1104,10 +1325,16 @@ async fn stream_turn(
     events: &UnboundedSender<AgentEvent>,
     watchdog: &mut Watchdog,
     cancel: &Canceller,
+    kind: TurnKind,
 ) -> (Result<TurnSummary, StuckReason>, Option<Usage>) {
     let (delta_tx, mut delta_rx) = mpsc::unbounded_channel::<StreamEvent>();
     let provider = provider.clone();
-    let mut task = tokio::spawn(async move { provider.stream(request, delta_tx).await });
+    let mut task = tokio::spawn(async move {
+        match kind {
+            TurnKind::Normal => provider.stream(request, delta_tx).await,
+            TurnKind::Consult => provider.consult(request, delta_tx).await,
+        }
+    });
 
     // Usage the tier reported before the attempt ended, whichever way it ended.
     // A killed stream has still been billed, and the figure often arrives before
@@ -1472,6 +1699,9 @@ mod tests {
             workspace: workspace.to_path_buf(),
             max_steps,
             cancel: Canceller::default(),
+            // Most tests are about a turn, not about what outlives the process;
+            // the ones that are set a store on the config they build.
+            store: None,
         }
     }
 
@@ -1485,6 +1715,7 @@ mod tests {
             workspace: workspace.to_path_buf(),
             max_steps,
             cancel: cancel.clone(),
+            store: None,
         };
         (config, cancel)
     }
@@ -3941,5 +4172,543 @@ mod tests {
             .1;
         assert_eq!(consultant.prompt_tokens, 900);
         assert_eq!(consultant.completion_tokens, 40);
+    }
+
+    /// A tier that answers as a driver but must never be consulted.
+    ///
+    /// `consult` panics rather than returning, because the guarantee under test
+    /// is that a refusal happens *before* anything is asked — a call to it would
+    /// mean the refusal had been skipped.
+    struct RefusesConsult;
+
+    #[async_trait]
+    impl Provider for RefusesConsult {
+        fn describe(&self) -> String {
+            "refuser".to_string()
+        }
+
+        async fn stream(
+            &self,
+            _request: ChatRequest,
+            _events: UnboundedSender<StreamEvent>,
+        ) -> Result<TurnSummary, ProviderError> {
+            Ok(answer("escalated here"))
+        }
+
+        fn consult_refusal(&self) -> Option<String> {
+            Some("it runs its own tools and has no read-only mode configured".to_string())
+        }
+
+        async fn consult(
+            &self,
+            _request: ChatRequest,
+            _events: UnboundedSender<StreamEvent>,
+        ) -> Result<TurnSummary, ProviderError> {
+            panic!("a consultant that cannot run read-only must never be asked")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_consultant_that_cannot_run_read_only_escalates_instead() {
+        // A CLI with tools of its own and no read-only flag is the hole this
+        // closes: "please do not act" is not a guarantee, so it is never asked.
+        // The turn escalates, which is where it would have gone without consult
+        // at all, and the reason is stated rather than left to be guessed.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let driver = ScriptedProvider::new(vec![looping_answer()]);
+
+        let mut first = Tier::new(
+            "Local".to_string(),
+            "m0".to_string(),
+            driver,
+            Limits::default(),
+        );
+        first.on_stuck = OnStuck::Consult;
+        let second = Tier::new(
+            "Grok".to_string(),
+            "m1".to_string(),
+            Arc::new(RefusesConsult),
+            Limits::default(),
+        );
+        let chain = FallbackChain::new(vec![first, second], true).expect("a chain");
+
+        let (tx, mut rx) = loop_over(dir.path(), chain);
+        tx.send(Command::Prompt("make the tests pass".to_string()))
+            .expect("send");
+        let events = drain_from(&mut rx).await;
+
+        assert!(
+            consulted(&events).is_empty(),
+            "nothing may be consulted: {events:?}"
+        );
+        let said = notices(&events).join("\n");
+        assert!(said.contains("Grok cannot be consulted"), "{said}");
+        assert!(
+            said.contains("read-only"),
+            "the reason should be named, not just the refusal: {said}"
+        );
+        assert!(
+            escalation(&events).is_some(),
+            "the turn must be handed over instead: {events:?}"
+        );
+    }
+
+    // ---- persistence ------------------------------------------------------
+
+    /// A provider that holds a conversation, the way a CLI tier does.
+    struct SessionedProvider(Mutex<Option<String>>);
+
+    #[async_trait]
+    impl Provider for SessionedProvider {
+        fn describe(&self) -> String {
+            "sessioned".to_string()
+        }
+
+        async fn stream(
+            &self,
+            _request: ChatRequest,
+            _events: UnboundedSender<StreamEvent>,
+        ) -> Result<TurnSummary, ProviderError> {
+            Ok(answer("ok"))
+        }
+
+        fn session_id(&self) -> Option<String> {
+            self.0.lock().expect("lock").clone()
+        }
+
+        fn set_session(&self, id: Option<String>) {
+            *self.0.lock().expect("lock") = id;
+        }
+    }
+
+    /// A store with nowhere to write, for checking the failure path.
+    fn store_in(dir: &std::path::Path) -> SessionStore {
+        SessionStore::at(dir.join("session.json"), dir.to_path_buf())
+    }
+
+    /// Run one prompt through a chain that has somewhere to save.
+    async fn saved_turn(
+        dir: &std::path::Path,
+        chain: FallbackChain,
+        prompt: &str,
+    ) -> (Vec<AgentEvent>, SessionStore) {
+        let mut agent_config = config(dir, DEFAULT_MAX_STEPS);
+        agent_config.store = Some(store_in(dir));
+
+        let (tx, mut rx) = spawn_seeded(
+            agent_config,
+            chain,
+            Arc::new(Registry::with_default_tools()),
+            Arc::new(AlwaysApprove::default()),
+            None,
+        );
+        tx.send(Command::Prompt(prompt.to_string())).expect("send");
+        let events = drain_from(&mut rx).await;
+        // The write happens after the terminal event is sent, in the same poll
+        // of the agent task, so it has already run — but yielding makes that a
+        // fact of the schedule rather than an assumption about it.
+        tokio::task::yield_now().await;
+        (events, store_in(dir))
+    }
+
+    #[test]
+    fn a_snapshot_captures_the_chain_the_mode_and_the_holds_of_each_tier() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sessioned = Arc::new(SessionedProvider(Mutex::new(Some("sess-1".to_string()))));
+
+        let mut tier = Tier::with_id("grok", "Grok", "m", sessioned, Limits::default());
+        tier.on_stuck = OnStuck::Escalate;
+        let mut chain = FallbackChain::new(vec![tier], false).expect("a chain");
+        // The tier's own policy and the session's choice are different things,
+        // and only the second is session state: the first lives in the config
+        // file and is re-read on every start.
+        chain.set_on_stuck(Some(OnStuck::Consult));
+
+        let mut session = Session::with_system_prompt("be brief");
+        session.push(ChatMessage::user("hello"));
+        let state = Loop {
+            session,
+            chain,
+            mode: Mode::Plan,
+            last: None,
+            last_write: None,
+        };
+
+        let agent_config = AgentConfig {
+            workspace: dir.path().to_path_buf(),
+            max_steps: DEFAULT_MAX_STEPS,
+            cancel: Canceller::default(),
+            store: None,
+        };
+        let file = snapshot(&agent_config, &state);
+
+        assert_eq!(file.mode, Mode::Plan);
+        assert_eq!(file.workspace, dir.path());
+        assert_eq!(file.active_tier.as_deref(), Some("grok"));
+        assert_eq!(
+            file.on_stuck,
+            Some(OnStuck::Consult),
+            "the session's choice is saved; each tier's own policy is not session state"
+        );
+        assert!(
+            !file
+                .messages
+                .iter()
+                .any(|m| m.role == crate::session::Role::System),
+            "the prompt is rebuilt on load, not stored"
+        );
+        assert_eq!(file.messages.len(), 1, "just the one user turn");
+        assert_eq!(
+            file.cli_sessions.get("grok").map(String::as_str),
+            Some("sess-1"),
+            "a CLI's own conversation has to travel with the session"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_finished_turn_is_on_disk_by_the_time_it_is_reported() {
+        // This is the whole feature: quit, come back, and the conversation is
+        // there. A turn that ends without saving is a turn that is lost.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let scripted = ScriptedProvider::new(vec![answer("all done")]);
+
+        let (events, store) = saved_turn(
+            dir.path(),
+            single_tier(scripted.clone()),
+            "make the tests pass",
+        )
+        .await;
+
+        assert!(
+            matches!(events.last(), Some(AgentEvent::Finished { .. })),
+            "{events:?}"
+        );
+
+        let saved = store.load().expect("the session should have been saved");
+        let text: String = saved.messages.iter().map(|m| m.content.clone()).collect();
+        assert!(text.contains("make the tests pass"), "{text}");
+        assert!(text.contains("all done"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn clearing_the_conversation_forgets_it_on_disk_too() {
+        // `/clear` has to be more than a wiped screen: coming back to the
+        // conversation it was supposed to have dropped would make it a lie.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let scripted = ScriptedProvider::new(vec![answer("all done")]);
+        let (_, store) = saved_turn(
+            dir.path(),
+            single_tier(scripted.clone()),
+            "make the tests pass",
+        )
+        .await;
+        assert!(store.load().is_some(), "there is something to clear");
+
+        let mut agent_config = config(dir.path(), DEFAULT_MAX_STEPS);
+        agent_config.store = Some(store.clone());
+        let (tx, mut rx) = spawn(
+            agent_config,
+            single_tier(scripted.clone()),
+            Arc::new(Registry::with_default_tools()),
+            Arc::new(AlwaysApprove::default()),
+        );
+        tx.send(Command::Clear).expect("send");
+
+        // `/clear` answers with a notice and no terminal event, so wait for the
+        // notice rather than for a turn to finish.
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the clear should be acknowledged")
+            .expect("an event");
+        tokio::task::yield_now().await;
+
+        assert!(
+            store.load().is_none(),
+            "a cleared session should leave nothing to resume"
+        );
+    }
+
+    /// Collect events until the stream goes quiet.
+    ///
+    /// Unlike `drain_from` this does not stop at the terminal event, because the
+    /// save happens *after* it: the notice saying the session could not be
+    /// written arrives on the far side of `Finished`, and a drain that stopped
+    /// there would never see it.
+    async fn drain_quiet(rx: &mut UnboundedReceiver<AgentEvent>) -> Vec<AgentEvent> {
+        let mut events = Vec::new();
+        while let Ok(Some(event)) =
+            tokio::time::timeout(Duration::from_millis(150), rx.recv()).await
+        {
+            events.push(event);
+        }
+        events
+    }
+
+    #[tokio::test]
+    async fn a_session_that_cannot_be_saved_says_so_without_stopping() {
+        // Losing the session is worth saying out loud; it is never a reason to
+        // abandon a turn that is working.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, "in the way").expect("write");
+
+        let scripted = ScriptedProvider::new(vec![answer("all done")]);
+        let mut agent_config = config(dir.path(), DEFAULT_MAX_STEPS);
+        // A file where the directory should be, so the write cannot succeed.
+        agent_config.store = Some(SessionStore::at(
+            blocker.join("session.json"),
+            dir.path().to_path_buf(),
+        ));
+
+        let (tx, mut rx) = spawn(
+            agent_config,
+            single_tier(scripted.clone()),
+            Arc::new(Registry::with_default_tools()),
+            Arc::new(AlwaysApprove::default()),
+        );
+        tx.send(Command::Prompt("go".to_string())).expect("send");
+        let events = drain_quiet(&mut rx).await;
+
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Finished { .. })),
+            "the turn must still finish: {events:?}"
+        );
+        let said = notices(&events).join("\n");
+        assert!(said.contains("could not be saved"), "{said}");
+    }
+
+    #[tokio::test]
+    async fn a_seeded_run_starts_from_the_saved_conversation() {
+        // What resuming means for the model: the earlier turns go out ahead of
+        // the new one, so the work is not explained again.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let scripted = ScriptedProvider::new(vec![answer("carrying on")]);
+
+        let seed = Seed {
+            messages: vec![
+                ChatMessage::user("earlier question"),
+                ChatMessage::assistant("earlier answer", Vec::new()),
+            ],
+            mode: Mode::Build,
+        };
+
+        let (tx, mut rx) = spawn_seeded(
+            config(dir.path(), DEFAULT_MAX_STEPS),
+            single_tier(scripted.clone()),
+            Arc::new(Registry::with_default_tools()),
+            Arc::new(AlwaysApprove::default()),
+            Some(seed),
+        );
+        tx.send(Command::Prompt("and now?".to_string()))
+            .expect("send");
+        let _ = drain_from(&mut rx).await;
+
+        let sent = scripted.request(0).messages;
+        assert_eq!(
+            sent[0].role,
+            crate::session::Role::System,
+            "a conversation always opens with its instructions"
+        );
+        let text: String = sent.iter().map(|m| m.content.clone()).collect();
+        assert!(text.contains("earlier question"), "{text}");
+        assert!(text.contains("earlier answer"), "{text}");
+        assert!(text.contains("and now?"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_seeded_run_carries_the_saved_mode_into_the_prompt() {
+        // A conversation resumed in plan mode must be told it is read-only, or
+        // the first turn after a restart quietly gains write powers.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let scripted = ScriptedProvider::new(vec![answer("planning")]);
+
+        let seed = Seed {
+            messages: vec![ChatMessage::user("earlier")],
+            mode: Mode::Plan,
+        };
+        let (tx, mut rx) = spawn_seeded(
+            config(dir.path(), DEFAULT_MAX_STEPS),
+            single_tier(scripted.clone()),
+            Arc::new(Registry::with_default_tools()),
+            Arc::new(AlwaysApprove::default()),
+            Some(seed),
+        );
+        tx.send(Command::Prompt("go".to_string())).expect("send");
+        let _ = drain_from(&mut rx).await;
+
+        let prompt = &scripted.request(0).messages[0].content;
+        assert!(
+            prompt.contains("PLAN MODE"),
+            "the restored mode's prompt must lead: {prompt}"
+        );
+    }
+
+    // ---- undo -------------------------------------------------------------
+
+    /// One approved `write_file`, driven through the loop.
+    fn writing_over(path: &str, contents: &str) -> Vec<TurnSummary> {
+        vec![
+            calls_tool(
+                "write_file",
+                &format!(r#"{{"path":"{path}","content":"{contents}"}}"#),
+            ),
+            answer("wrote it"),
+        ]
+    }
+
+    #[tokio::test]
+    async fn an_approved_write_can_be_put_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let note = dir.path().join("note.txt");
+        std::fs::write(&note, "the original\n").expect("write");
+
+        let (tx, mut rx) = spawn(
+            config(dir.path(), DEFAULT_MAX_STEPS),
+            single_tier(ScriptedProvider::new(writing_over("note.txt", "junk"))),
+            Arc::new(Registry::with_default_tools()),
+            Arc::new(AlwaysApprove::default()),
+        );
+        tx.send(Command::Prompt("do it".to_string())).expect("send");
+        let _ = drain_from(&mut rx).await;
+        assert_eq!(std::fs::read_to_string(&note).expect("read"), "junk");
+
+        tx.send(Command::Undo).expect("send");
+        let said = notices(&drain_quiet(&mut rx).await).join("\n");
+
+        assert!(said.contains("restored"), "{said}");
+        assert!(said.contains("write_file"), "{said}");
+        assert_eq!(
+            std::fs::read_to_string(&note).expect("read"),
+            "the original\n",
+            "the write should have been reversed"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_undo_reaches_one_write_and_then_says_so() {
+        // Not a stack: a second `/undo` has to be honest that there is nothing
+        // left, rather than flipping the file back and forth.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let note = dir.path().join("note.txt");
+        std::fs::write(&note, "the original\n").expect("write");
+
+        let (tx, mut rx) = spawn(
+            config(dir.path(), DEFAULT_MAX_STEPS),
+            single_tier(ScriptedProvider::new(writing_over("note.txt", "junk"))),
+            Arc::new(Registry::with_default_tools()),
+            Arc::new(AlwaysApprove::default()),
+        );
+        tx.send(Command::Prompt("do it".to_string())).expect("send");
+        let _ = drain_from(&mut rx).await;
+
+        tx.send(Command::Undo).expect("send");
+        let _ = drain_quiet(&mut rx).await;
+        tx.send(Command::Undo).expect("send");
+        let said = notices(&drain_quiet(&mut rx).await).join("\n");
+
+        assert!(said.contains("nothing to undo"), "{said}");
+        assert_eq!(
+            std::fs::read_to_string(&note).expect("read"),
+            "the original\n",
+            "and it must not have touched the file a second time"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_write_a_spilled_tier_made_can_still_be_put_back() {
+        // The pairing this exists for: the cheap model wrote junk, then looped
+        // and was abandoned. The junk is still on disk, and the tier that took
+        // over has no idea it is there.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let note = dir.path().join("note.txt");
+        std::fs::write(&note, "the original\n").expect("write");
+
+        let stubborn = ScriptedProvider::new(vec![
+            calls_tool("write_file", r#"{"path":"note.txt","content":"junk"}"#),
+            // Then it loses the plot and is spilled past.
+            looping_answer(),
+        ]);
+        let healthy = ScriptedProvider::new(vec![answer("recovered")]);
+
+        let chain = chain_of(vec![
+            (stubborn, Limits::default()),
+            (healthy, Limits::default()),
+        ]);
+        let (tx, mut rx) = spawn(
+            config(dir.path(), DEFAULT_MAX_STEPS),
+            chain,
+            Arc::new(Registry::with_default_tools()),
+            Arc::new(AlwaysApprove::default()),
+        );
+
+        tx.send(Command::Prompt("do it".to_string())).expect("send");
+        let events = drain_from(&mut rx).await;
+
+        assert!(
+            escalation(&events).is_some(),
+            "the tier should have spilled: {events:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&note).expect("read"),
+            "junk",
+            "the abandoned tier's side effect stands, which is why undo matters"
+        );
+
+        tx.send(Command::Undo).expect("send");
+        let said = notices(&drain_quiet(&mut rx).await).join("\n");
+
+        assert!(said.contains("restored"), "{said}");
+        assert_eq!(
+            std::fs::read_to_string(&note).expect("read"),
+            "the original\n",
+            "the junk from the tier that spilled should be gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn undoing_with_nothing_recorded_says_so() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (tx, mut rx) = spawn(
+            config(dir.path(), DEFAULT_MAX_STEPS),
+            single_tier(ScriptedProvider::new(Vec::new())),
+            Arc::new(Registry::with_default_tools()),
+            Arc::new(AlwaysApprove::default()),
+        );
+
+        tx.send(Command::Undo).expect("send");
+        let said = notices(&drain_quiet(&mut rx).await).join("\n");
+
+        assert!(said.contains("nothing to undo"), "{said}");
+    }
+
+    #[tokio::test]
+    async fn a_shell_command_is_never_offered_for_undo() {
+        // It can do anything, so there is no honest reversal. `/undo` after one
+        // must not claim to have put anything back.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (shell, flag) = crate::provider::cli::portable_shell();
+
+        let (tx, mut rx) = spawn(
+            config(dir.path(), DEFAULT_MAX_STEPS),
+            single_tier(ScriptedProvider::new(vec![
+                calls_tool(
+                    "run_shell",
+                    &format!(r#"{{"command":"{shell} {flag} 'echo hi'"}}"#),
+                ),
+                answer("ran it"),
+            ])),
+            Arc::new(Registry::with_default_tools()),
+            Arc::new(AlwaysApprove::default()),
+        );
+        tx.send(Command::Prompt("run it".to_string()))
+            .expect("send");
+        let _ = drain_from(&mut rx).await;
+
+        tx.send(Command::Undo).expect("send");
+        let said = notices(&drain_quiet(&mut rx).await).join("\n");
+
+        assert!(said.contains("nothing to undo"), "{said}");
     }
 }
