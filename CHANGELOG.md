@@ -6,6 +6,123 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-11
+
+### Added
+
+- **`/undo` — put back the last approved write.** Spill stops and shows a diff
+  before every write, so the bytes it was about to replace were already in hand;
+  keeping them makes the one capability a model-initiated write cannot offer you.
+  It pairs with spilling over: a tier that wrote junk and then looped is abandoned,
+  but its side effects are not, and the next tier inherits a workspace containing
+  them.
+
+  It reaches **one write** — a second `/undo` says there is nothing to undo rather
+  than working backwards — and it refuses rather than guessing: if the file is not
+  still exactly what the write left, because you edited it or it was deleted, it
+  says so and changes nothing. That refusal is the whole safety story, and it is
+  why `/undo` does not ask for approval first: you typed it, and the thing it
+  protects you from is not yourself.
+
+  A created file is removed again, along with the directories the write created —
+  but only while they are empty, so a directory that acquired something else is
+  left alone. A write too large to keep a copy of says so rather than quietly
+  offering to restore an *older* write. `run_shell` is never reversible and is
+  never offered. Nothing is persisted, so it does not survive a restart.
+
+- **A tool-error budget by error class.** A run of tool failures used to be counted
+  without regard to *what* failed, so a model guessing at a path that does not exist
+  and one having an unlucky run looked the same. Failures are now classified —
+  missing file, permission denied, malformed call, timeout, or unrecognised — and the
+  same kind of failure from the same tool three times is a stall. Three different
+  files read *successfully* is not, and never was; that is now pinned by a test.
+
+  **A repeat only counts when it is really a repeat.** A missing file, a refusal and
+  a timeout are facts about the *world*, so those only accumulate when the call's
+  target repeats too: looking for a `.env`, a `Makefile` and a `pyproject.toml` that
+  are not there is three facts about the filesystem, not one wall. A malformed call is
+  the model's own output being wrong, so those count across targets — the target was
+  never what was wrong. Probing that never stops is still caught, by the general
+  run-of-failures rule at whatever the tier asked for.
+
+  The budget is a minimum against the tier's own `max_repeat_run`, so it can only make
+  detection tighter and can never loosen a tier that configured itself strictly.
+  Transient and unrecognised failures have no budget of their own, because the next
+  try may well work, so only the tier's general allowance applies to those. The
+  verdict names the class:
+  `read_file failed 3 times with the same error (no such file)`.
+
+- **The handoff is narrated before it happens.** A new `Spilling` event is sent the
+  moment the verdict lands and *before* the attempt is discarded, so the transcript
+  says why a tier is being given up on as it happens rather than after. The rail
+  meanwhile draws that tier's mark reversed in the warning colour for a beat
+  (~360ms), then settles it into the spent `✗`.
+
+  This is presentation only: the tier is already stopped when the verdict fires, so
+  the beat costs the retry nothing — the next tier starts work immediately and the
+  narration is held on screen over it.
+
+- **The session survives the process.** Quitting used to lose everything: the
+  conversation, the tier it had settled on, whether one was pinned, the sticky
+  choice, the stuck policy, the mode, and every CLI tier's conversation handle.
+  `spill` with no arguments now resumes the session for the directory it is run
+  in, and says so — `resumed this session — 42 messages, last saved 3h ago`.
+
+  One file per workspace under the state directory (`~/.local/state/spill/sessions/`
+  on Linux), written atomically and `0600`, keyed by a hash of the canonical
+  workspace path with the path itself stored and checked on load so a collision
+  cannot resume somebody else's conversation. The tier is named by its configured
+  `id` rather than its position, so reordering `config.toml` between runs does not
+  quietly move you onto a different model; a tier that is gone is dropped and
+  falls back to the first.
+
+  **The transcript is stored inline, and that was the whole argument.** A pointer
+  to a provider-side conversation would be smaller, but an `openai` tier is
+  stateless by design — the entire history is re-sent on every turn — so a
+  pointer-only session would remember *nothing* for a local model, which is the
+  configuration this program is built around. The file is therefore the only
+  record that exists for those tiers.
+
+  The system prompt is not stored, only the conversation: it is rebuilt from the
+  restored mode on load, so a session saved in plan mode cannot be resumed
+  carrying instructions to be read-only while in build mode. What comes back is
+  the conversation the models saw, so tool spinners and notices are not replayed.
+  Token and cost totals are not persisted — they describe a session, and `/cost`
+  starts fresh.
+
+  Written by the agent, which is the only thing that can see the session, the
+  chain and each provider's conversation at once, at one call site that every
+  command passes through — so a completed turn, a tier change and `/clear` are
+  all saved by the same code. A failed write is reported and the turn carries on.
+
+  `-p`, `doctor` and `presets` are untouched: a script that resumed yesterday's
+  conversation because it ran in the same directory would be a trap. `/clear`
+  clears what is on disk as well as what is on screen.
+
+### Changed
+
+- **Timeout defaults depend on where the model is.** One profile was wrong in both
+  directions. A local tier — loopback, the private ranges, link-local, `.local`,
+  `host.docker.internal` — now gets **120s** before its first token, because a 30B
+  loading into a 5090's VRAM can easily need more than the old 30s, and **30s** of
+  silence once it is streaming, because a local server that has gone quiet has
+  wedged. Hosted tiers keep 30s / 60s, and a `cli` tier is judged as hosted: its first
+  line includes its own harness starting up, which is slow for reasons a model server
+  is not.
+
+  A tier's `[tier.limits]` block is now *overrides*, and each field falls through to
+  its class default independently — so a local tier that sets only `idle_timeout_ms`
+  keeps the first-token patience its locality implies instead of dropping back to a
+  global 30s, which was the false spill this was meant to prevent.
+
+  `spill doctor` reports the effective timeouts for a local tier, and carries the
+  class and both budgets for every tier in its JSON.
+
+- **The rail's flash moved from after a spill to around it.** It used to reverse the
+  dead tier's mark for ~900ms once the move had already happened. It now flashes the
+  tier being abandoned, starting at the announcement and settling when the beat
+  expires, so the mark and the reason belong to the move rather than to its aftermath.
+
 ### Fixed
 
 - The command menu shows every command again. It capped at twelve rows and the
@@ -196,20 +313,25 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   stuck reason rather than the session: a turn that loops is abandoned before any of
   it is recorded, so the detector's own sample is the only copy of that evidence.
 
-  The consultant is given no tools, which is what makes "the answer is prose" true
-  for an `openai` endpoint rather than hoped for: it has nothing to call, so it must
-  answer, and the call is one round trip rather than an agent loop. A `cli`
-  consultant runs its own harness and cannot be stripped of its tools this way, so
-  the question asks it plainly not to act and the README says so.
+  An `openai` consultant is given no tools, which is what makes "the answer is prose"
+  true for it rather than hoped for: it has nothing to call, so it must answer, and the
+  call is one round trip rather than an agent loop. A `cli` consultant runs its own
+  harness and cannot be stripped of its tools this way, so it is launched read-only
+  instead — a plan mode, a sandbox policy, a Q&A mode, whichever that CLI offers — with a
+  hard instruction not to act leading the question, and never with the unattended flag
+  that would hand the powers straight back. A CLI whose preset names no read-only mode is
+  never consulted at all: the turn escalates and says why, rather than asking the model
+  to behave when nothing enforces it. The shipped presets carry the flag wherever the CLI
+  has one, checked against each CLI's own `--help`.
 
   Consult falls back to escalating rather than insisting: when the per-turn budget
   is spent, when the consult fails or is stopped, when the answer comes back empty,
-  or when there is no tier below to ask. A stuck turn is therefore never stranded,
-  and a consult can never cost more than the escalation it replaced. The answer is
-  clipped before it enters the driver's history, because it is re-read on every
-  later turn of the session. A second consult is told what the first one said and
-  that it did not work, since the likeliest outcome of asking twice is paying for
-  the same advice again.
+  when the consultant cannot be held read-only, or when there is no tier below to
+  ask. A stuck turn is therefore never stranded, and a consult can never cost more
+  than the escalation it replaced. The answer is clipped before it enters the
+  driver's history, because it is re-read on every later turn of the session. A
+  second consult is told what the first one said and that it did not work, since the
+  likeliest outcome of asking twice is paying for the same advice again.
 
   The consultant's tokens are attributed to the consultant rather than to the
   driving tier, so `/cost` measures the thing the choice between the two modes
@@ -443,4 +565,6 @@ First release. Everything below is new.
   [`randallyash/spillover`](https://github.com/randallyash/homebrew-spillover)
   tap, so `brew install randallyash/spillover/spill` works.
 
+[Unreleased]: https://github.com/randallyash/spillover/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/randallyash/spillover/releases/tag/v0.1.1
 [0.1.0]: https://github.com/randallyash/spillover/releases/tag/v0.1.0
