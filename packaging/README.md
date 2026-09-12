@@ -151,9 +151,9 @@ know, so it cannot be done for you from here.
    cat ~/.ssh/id_ed25519_aur.pub
    ```
 
-3. Confirm the AUR accepts it. This prints `Welcome` when the key is registered
-   and `Permission denied (publickey)` when it is not, so it is worth running
-   before blaming the push:
+3. Confirm the AUR accepts it. When the key is registered this answers with a
+   welcome naming your account; when it is not you get `Permission denied
+   (publickey)`, which is worth knowing before blaming the push:
 
    ```sh
    ssh -T aur@aur.archlinux.org
