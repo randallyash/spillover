@@ -419,25 +419,39 @@ pub fn portable_shell() -> (&'static str, &'static str) {
     }
 }
 
+/// Where a command would be found, if it is on PATH at all.
+///
+/// The path rather than the answer, because the path is the diagnostic: "grok
+/// is installed" cannot say *which* grok, and a second copy earlier on PATH is
+/// the usual reason a tier behaves differently here than in the shell the CLI
+/// was tested in. `on_path` is this with the answer thrown away.
+pub fn which(bin: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+
+    std::env::split_paths(&path).find_map(|directory| {
+        let direct = directory.join(bin);
+        if direct.is_file() {
+            return Some(direct);
+        }
+
+        // Windows resolves executables by extension.
+        if cfg!(windows) {
+            return ["exe", "cmd", "bat"]
+                .iter()
+                .map(|extension| directory.join(format!("{bin}.{extension}")))
+                .find(|candidate| candidate.is_file());
+        }
+
+        None
+    })
+}
+
 /// Whether a command can be found on PATH.
 ///
 /// Used to report a missing agent CLI when a tier is set up or checked, rather
 /// than at the moment it is first needed.
 pub fn on_path(bin: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-
-    std::env::split_paths(&path).any(|directory| {
-        if directory.join(bin).is_file() {
-            return true;
-        }
-        // Windows resolves executables by extension.
-        cfg!(windows)
-            && ["exe", "cmd", "bat"]
-                .iter()
-                .any(|extension| directory.join(format!("{bin}.{extension}")).is_file())
-    })
+    which(bin).is_some()
 }
 
 /// The newest user turn, which is all a continued session needs.
@@ -1048,6 +1062,30 @@ mod tests {
             ],
             "the read-only flags go in; --yolo and the session flags stay out"
         );
+    }
+
+    #[test]
+    fn which_returns_the_file_not_just_the_answer() {
+        // What the doctor report prints, and the reason it prints it: "it is on
+        // PATH" cannot say *which* one, and a second copy earlier on PATH is the
+        // usual reason a CLI tier behaves differently here than in a shell.
+        #[cfg(unix)]
+        {
+            let found = which("sh").expect("sh is on PATH in any unix environment");
+            assert!(found.is_file(), "{}", found.display());
+            assert!(found.ends_with("sh"), "{}", found.display());
+        }
+
+        // Whatever it finds or does not, the boolean must be the same answer:
+        // one rule, two callers.
+        assert_eq!(on_path("sh"), which("sh").is_some());
+    }
+
+    #[test]
+    fn a_command_that_is_not_installed_has_nowhere_to_be_found() {
+        let absent = "spill-nothing-is-called-this-anywhere";
+        assert!(which(absent).is_none());
+        assert!(!on_path(absent));
     }
 
     #[test]

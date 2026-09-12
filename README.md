@@ -504,24 +504,57 @@ spill doctor
 ```
 spill 0.1.0 — doctor
 
+config    /home/you/.config/spill/config.toml
+          found at the default path · workspace ~ · sticky fallback on
+
 ok    local    openai  http://localhost:1234/v1
                would use qwen3-coder-30b  (5 ms)
-               on stuck: consult
 FAIL  offline  openai  http://127.0.0.1:9/v1
                could not reach http://127.0.0.1:9/v1/models: could not connect  (0 ms)
 ok    grok     cli     grok
                is installed  (0 ms)
+               binary: /home/you/.local/share/mise/installs/node/bin/grok
+               sessions: on · opens with -s {session} · resumes with -r {session}
+               consult: available read-only · --permission-mode plan
 
 2 of 3 tier(s) usable. spill will start on the first one that answers.
+
+delegated CLIs sign in for themselves, so spill removes these from their
+environment before they start — a key exported for another tier cannot change
+whose account is billed:
+  ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN OPENAI_API_KEY XAI_API_KEY
+  GROK_API_KEY GEMINI_API_KEY GOOGLE_API_KEY GOOGLE_GENERATIVE_AI_API_KEY
+  OPENROUTER_API_KEY DEEPSEEK_API_KEY
+  * set here right now, so this is the removal doing something: XAI_API_KEY
+
+this machine
+  terminal  110x40
+  colours   truecolor
+  needs     nothing installed for spill itself: no Rust toolchain and no runtime
 ```
 
-Every configured tier is checked, with what each would actually use, how long it
-took, and why anything failed. A tier whose stuck policy is not the default says so,
-because handing a turn over is a choice worth being able to audit — and the plain-text
-report shows it only when it is not `consult`, so an ordinary configuration stays as
-short as it was. The JSON always carries `onStuck` for every tier, so a script never has to infer
-it from a missing line. `--json` produces the same report for a script, and the exit
-code is non-zero when no tier is usable.
+It is written to answer "it does not work on my machine" before anyone has to ask:
+which file is in force, every tier with what it would actually use and how long it
+took, where each CLI really is, what flags it will run with, which variables get
+taken out of its environment, and what the terminal is giving the interface.
+
+The config line is the first thing to check when the run does not match the file you
+edited: a path you did not expect means you are editing the other one, and *not there
+yet* means the built-in defaults are in force.
+
+The `binary:` line is the answer more often than the rest of it. "grok is installed"
+cannot say *which* grok, and a second copy earlier on `PATH` is the usual reason a
+tier behaves differently here than in your shell. `sessions:` is the same idea for the
+flags nobody read: whether a CLI continues its session between turns or is handed the
+whole transcript again, and whether it can be consulted at all without a read-only
+mode.
+
+A tier whose stuck policy is not the default says so, because handing a turn over is a
+choice worth being able to audit — and the plain-text report shows it only when it is
+not `consult`, so an ordinary configuration stays as short as it was.
+
+`--json` produces the same report for a script, carrying every field the prose leaves
+out. The exit code is non-zero when no tier is usable.
 
 **API keys are never printed** — only the *name* of the environment variable one
 would come from. That is deliberate, so a doctor report is safe to paste into an

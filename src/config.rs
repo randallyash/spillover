@@ -69,6 +69,67 @@ pub struct Config {
     pub general: General,
     #[serde(default, rename = "tier")]
     pub tiers: Vec<Tier>,
+    /// Where this configuration came from, recorded by `load`.
+    ///
+    /// Not part of the file, and not re-derivable afterwards: a missing default
+    /// path and a found one both produce a `Config` that is perfectly valid, and
+    /// the difference is the first thing anyone asks when the run does not
+    /// behave like the file they edited. Kept here rather than worked out again
+    /// by whoever reports it, because a second copy of the resolution rules is a
+    /// second chance to be confidently wrong about it.
+    #[serde(skip)]
+    pub origin: Origin,
+}
+
+/// Which file a configuration was read from, if any.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Origin {
+    /// The path `--config` named.
+    Given(PathBuf),
+    /// The default path, where a file was found.
+    Found(PathBuf),
+    /// The default path, where there was nothing: the built-in defaults apply.
+    Missing(PathBuf),
+    /// Parsed from text rather than read from a file.
+    #[default]
+    Text,
+}
+
+impl Origin {
+    /// The file involved, whether or not it turned out to exist.
+    pub fn path(&self) -> Option<&Path> {
+        match self {
+            Self::Given(path) | Self::Found(path) | Self::Missing(path) => Some(path),
+            Self::Text => None,
+        }
+    }
+
+    /// A stable word for the machine reading the report, as with the spill log's
+    /// trigger tokens: the prose may be reworded, this may not.
+    pub fn token(&self) -> &'static str {
+        match self {
+            Self::Given(_) => "given",
+            Self::Found(_) => "found",
+            Self::Missing(_) => "missing",
+            Self::Text => "text",
+        }
+    }
+
+    /// Which origin a load produced, from the two facts it has.
+    ///
+    /// `required` is whether the path was named by `--config`, which is also
+    /// whether a missing file is an error rather than a first run. Kept out of
+    /// `load` so the three cases can be tested without a test moving the default
+    /// path, which means reaching into the environment every test shares.
+    fn after_load(path: &Path, required: bool, read: bool) -> Self {
+        match (read, required) {
+            (true, true) => Self::Given(path.to_path_buf()),
+            (true, false) => Self::Found(path.to_path_buf()),
+            // Nothing there, and nothing named: not set up yet, which is a state
+            // to report rather than an error.
+            (false, _) => Self::Missing(path.to_path_buf()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -462,6 +523,7 @@ impl Default for Config {
             schema: default_schema(),
             general: General::default(),
             tiers: Vec::new(),
+            origin: Origin::default(),
         }
     }
 }
@@ -504,13 +566,18 @@ impl Config {
             Ok(text) => text,
             Err(source) => {
                 if explicit.is_none() && source.kind() == std::io::ErrorKind::NotFound {
-                    return Ok(Self::default());
+                    return Ok(Self {
+                        origin: Origin::after_load(&path, false, false),
+                        ..Self::default()
+                    });
                 }
                 return Err(ConfigError::Read { path, source });
             }
         };
 
-        Self::parse(&path, &text)
+        let mut config = Self::parse(&path, &text)?;
+        config.origin = Origin::after_load(&path, explicit.is_some(), true);
+        Ok(config)
     }
 
     pub fn parse(path: &Path, text: &str) -> Result<Self, ConfigError> {
@@ -700,6 +767,75 @@ mod tests {
         // model and one that 404s until it is edited.
         let config = parse(include_str!("../config.example.toml")).expect("valid");
         assert_eq!(config.tiers[0].model.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn a_load_says_which_file_it_read_and_how_it_was_chosen() {
+        // The report's first line. Recorded at load time because this is the
+        // only place that knows: afterwards, a found file and a missing one both
+        // produce a `Config` that works, and the difference is the first thing
+        // anyone asks when the run does not match the file they edited.
+        let path = Path::new("/home/you/.config/spill/config.toml");
+
+        assert_eq!(
+            Origin::after_load(path, true, true),
+            Origin::Given(path.to_path_buf()),
+            "named by --config and read"
+        );
+        assert_eq!(
+            Origin::after_load(path, false, true),
+            Origin::Found(path.to_path_buf()),
+            "the default path, with a file at it"
+        );
+        assert_eq!(
+            Origin::after_load(path, false, false),
+            Origin::Missing(path.to_path_buf()),
+            "the default path, with nothing there yet"
+        );
+    }
+
+    #[test]
+    fn every_origin_names_itself_and_keeps_its_path() {
+        // The token is what a script reads, so it is a contract: reword the
+        // prose in the report, never these. The path survives every case, since
+        // "not there yet" is only actionable with the place it looked in.
+        let path = Path::new("/home/you/.config/spill/config.toml");
+
+        for (origin, token) in [
+            (Origin::after_load(path, true, true), "given"),
+            (Origin::after_load(path, false, true), "found"),
+            (Origin::after_load(path, false, false), "missing"),
+            (Origin::Text, "text"),
+        ] {
+            assert_eq!(origin.token(), token);
+            if token != "text" {
+                assert_eq!(origin.path(), Some(path), "{token} lost its path");
+            }
+        }
+
+        assert_eq!(Origin::default(), Origin::Text, "text is the only default");
+        assert_eq!(Origin::Text.path(), None);
+    }
+
+    #[tokio::test]
+    async fn a_real_load_records_an_explicit_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[[tier]]\nid = \"local\"\nkind = \"openai\"\nbase_url = \"http://127.0.0.1:9/v1\"\n",
+        )
+        .expect("write");
+
+        let config = Config::load(Some(&path)).expect("an explicit path that exists");
+        assert_eq!(config.origin, Origin::Given(path.clone()));
+        assert_eq!(config.origin.path(), Some(path.as_path()));
+
+        // And an explicit path that is not there is still an error: a typo must
+        // never be silently ignored, which is the rule this feature must not
+        // have loosened.
+        let missing = dir.path().join("nothing.toml");
+        assert!(Config::load(Some(&missing)).is_err());
     }
 
     #[test]

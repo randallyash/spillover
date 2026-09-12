@@ -4,13 +4,52 @@
 //! working?" without anyone having to trace a request by hand. Secrets are
 //! never printed — only the *name* of the variable a key would come from.
 
+use std::path::PathBuf;
 use std::time::Instant;
 
 use serde_json::json;
 
-use crate::config::{Config, Limits, OnStuck, TierClass, TierKind};
+use crate::config::{Config, Limits, OnStuck, Origin, TierClass, TierKind};
 use crate::preset::{Library, cli_spec, openai_settings};
+use crate::provider::cli::{CliSpec, which};
 use crate::setup::probe;
+
+/// What a `cli` tier resolved to, which is the half of it that is not visible
+/// anywhere else.
+///
+/// A CLI tier's behaviour depends on flags that come from a preset the user has
+/// never read, so "why does this not resume its session?" is otherwise
+/// unanswerable without knowing which preset was picked and what it carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliDetail {
+    /// Where the binary actually is.
+    ///
+    /// Not the same question as whether it is on PATH, and the difference is the
+    /// answer more often than anything else here: a second copy earlier on PATH
+    /// is the usual reason a tier behaves differently here than in your shell.
+    pub bin_path: Option<PathBuf>,
+    /// Whether this tier continues a session between turns, and with which
+    /// flags — empty means the whole transcript is sent every turn instead.
+    pub resume_args: Vec<String>,
+    /// Flags that open the session, when spill is the one choosing its id.
+    /// Empty means the CLI mints its own and reports it.
+    pub session_args: Vec<String>,
+    /// Whether the CLI can be consulted at all, which needs a read-only mode
+    /// spill can launch it with. A CLI without one hands the turn over instead.
+    pub read_only_args: Vec<String>,
+}
+
+impl CliDetail {
+    /// Whether turn-to-turn session continuity is on for this tier.
+    pub fn continues_sessions(&self) -> bool {
+        !self.resume_args.is_empty()
+    }
+
+    /// Whether the CLI names its own session, so spill has no id to pass.
+    pub fn captures_session(&self) -> bool {
+        self.continues_sessions() && self.session_args.is_empty()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct TierReport {
@@ -37,6 +76,74 @@ pub struct TierReport {
     /// grace period, and nothing else on screen answers it.
     pub limits: Limits,
     pub class: TierClass,
+    /// Present for a `cli` tier whose spec resolved.
+    pub cli: Option<CliDetail>,
+}
+
+/// The model credentials removed from a delegated CLI's environment.
+///
+/// Reported as the whole list rather than only the ones set, because the
+/// question a person arrives with is "is my key the one being taken away?", and
+/// a list that answers it by omission cannot be read.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Credentials {
+    /// Every name spill removes before starting a delegated CLI.
+    pub removed: Vec<&'static str>,
+    /// Those set in this environment right now: the ones the removal is doing
+    /// something about, and the ones whose absence from a CLI would explain it
+    /// failing to find a key.
+    pub set: Vec<&'static str>,
+}
+
+/// What this machine offers the interface.
+///
+/// The other half of "it does not work here", and the half nobody can see: the
+/// reader of a pasted report is not sitting at the terminal it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Machine {
+    /// Columns and rows, when there is a terminal to ask. `None` when there is
+    /// not, which is the ordinary case for a report on its way to a bug tracker.
+    pub terminal: Option<(u16, u16)>,
+    /// The colour depth the environment advertises: 8, 256, or truecolor.
+    pub colours: u16,
+    /// Whether `NO_COLOR` asks for none, per its specification.
+    pub no_color: bool,
+}
+
+impl Machine {
+    /// Ask the machine, which is only ever done once, by `diagnose`.
+    fn detect() -> Self {
+        Self {
+            terminal: crossterm::terminal::size().ok(),
+            colours: crossterm::style::available_color_count(),
+            no_color: std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()),
+        }
+    }
+
+    /// The terminal as a person would describe it.
+    fn terminal_line(&self) -> String {
+        match self.terminal {
+            Some((columns, rows)) => format!("{columns}x{rows}"),
+            None => "not a terminal (the output is piped)".to_string(),
+        }
+    }
+
+    /// The colour depth, and whether it will be used.
+    fn colour_line(&self) -> String {
+        let depth = if self.colours > 256 {
+            "truecolor"
+        } else if self.colours == 256 {
+            "256 colours"
+        } else {
+            "8 colours"
+        };
+
+        if self.no_color {
+            format!("{depth}, but NO_COLOR is set so none of them are used")
+        } else {
+            depth.to_string()
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +151,14 @@ pub struct Report {
     pub tiers: Vec<TierReport>,
     pub notes: Vec<String>,
     pub version: String,
+    /// Which file was read, and how it was found.
+    pub origin: Origin,
+    pub workspace: String,
+    pub sticky_fallback: bool,
+    /// Present only when there is a `cli` tier to start: with none, nothing is
+    /// removed from anything.
+    pub credentials: Option<Credentials>,
+    pub machine: Machine,
 }
 
 impl Report {
@@ -60,9 +175,13 @@ impl Report {
     pub fn render(&self) -> String {
         let mut out = String::new();
         out.push_str(&format!("spill {} — doctor\n\n", self.version));
+        out.push_str(&self.render_config());
+        out.push('\n');
 
         if self.tiers.is_empty() {
             out.push_str("No tiers are configured. Run `spill setup` to choose some.\n");
+            out.push('\n');
+            out.push_str(&self.render_machine());
             if !self.notes.is_empty() {
                 out.push('\n');
                 out.push_str(&self.render_notes());
@@ -119,6 +238,11 @@ impl Report {
                     width = width
                 ));
             }
+            if let Some(cli) = &tier.cli {
+                for line in cli_lines(cli) {
+                    out.push_str(&format!("      {:<width$}  {line}\n", "", width = width));
+                }
+            }
         }
 
         let working = self.tiers.iter().filter(|tier| tier.reachable).count();
@@ -132,12 +256,65 @@ impl Report {
             out.push_str("spill has nowhere to send a prompt until one of these works.\n");
         }
 
+        if let Some(credentials) = &self.credentials {
+            out.push('\n');
+            out.push_str(&render_credentials(credentials));
+        }
+
+        out.push('\n');
+        out.push_str(&self.render_machine());
+
         if !self.notes.is_empty() {
             out.push('\n');
             out.push_str(&self.render_notes());
         }
 
         out.trim_end().to_string()
+    }
+
+    /// Which file is in force, and how it was chosen.
+    ///
+    /// The first thing anyone asks when the run does not match the file they
+    /// edited, and the one question a report could not previously answer at all.
+    fn render_config(&self) -> String {
+        let mut out = String::new();
+        let (path, how) = match &self.origin {
+            Origin::Given(path) => (Some(path), "named by --config"),
+            Origin::Found(path) => (Some(path), "found at the default path"),
+            Origin::Missing(path) => (
+                Some(path),
+                "not there yet, so the built-in defaults are in force",
+            ),
+            Origin::Text => (None, "not read from a file"),
+        };
+
+        let head = match path {
+            Some(path) => path.display().to_string(),
+            None => "(no file)".to_string(),
+        };
+        out.push_str(&format!(
+            "{:<width$} {head}\n",
+            "config",
+            width = LABEL_WIDTH
+        ));
+        out.push_str(&format!(
+            "{:width$} {how} · workspace {} · sticky fallback {}\n",
+            "",
+            self.workspace,
+            if self.sticky_fallback { "on" } else { "off" },
+            width = LABEL_WIDTH
+        ));
+        out
+    }
+
+    /// What this machine gives the interface.
+    fn render_machine(&self) -> String {
+        format!(
+            "this machine\n  terminal  {}\n  colours   {}\n  needs     nothing installed for \
+             spill itself: no Rust toolchain and no runtime\n",
+            self.machine.terminal_line(),
+            self.machine.colour_line()
+        )
     }
 
     fn render_notes(&self) -> String {
@@ -169,8 +346,37 @@ impl Report {
                 "class": tier.class.label(),
                 "firstTokenTimeoutMs": tier.limits.first_token_timeout_ms,
                 "idleTimeoutMs": tier.limits.idle_timeout_ms,
+                "cli": tier.cli.as_ref().map(|cli| json!({
+                    "binPath": cli.bin_path.as_ref().map(|path| path.display().to_string()),
+                    "sessions": cli.continues_sessions(),
+                    "sessionArgs": cli.session_args,
+                    "resumeArgs": cli.resume_args,
+                    "readOnlyArgs": cli.read_only_args,
+                    "consultable": !cli.read_only_args.is_empty(),
+                })),
             })).collect::<Vec<_>>(),
             "notes": self.notes,
+            // Everything below is carried for a machine even where the prose
+            // leaves it out: the report is meant to be pasted into a bug report,
+            // and a reader should not have to ask for the rest of it.
+            "config": {
+                "path": self.origin.path().map(|path| path.display().to_string()),
+                "source": self.origin.token(),
+                "workspace": self.workspace,
+                "stickyFallback": self.sticky_fallback,
+            },
+            "credentials": self.credentials.as_ref().map(|credentials| json!({
+                "removed": credentials.removed,
+                "set": credentials.set,
+            })),
+            "machine": {
+                "terminal": self.machine.terminal.map(|(columns, rows)| json!({
+                    "columns": columns,
+                    "rows": rows,
+                })),
+                "colours": self.machine.colours,
+                "noColor": self.machine.no_color,
+            },
         });
         serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
     }
@@ -203,6 +409,118 @@ impl Report {
     }
 }
 
+/// How wide the label column is in the blocks that have one.
+const LABEL_WIDTH: usize = 9;
+
+/// How wide the report wraps, in columns.
+///
+/// Fixed rather than taken from the terminal, because the report is written to
+/// be pasted: a line wrapped to the writer's window arrives at the reader's
+/// terminal wrapped somewhere else, or not at all.
+const REPORT_WIDTH: usize = 78;
+
+/// What a `cli` tier resolved to, as the lines that belong under it.
+///
+/// Each line is a fact that changes what the tier does and that nothing else in
+/// the report shows: which binary will run, whether the session is continued or
+/// the whole transcript is resent every turn, and whether this tier can be
+/// consulted at all.
+fn cli_lines(cli: &CliDetail) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    // Only when it was found. A missing one is already the tier's own failure
+    // line, and repeating it here would say the same thing twice.
+    if let Some(path) = &cli.bin_path {
+        lines.push(format!("binary: {}", path.display()));
+    }
+
+    if cli.continues_sessions() {
+        // Both sets of flags, because they answer different questions: what
+        // opens a session, and what comes back to it. A CLI that names its own
+        // id has only the second, and saying so is the point.
+        let mut parts = Vec::new();
+        if cli.captures_session() {
+            parts.push("the CLI names the session".to_string());
+        } else {
+            parts.push(format!("opens with {}", cli.session_args.join(" ")));
+        }
+        parts.push(format!("resumes with {}", cli.resume_args.join(" ")));
+        lines.push(format!("sessions: on · {}", parts.join(" · ")));
+    } else {
+        lines.push(
+            "sessions: off · the whole transcript is sent every turn, which costs tokens but \
+             survives a CLI that cannot remember"
+                .to_string(),
+        );
+    }
+
+    if cli.read_only_args.is_empty() {
+        lines.push(
+            "consult: no read-only flag for this CLI, so a stall hands the turn over instead of \
+             asking it"
+                .to_string(),
+        );
+    } else {
+        lines.push(format!(
+            "consult: available read-only · {}",
+            cli.read_only_args.join(" ")
+        ));
+    }
+
+    lines
+}
+
+/// The removed credentials: the whole list, then the ones that are set.
+fn render_credentials(credentials: &Credentials) -> String {
+    let mut out = String::from(
+        "delegated CLIs sign in for themselves, so spill removes these from their\nenvironment \
+         before they start — a key exported for another tier cannot change\nwhose account is \
+         billed:\n",
+    );
+    out.push_str(&wrapped(&credentials.removed, "  ", REPORT_WIDTH));
+
+    if !credentials.set.is_empty() {
+        out.push_str(&format!(
+            "  * set here right now, so this is the removal doing something: {}\n",
+            credentials.set.join(" ")
+        ));
+    }
+
+    out
+}
+
+/// Names filled into lines of at most `width` columns.
+///
+/// The credential list is the only thing here long enough to need it, and it is
+/// also the only thing a reader greps: wrapped, every name is still one word on
+/// one line, and the block stays readable at any terminal size.
+fn wrapped(names: &[&str], indent: &str, width: usize) -> String {
+    let mut out = String::new();
+    let mut line = String::new();
+
+    for name in names {
+        let would_be = indent.len() + line.len() + 1 + name.len();
+        if !line.is_empty() && would_be > width {
+            out.push_str(indent);
+            out.push_str(&line);
+            out.push('\n');
+            line.clear();
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(name);
+    }
+
+    if !line.is_empty() {
+        out.push_str(indent);
+        out.push_str(&line);
+        out.push('\n');
+    }
+
+    out
+}
+
 /// A millisecond budget as the seconds a person would say, so the report reads
 /// "120s" rather than "120000".
 fn seconds(milliseconds: u64) -> String {
@@ -227,6 +545,7 @@ pub async fn diagnose(library: &Library, config: &Config) -> Report {
         // Asked of the same function the agent builds with, so a report can never
         // describe timeouts that differ from the ones in force.
         let class = crate::tiers::class_of(library, tier);
+        let cli = cli_detail(library, tier);
 
         tiers.push(TierReport {
             id: tier.id.clone(),
@@ -239,14 +558,49 @@ pub async fn diagnose(library: &Library, config: &Config) -> Report {
             on_stuck: tier.on_stuck,
             limits: tier.limits.resolve(class),
             class,
+            cli,
         });
     }
+
+    // Only when there is a CLI tier. With none, nothing is removed from
+    // anything, and a list of variables that will not be touched is noise in
+    // exactly the report that most needs to stay readable.
+    let credentials = config
+        .tiers
+        .iter()
+        .any(|tier| tier.kind == TierKind::Cli)
+        .then(|| Credentials {
+            removed: crate::spawn::MODEL_CREDENTIALS.to_vec(),
+            set: crate::spawn::inherited_credentials(),
+        });
 
     Report {
         tiers,
         notes: crate::tiers::notes(library, config),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        origin: config.origin.clone(),
+        workspace: config.general.workspace.clone(),
+        sticky_fallback: config.general.sticky_fallback,
+        credentials,
+        machine: Machine::detect(),
     }
+}
+
+/// A `cli` tier's resolved spec, as the report shows it.
+fn cli_detail(library: &Library, tier: &crate::config::Tier) -> Option<CliDetail> {
+    if tier.kind != TierKind::Cli {
+        return None;
+    }
+
+    // A spec that will not resolve is already the tier's own failure line above.
+    let spec: CliSpec = cli_spec(library, tier).ok()?;
+
+    Some(CliDetail {
+        bin_path: which(&spec.bin),
+        resume_args: spec.resume_args.clone(),
+        session_args: spec.session_args.clone(),
+        read_only_args: spec.read_only_args.clone(),
+    })
 }
 
 #[cfg(test)]
@@ -264,6 +618,43 @@ mod tests {
             tiers,
             notes: Vec::new(),
             version: "0.0.0".to_string(),
+            origin: Origin::Found(PathBuf::from("/home/you/.config/spill/config.toml")),
+            workspace: "~".to_string(),
+            sticky_fallback: true,
+            credentials: None,
+            machine: machine(),
+        }
+    }
+
+    /// A fixed machine, so a render test reads the same wherever it runs. The
+    /// real one is asked once, by `diagnose`, and cannot be asserted about: it
+    /// is whatever terminal the suite happens to be running in.
+    fn machine() -> Machine {
+        Machine {
+            terminal: Some((110, 40)),
+            colours: u16::MAX,
+            no_color: false,
+        }
+    }
+
+    /// A `cli` tier's detail, as a preset would resolve it.
+    fn cli_detail(bin: &str, resume: &[&str], session: &[&str], read_only: &[&str]) -> CliDetail {
+        let owned = |flags: &[&str]| flags.iter().map(|flag| flag.to_string()).collect();
+        CliDetail {
+            bin_path: Some(PathBuf::from(format!("/usr/local/bin/{bin}"))),
+            resume_args: owned(resume),
+            session_args: owned(session),
+            read_only_args: owned(read_only),
+        }
+    }
+
+    /// A `cli` tier reported with those flags, for the render tests.
+    fn cli_tier(id: &str, resume: &[&str], session: &[&str], read_only: &[&str]) -> TierReport {
+        TierReport {
+            kind: "cli".to_string(),
+            target: id.to_string(),
+            cli: Some(cli_detail(id, resume, session, read_only)),
+            ..tier(id, true)
         }
     }
 
@@ -283,6 +674,7 @@ mod tests {
             on_stuck: OnStuck::default(),
             limits: Limits::default(),
             class: TierClass::Hosted,
+            cli: None,
         }
     }
 
@@ -602,5 +994,384 @@ mod tests {
         // A key would look like this; nothing resembling one may appear.
         assert!(!text.contains("sk-"), "{text}");
         assert!(!json.contains("sk-"), "{json}");
+    }
+
+    // ---- the five questions a bug report has to answer on its own ----------
+
+    #[test]
+    fn the_report_names_the_file_in_force_and_how_it_was_chosen() {
+        // The first question when the run does not match the file you edited,
+        // and the one thing a report previously could not answer at all.
+        let mut report = report(vec![tier("local", true)]);
+        report.origin = Origin::Found(PathBuf::from("/home/you/.config/spill/config.toml"));
+        let text = report.render();
+        assert!(
+            text.contains("/home/you/.config/spill/config.toml"),
+            "{text}"
+        );
+        assert!(text.contains("found at the default path"), "{text}");
+
+        // And an explicit file says so, because "which of the two am I editing"
+        // is the whole reason to print the path rather than assume it.
+        report.origin = Origin::Given(PathBuf::from("/tmp/other.toml"));
+        let text = report.render();
+        assert!(text.contains("/tmp/other.toml"), "{text}");
+        assert!(text.contains("named by --config"), "{text}");
+    }
+
+    #[test]
+    fn a_configuration_that_is_not_there_names_the_path_it_looked_in() {
+        // "No tiers are configured" is only actionable with the path beside it:
+        // the file may be somewhere else, or not written yet.
+        let mut report = report(Vec::new());
+        report.origin = Origin::Missing(PathBuf::from("/home/you/.config/spill/config.toml"));
+        let text = report.render();
+
+        assert!(
+            text.contains("/home/you/.config/spill/config.toml"),
+            "{text}"
+        );
+        assert!(text.contains("built-in defaults are in force"), "{text}");
+        assert!(text.contains("No tiers are configured"), "{text}");
+    }
+
+    #[test]
+    fn the_config_line_carries_the_settings_that_change_how_a_session_behaves() {
+        let mut report = report(vec![tier("local", true)]);
+        report.workspace = "/home/you/code".to_string();
+        report.sticky_fallback = false;
+        let text = report.render();
+
+        assert!(text.contains("workspace /home/you/code"), "{text}");
+        assert!(
+            text.contains("sticky fallback off"),
+            "a session that does not stick is worth seeing before it surprises someone: {text}"
+        );
+    }
+
+    #[test]
+    fn a_cli_tier_says_which_binary_and_which_flags_it_will_use() {
+        // None of this is visible anywhere else: the flags come from a preset
+        // nobody read, and the path is the answer to "it works in my shell".
+        let report = report(vec![cli_tier(
+            "helper",
+            &["-r", "{session}"],
+            &["-s", "{session}"],
+            &["--permission-mode", "plan"],
+        )]);
+        let text = report.render();
+
+        assert!(text.contains("binary: /usr/local/bin/helper"), "{text}");
+        assert!(
+            text.contains("opens with -s {session}"),
+            "opening a session and returning to it are different flags: {text}"
+        );
+        assert!(text.contains("resumes with -r {session}"), "{text}");
+        assert!(
+            text.contains("consult: available read-only · --permission-mode plan"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_cli_tier_that_cannot_remember_says_the_whole_transcript_is_resent() {
+        let report = report(vec![cli_tier("helper", &[], &[], &[])]);
+        let text = report.render();
+
+        assert!(text.contains("sessions: off"), "{text}");
+        assert!(
+            text.contains("the whole transcript is sent every turn"),
+            "the cost of a CLI that cannot remember should be stated, not implied: {text}"
+        );
+        assert!(
+            text.contains("no read-only flag"),
+            "and a tier that cannot be consulted should say so: {text}"
+        );
+    }
+
+    #[test]
+    fn a_cli_that_never_prints_its_session_id_is_described_that_way() {
+        // A CLI spill can continue but cannot name: it mints the id itself. That
+        // is a different arrangement from one spill opens, and the flags alone
+        // do not say which.
+        let report = report(vec![cli_tier("helper", &["-r", "{session}"], &[], &[])]);
+        assert!(
+            report.render().contains("the CLI names the session"),
+            "{}",
+            report.render()
+        );
+    }
+
+    #[test]
+    fn an_endpoint_tier_has_nothing_to_say_about_cli_flags() {
+        // The lines belong to the kind. An endpoint has no binary, no session
+        // and no read-only mode, and printing empty ones would be noise in
+        // exactly the report that has to stay readable.
+        let text = report(vec![tier("local", true)]).render();
+        for line in ["binary:", "sessions:", "consult:"] {
+            assert!(!text.contains(line), "{line} should not appear: {text}");
+        }
+    }
+
+    #[test]
+    fn the_credentials_section_carries_the_whole_list_not_only_the_set_ones() {
+        // The question people arrive with is "is my key the one being taken
+        // away?", and a list that answers by omission cannot be read.
+        let mut report = report(vec![cli_tier("helper", &[], &[], &[])]);
+        report.credentials = Some(Credentials {
+            removed: crate::spawn::MODEL_CREDENTIALS.to_vec(),
+            set: vec!["XAI_API_KEY"],
+        });
+        let text = report.render();
+
+        for name in crate::spawn::MODEL_CREDENTIALS {
+            assert!(text.contains(name), "{name} should be listed: {text}");
+        }
+        assert!(
+            text.contains("* set here right now"),
+            "the ones in force are the ones doing something: {text}"
+        );
+        assert!(text.contains("XAI_API_KEY"), "{text}");
+
+        // Wrapped, and every name intact as one word. Checked against the block
+        // rather than the whole report: this is the text long enough to need
+        // wrapping, and a tier's own detail line is allowed to run past it.
+        let block = render_credentials(report.credentials.as_ref().expect("set above"));
+        for line in block.lines() {
+            assert!(
+                line.chars().count() <= REPORT_WIDTH,
+                "a line is wider than the report wraps: {line:?}"
+            );
+        }
+        for name in crate::spawn::MODEL_CREDENTIALS {
+            assert!(
+                block
+                    .lines()
+                    .any(|line| line.split(' ').any(|word| word == *name)),
+                "{name} should be greppable as one word: {block}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_report_with_nothing_delegated_prints_no_credentials_section_at_all() {
+        // Whether to ask is `diagnose`'s call, from the configuration — that
+        // half is covered below, against a real config. This is the other half:
+        // an absent answer prints nothing rather than an empty heading.
+        let text = report(vec![tier("local", true)]).render();
+
+        assert!(text.contains("this machine"), "{text}");
+        assert!(!text.contains("ANTHROPIC_API_KEY"), "{text}");
+        assert!(!text.contains("delegated CLIs"), "{text}");
+    }
+
+    #[test]
+    fn the_machine_block_says_what_the_interface_was_given() {
+        let mut report = report(vec![tier("local", true)]);
+        report.machine = Machine {
+            terminal: Some((120, 40)),
+            colours: u16::MAX,
+            no_color: false,
+        };
+        let text = report.render();
+
+        assert!(text.contains("terminal  120x40"), "{text}");
+        assert!(text.contains("colours   truecolor"), "{text}");
+        assert!(
+            text.contains("no Rust toolchain"),
+            "the question this line answers is whether anything else must be installed: {text}"
+        );
+    }
+
+    #[test]
+    fn a_report_written_to_a_pipe_does_not_invent_a_terminal_size() {
+        // The usual case for a pasted report, and the one where a made-up
+        // "80x24" would send someone looking at the wrong thing entirely.
+        let mut report = report(vec![tier("local", true)]);
+        report.machine = Machine {
+            terminal: None,
+            colours: 256,
+            no_color: false,
+        };
+        let text = report.render();
+
+        assert!(text.contains("not a terminal"), "{text}");
+        assert!(text.contains("colours   256 colours"), "{text}");
+    }
+
+    #[test]
+    fn no_color_is_reported_as_the_answer_about_colour() {
+        let mut report = report(vec![tier("local", true)]);
+        report.machine = Machine {
+            terminal: Some((80, 24)),
+            colours: u16::MAX,
+            no_color: true,
+        };
+        let text = report.render();
+
+        assert!(
+            text.contains("NO_COLOR is set so none of them are used"),
+            "the depth is not the answer once NO_COLOR has the last word: {text}"
+        );
+    }
+
+    #[test]
+    fn the_json_carries_every_new_field_even_where_the_prose_leaves_it_out() {
+        // A machine reading the report should not have to infer a field from its
+        // absence — the same reason `onStuck` is carried for every tier.
+        let mut built = report(vec![cli_tier(
+            "helper",
+            &["-r", "{session}"],
+            &["-s", "{session}"],
+            &["--permission-mode", "plan"],
+        )]);
+        built.origin = Origin::Given(PathBuf::from("/tmp/other.toml"));
+        built.workspace = "/home/you/code".to_string();
+        built.sticky_fallback = false;
+        built.credentials = Some(Credentials {
+            removed: crate::spawn::MODEL_CREDENTIALS.to_vec(),
+            set: Vec::new(),
+        });
+        built.machine = Machine {
+            terminal: None,
+            colours: 256,
+            no_color: true,
+        };
+
+        let parsed: serde_json::Value = serde_json::from_str(&built.to_json()).expect("valid JSON");
+
+        assert_eq!(parsed["config"]["path"], "/tmp/other.toml");
+        assert_eq!(
+            parsed["config"]["source"], "given",
+            "a stable token, not prose"
+        );
+        assert_eq!(parsed["config"]["workspace"], "/home/you/code");
+        assert_eq!(parsed["config"]["stickyFallback"], false);
+        assert_eq!(
+            parsed["credentials"]["removed"].as_array().map(Vec::len),
+            Some(crate::spawn::MODEL_CREDENTIALS.len())
+        );
+        assert_eq!(parsed["machine"]["terminal"], serde_json::Value::Null);
+        assert_eq!(parsed["machine"]["colours"], 256);
+        assert_eq!(parsed["machine"]["noColor"], true);
+
+        let cli = &parsed["tiers"][0]["cli"];
+        assert_eq!(cli["binPath"], "/usr/local/bin/helper");
+        assert_eq!(cli["sessions"], true);
+        assert_eq!(cli["sessionArgs"][0], "-s");
+        assert_eq!(cli["resumeArgs"][0], "-r");
+        assert_eq!(cli["consultable"], true);
+
+        // And absent rather than empty for a tier that has none.
+        let mut endpoint = report(vec![tier("local", true)]);
+        endpoint.machine = built.machine.clone();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&endpoint.to_json()).expect("valid JSON");
+        assert_eq!(parsed["tiers"][0]["cli"], serde_json::Value::Null);
+        assert_eq!(parsed["credentials"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn a_cli_tier_is_resolved_from_its_config_not_from_a_preset_being_present() {
+        // The flags in the report have to be the ones the tier will actually
+        // run with, which means they come from the same resolver the agent uses.
+        let library = Library::embedded();
+        let report = diagnose(
+            &library,
+            &config(
+                r#"
+                [[tier]]
+                id = "helper"
+                kind = "cli"
+                bin = "spill-nothing-is-called-this"
+                args = ["-p", "{prompt}"]
+                session_args = ["--session-id", "{session}"]
+                resume_args = ["--resume", "{session}"]
+                "#,
+            ),
+        )
+        .await;
+
+        let cli = report.tiers[0].cli.as_ref().expect("a resolved spec");
+        assert_eq!(cli.resume_args, vec!["--resume", "{session}"]);
+        assert!(
+            !cli.captures_session(),
+            "this tier declares its own session flags, so spill opens the session"
+        );
+        assert!(
+            cli.read_only_args.is_empty(),
+            "and it declares no read-only flag, so it cannot be consulted"
+        );
+        // The binary cannot be found, so there is no path to print — and the
+        // tier's own failure line is already saying so.
+        assert!(cli.bin_path.is_none());
+        assert!(!report.tiers[0].reachable);
+        assert!(!report.render().contains("binary:"), "{}", report.render());
+    }
+
+    #[tokio::test]
+    async fn credentials_are_asked_for_only_when_a_delegated_cli_is_configured() {
+        let library = Library::embedded();
+
+        let with_cli = diagnose(
+            &library,
+            &config(
+                r#"
+                [[tier]]
+                id = "helper"
+                kind = "cli"
+                bin = "spill-nothing-is-called-this"
+                args = ["-p", "{prompt}"]
+                "#,
+            ),
+        )
+        .await;
+        let credentials = with_cli.credentials.as_ref().expect("a CLI tier");
+        assert_eq!(credentials.removed, crate::spawn::MODEL_CREDENTIALS);
+        assert!(
+            credentials
+                .set
+                .iter()
+                .all(|name| credentials.removed.contains(name)),
+            "everything reported as set must be one of the ones being removed"
+        );
+
+        let without = diagnose(
+            &library,
+            &config(
+                r#"
+                [[tier]]
+                id = "local"
+                kind = "openai"
+                base_url = "http://127.0.0.1:9/v1"
+                model = "m"
+                "#,
+            ),
+        )
+        .await;
+        assert!(
+            without.credentials.is_none(),
+            "with nothing delegated there is nothing to strip"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_tier_never_carries_cli_detail() {
+        let library = Library::embedded();
+        let report = diagnose(
+            &library,
+            &config(
+                r#"
+                [[tier]]
+                id = "local"
+                kind = "openai"
+                base_url = "http://127.0.0.1:9/v1"
+                model = "m"
+                "#,
+            ),
+        )
+        .await;
+
+        assert!(report.tiers[0].cli.is_none());
     }
 }

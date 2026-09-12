@@ -8,6 +8,21 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`spill doctor` answers "it does not work on my machine" before anyone has to
+  ask.** It now prints the configuration file in force and how it was chosen — an
+  explicit `--config`, the default path, or *not there yet* with the built-in defaults
+  in force, which is the difference between the file you edited and the file being
+  read. A `cli` tier shows where its binary actually is, not merely that something of
+  that name is on `PATH` (a second copy earlier on `PATH` is the usual reason a tier
+  behaves differently than in your shell), plus the flags it will run with: whether it
+  continues a session between turns or is handed the whole transcript each time, and
+  whether it has a read-only mode that makes it consultable at all. Every model
+  credential spill removes from a delegated CLI's environment is listed, with the ones
+  set here marked — the whole list rather than the summary, because the question is
+  "is my key the one being taken away?". And a machine block reports the terminal size
+  and colour depth, and that nothing need be installed for spill itself: no Rust
+  toolchain, no runtime. All of it is in `--json` too.
+
 - **A first run is now a complete setup rather than half of one.** With nothing
   configured, spill picks the local server it found as tier 1 — and then adds one
   fallback, the first agent CLI on PATH, so "local until it isn't" has an "isn't" from
