@@ -1,0 +1,6 @@
+# Build outputs and downloaded sources. The AUR repository holds the recipe
+# only — PKGBUILD, .SRCINFO and this file — and `/*.tar.*` catches both the
+# source makepkg downloads and the package it builds from it.
+/*.tar.*
+/pkg
+/src
