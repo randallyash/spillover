@@ -180,7 +180,10 @@ pub async fn run(library: &Library, config: &Config, options: &Options) -> Outco
                 outcome.near_misses.push(format!("{tier} {}", miss.sentence()));
             }
             AgentEvent::Exhausted { reason } => {
-                outcome.failure = Some(format!("no tier could answer: {reason}"));
+                outcome.failure = Some(format!(
+                    "no tier could answer: {reason}. {}",
+                    crate::tiers::UNREACHABLE_NEXT_STEPS
+                ));
                 break;
             }
             // A consult is a detour inside a turn, not its end: the driver

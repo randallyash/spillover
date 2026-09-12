@@ -127,10 +127,24 @@ spill
 
 With no configuration yet, spill looks for a local model on the usual ports
 (LM Studio, Ollama, llama.cpp, vLLM) and starts on whatever it finds, telling you
-which one it picked. For the common case there is nothing to configure.
+which one it picked — and then adds a fallback for you: the first agent CLI it
+finds on your PATH, so that "local until it isn't" has somewhere to spill to from
+the very first turn. One tier is not this product; a chain of one has the headline
+behaviour switched off.
 
-If nothing is running, it opens the setup wizard instead of leaving you at a prompt
-that cannot answer. You can also start it directly:
+The CLIs it will pick, in the order it looks: `claude`, `codex`, `gemini`,
+`copilot`, `cursor-agent`, `grok`, `opencode`, `crush`, `command-code`. That is a
+preference order among the ones actually installed, not a ranking — the first one
+found wins and the rest are never considered. `command-code` is last deliberately:
+it is the harness you may be running spill inside, and picking it for you would
+spend a plan you are already using.
+
+If no agent CLI is installed, you get an all-local chain and are told exactly what
+that means: a stalled turn will end rather than spill. That is a supported way to
+run, not a broken setup.
+
+If nothing is running locally, it opens the setup wizard instead of leaving you at a
+prompt that cannot answer. You can also start it directly:
 
 ```sh
 spill setup
@@ -147,6 +161,21 @@ Three steps, and every choice is checked before anything is written:
    models it serves, so you pick one rather than guessing at an id. If you would
    rather type an id than scroll to it, it is checked against that list, and a
    near miss is named rather than accepted.
+If you end up with a configuration that cannot answer at all, spill refuses to start
+rather than opening an interface that will fail on the first turn, and says which
+tier went and what to do about it:
+
+```
+spill: none of the configured tiers can be used (tier "grok" runs "grok", which is
+not on PATH), so no prompt could be answered. Run `spill presets` to see what a
+tier can be, or `spill setup` to choose tiers and write a config.
+```
+
+A tier that is merely *down* is not dropped — it stays in the chain and is tried,
+because pre-flighting the local tier would mean silently starting on the paid one.
+Only a `cli` tier that is not installed at all is left out, since it can never
+answer and carrying it would put a fallback in the rail that never happens.
+
 3. **Review** — each tier is checked and its resolved model named, so a wrong URL or
    a missing CLI is caught here rather than mid-conversation. `w` is refused while
    any tier cannot answer, because a config that cannot work is worse than no

@@ -13,11 +13,62 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::config::{LimitOverrides, OnStuck, Tier, TierKind};
-use crate::preset::Library;
+use crate::preset::{Cli, Library};
+use crate::provider::cli::on_path;
 use crate::setup::probe::{Found, Readiness, unserved_model};
 
 /// How many online fallbacks the wizard offers, after the local model.
 pub const MAX_ONLINE: usize = 2;
+
+/// The agent CLIs a first run will accept as a fallback, most likely first.
+///
+/// A *preference order among the ones actually installed* — the first on PATH
+/// wins and the rest are never looked at — so this says nothing about which is
+/// better. It is roughly by how common each is, because a first run should land
+/// on something the person already uses rather than on a niche one they happen
+/// to also have.
+///
+/// `command-code` is last on purpose. It is the harness you may be running spill
+/// inside, and quietly choosing it bills a plan the person is already using —
+/// fine to offer, not fine to pick for them.
+const FIRST_RUN_FALLBACKS: &[&str] = &[
+    "claude",
+    "codex",
+    "gemini",
+    "copilot",
+    "cursor-agent",
+    "grok",
+    "opencode",
+    "crush",
+    "command-code",
+];
+
+/// The first agent CLI on this machine, if there is one.
+///
+/// This is what makes a first run a *complete* setup instead of half of one.
+/// "Local until it isn't" has nowhere to spill to with a single tier, so the
+/// headline behaviour is inert until a second one exists — and the moment to
+/// add it is the moment someone has nothing configured, not after their first
+/// stalled turn.
+///
+/// `None` is a normal answer, not a failure: plenty of machines have no agent
+/// CLI installed, and an all-local chain is a legitimate way to run.
+pub fn first_run_fallback(library: &Library) -> Option<&Cli> {
+    first_run_fallback_with(library, on_path)
+}
+
+/// The same question, with "is it installed" supplied.
+///
+/// `PATH` is process-wide and tests run in threads, so the one thing worth
+/// varying here — which CLIs exist on this machine — is passed in rather than
+/// read, and the ordering can be tested without one test's environment leaking
+/// into another's.
+fn first_run_fallback_with(library: &Library, installed: impl Fn(&str) -> bool) -> Option<&Cli> {
+    FIRST_RUN_FALLBACKS.iter().find_map(|id| {
+        let preset = library.cli.iter().find(|preset| preset.id == *id)?;
+        installed(&preset.bin).then_some(preset)
+    })
+}
 
 /// The row that lets someone type an address not in the shipped list.
 pub const CUSTOM_ENDPOINT_ID: &str = "custom-online";
@@ -722,6 +773,22 @@ pub fn tier_for_local(found: &Found) -> Tier {
         // Empty on purpose: whatever the server has loaded is the right answer.
         None,
         None,
+    )
+}
+
+/// The tier for an agent CLI that was found on PATH.
+///
+/// Same shape the wizard writes for the same choice — the preset id as the tier
+/// id, and no model, because a CLI tier's model is the CLI's own business.
+pub fn tier_for_cli(preset: &Cli) -> Tier {
+    make_tier(
+        &preset.id,
+        TierKind::Cli,
+        &preset.name,
+        Some(preset.id.clone()),
+        None,
+        None,
+        Some(preset.bin.clone()),
     )
 }
 
@@ -1829,5 +1896,94 @@ mod tests {
             .filter(|name| name.ends_with(".tmp"))
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+}
+
+#[cfg(test)]
+mod first_run_tests {
+    use super::*;
+
+    /// Is anything installed? Every case passes its own answer, because PATH is
+    /// process-wide and the thing under test is the *choice*, not the lookup.
+    fn only(bins: &'static [&'static str]) -> impl Fn(&str) -> bool {
+        move |bin: &str| bins.contains(&bin)
+    }
+
+    #[test]
+    fn the_fallback_is_chosen_in_the_declared_order_not_the_library_order() {
+        // The library happens to list `command-code` first, which is the last
+        // thing a first run should pick. Both are installed; the preference
+        // order is what decides.
+        let library = Library::embedded();
+        let chosen = first_run_fallback_with(&library, only(&["grok", "cmd"]));
+
+        assert_eq!(chosen.map(|preset| preset.id.as_str()), Some("grok"));
+    }
+
+    #[test]
+    fn a_cli_that_is_installed_but_not_the_first_choice_is_still_chosen() {
+        let library = Library::embedded();
+        let chosen = first_run_fallback_with(&library, only(&["opencode"]));
+        assert_eq!(chosen.map(|preset| preset.id.as_str()), Some("opencode"));
+    }
+
+    #[test]
+    fn a_cli_that_is_not_installed_is_skipped_for_the_next_one() {
+        // The bug the naive `find(...).filter(...)` has: the first preset that
+        // *exists in the library* is checked, found missing, and the search
+        // stops there instead of trying the next.
+        let library = Library::embedded();
+        let chosen = first_run_fallback_with(&library, only(&["codex"]));
+        assert_eq!(
+            chosen.map(|preset| preset.id.as_str()),
+            Some("codex"),
+            "claude is missing, so codex is the answer"
+        );
+    }
+
+    #[test]
+    fn no_agent_cli_at_all_is_a_normal_answer() {
+        // Not an error: plenty of machines have none, and an all-local chain is
+        // a legitimate way to run.
+        let library = Library::embedded();
+        assert!(first_run_fallback_with(&library, only(&[])).is_none());
+    }
+
+    #[test]
+    fn a_first_run_fallback_is_shaped_like_the_wizards_own_choice() {
+        // Both paths must produce the same config for the same decision, or the
+        // first run and `spill setup` would disagree about a tier someone then
+        // edits by hand.
+        let library = Library::embedded();
+        let grok = library
+            .cli
+            .iter()
+            .find(|preset| preset.id == "grok")
+            .expect("the grok preset ships");
+
+        let tier = tier_for_cli(grok);
+
+        assert_eq!(tier.id, "grok");
+        assert_eq!(tier.kind, TierKind::Cli);
+        assert_eq!(tier.name.as_deref(), Some(grok.name.as_str()));
+        assert_eq!(tier.preset.as_deref(), Some("grok"));
+        assert_eq!(tier.bin.as_deref(), Some("grok"));
+        assert_eq!(tier.model, None, "a CLI tier's model is its own business");
+        // The default policy, unchanged: a fallback that is only reached when
+        // the tier above it failed has nothing below it to consult.
+        assert_eq!(tier.on_stuck, OnStuck::Escalate);
+    }
+
+    #[test]
+    fn every_declared_fallback_names_a_preset_that_ships() {
+        // A typo here would silently drop a CLI from consideration, which is
+        // invisible until someone with only that one installed gets no fallback.
+        let library = Library::embedded();
+        for id in FIRST_RUN_FALLBACKS {
+            assert!(
+                library.cli.iter().any(|preset| preset.id == *id),
+                "{id} is in the preference order but no preset ships with that id"
+            );
+        }
     }
 }

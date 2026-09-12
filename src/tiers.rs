@@ -14,6 +14,23 @@ use crate::provider::Provider;
 use crate::provider::cli::{CliProvider, on_path};
 use crate::provider::openai::OpenAiProvider;
 
+/// What to say when spill cannot start a session at all.
+///
+/// Two commands, because there are two different problems: `spill presets`
+/// answers "what could I even name in a config", and `spill setup` answers "write
+/// me one". A refusal that does not name the next command is where a first run
+/// turns into an uninstall.
+pub const NEXT_STEPS: &str = "Run `spill presets` to see what a tier can be, or `spill setup` \
+                              to choose tiers and write a config.";
+
+/// The same, for a chain that was built and then answered nothing.
+///
+/// A different next step, because the problem is different: the tiers exist and
+/// are configured, so `spill doctor` is the command that says which of them are
+/// actually reachable and why the others are not.
+pub const UNREACHABLE_NEXT_STEPS: &str = "Run `spill doctor` to see which tiers are reachable, \
+                                           or `spill setup` to change them.";
+
 /// Anything the user should be told before it bites them: a key variable that
 /// is not set, a CLI that is not installed, a tier that runs unattended.
 ///
@@ -111,20 +128,34 @@ pub fn class_of(library: &Library, tier: &crate::config::Tier) -> TierClass {
 
 /// Build a provider for each configured tier, in order.
 ///
-/// Fails rather than skipping: a shortened chain is a fallback that never
-/// happens, which is worse than a clear refusal to start.
+/// A tier that cannot answer is left out rather than carried, and if that leaves
+/// nothing the whole thing is refused. The distinction is which failures are
+/// *knowable without asking the model anything*:
+///
+/// - A `cli` tier whose binary is not installed cannot answer, ever. Carrying it
+///   would put a fallback in the rail that never happens, which is the thing
+///   worth refusing to pretend about — so it is left out, and `notes` says so in
+///   as many words at startup.
+/// - Everything else stays in the chain and is tried when a turn runs. An
+///   endpoint that is merely down must not be dropped here: pre-flighting the
+///   local tier would mean silently starting on the paid one, which is the exact
+///   opposite of what this program is for.
+///
+/// So this fails only when there is genuinely nothing left to try, and the
+/// message says which tier went and what to do about it.
 pub async fn build(
     library: &Library,
     config: &Config,
     workspace: &Path,
 ) -> Result<Vec<Tier>, String> {
     let mut tiers = Vec::new();
+    let mut left_out: Vec<String> = Vec::new();
 
     for tier in &config.tiers {
         match tier.kind {
             TierKind::OpenAi => {
                 let settings = openai_settings(library, tier)
-                    .map_err(|error| format!("tier \"{}\": {error}", tier.id))?;
+                    .map_err(|error| format!("tier \"{}\": {error}. {NEXT_STEPS}", tier.id))?;
 
                 let api_key = settings
                     .api_key_env
@@ -137,7 +168,9 @@ pub async fn build(
                     None => {
                         crate::provider::openai::first_model(&settings.base_url, api_key.as_deref())
                             .await
-                            .map_err(|error| format!("tier \"{}\": {error}", tier.id))?
+                            .map_err(|error| {
+                                format!("tier \"{}\": {error}. {NEXT_STEPS}", tier.id)
+                            })?
                     }
                 };
 
@@ -156,7 +189,15 @@ pub async fn build(
             }
             TierKind::Cli => {
                 let spec = cli_spec(library, tier)
-                    .map_err(|error| format!("tier \"{}\": {error}", tier.id))?;
+                    .map_err(|error| format!("tier \"{}\": {error}. {NEXT_STEPS}", tier.id))?;
+
+                if !on_path(&spec.bin) {
+                    left_out.push(format!(
+                        "tier \"{}\" runs \"{}\", which is not on PATH",
+                        tier.id, spec.bin
+                    ));
+                    continue;
+                }
                 // A CLI tier's model is its own business; this value only keeps
                 // the request from carrying an empty model name.
                 let model = spec.model.clone().unwrap_or_else(|| tier.id.clone());
@@ -177,11 +218,19 @@ pub async fn build(
     }
 
     if tiers.is_empty() {
-        return Err(
-            "no tiers are configured yet, so prompts have nowhere to go. Run `spill setup` to \
-             choose your tiers."
-                .to_string(),
-        );
+        return Err(match left_out.is_empty() {
+            true => {
+                format!("no tiers are configured yet, so prompts have nowhere to go. {NEXT_STEPS}")
+            }
+            // Naming what was left out, because "no tiers" would be a lie: there
+            // are tiers, and the reason each one cannot be used is the thing that
+            // has to change.
+            false => format!(
+                "none of the configured tiers can be used ({}), so no prompt could be answered. \
+                 {NEXT_STEPS}",
+                left_out.join("; ")
+            ),
+        });
     }
 
     Ok(tiers)
@@ -377,6 +426,114 @@ mod tests {
             .err()
             .expect("discovery cannot succeed against a closed port");
         assert!(error.contains("dead"), "{error}");
+    }
+
+    // ---- what is left out, and what is refused ---------------------------
+
+    #[test]
+    fn the_guidance_names_the_commands_to_reach_for() {
+        // The whole point of these strings: a refusal that does not say what to
+        // do next is where a first run turns into an uninstall.
+        assert!(NEXT_STEPS.contains("`spill setup`"), "{NEXT_STEPS}");
+        assert!(NEXT_STEPS.contains("`spill presets`"), "{NEXT_STEPS}");
+        assert!(
+            UNREACHABLE_NEXT_STEPS.contains("`spill doctor`"),
+            "{UNREACHABLE_NEXT_STEPS}"
+        );
+        assert!(
+            UNREACHABLE_NEXT_STEPS.contains("`spill setup`"),
+            "{UNREACHABLE_NEXT_STEPS}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cli_that_is_not_installed_is_left_out_rather_than_carried() {
+        // A harness that is not installed cannot answer, ever, and a chain that
+        // carries it anyway puts a fallback in the rail that never happens. The
+        // tier that *is* usable still starts.
+        let (bin, flag) = crate::provider::cli::portable_shell();
+        let config = config(&format!(
+            r#"
+            [[tier]]
+            id = "good"
+            kind = "cli"
+            bin = "{bin}"
+            args = ["{flag}", "{{prompt}}"]
+
+            [[tier]]
+            id = "missing"
+            kind = "cli"
+            bin = "definitely-not-a-real-cli-xyz"
+            args = ["-p", "{{prompt}}"]
+            "#
+        ));
+
+        let tiers = build(&Library::embedded(), &config, Path::new("/tmp"))
+            .await
+            .expect("one usable tier is enough to start");
+
+        assert_eq!(tiers.len(), 1, "the missing one was left out");
+        assert_eq!(tiers[0].id, "good");
+    }
+
+    #[tokio::test]
+    async fn a_chain_of_nothing_but_missing_clis_refuses_and_says_what_to_do() {
+        // Zero reachable tiers. This is the refusal, and it has to name the tier
+        // that went, why, and the two commands that fix it.
+        let config = config(
+            r#"
+            [[tier]]
+            id = "missing"
+            kind = "cli"
+            bin = "definitely-not-a-real-cli-xyz"
+            args = ["-p", "{prompt}"]
+            "#,
+        );
+
+        let error = build(&Library::embedded(), &config, Path::new("/tmp"))
+            .await
+            .err()
+            .expect("nothing can answer");
+
+        assert!(error.contains("missing"), "{error}");
+        assert!(error.contains("definitely-not-a-real-cli-xyz"), "{error}");
+        assert!(error.contains("not on PATH"), "{error}");
+        assert!(error.contains("`spill presets`"), "{error}");
+        assert!(error.contains("`spill setup`"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_local_tier_that_is_merely_down_is_not_dropped() {
+        // The distinction the drop rule turns on. An endpoint that is not
+        // answering is *not* knowably unusable without asking it, and dropping it
+        // here would mean starting on the paid tier instead — the opposite of
+        // what this program is for. It stays, and the refusal is the honest one.
+        let (bin, flag) = crate::provider::cli::portable_shell();
+        let config = config(&format!(
+            r#"
+            [[tier]]
+            id = "local"
+            kind = "openai"
+            base_url = "http://127.0.0.1:9/v1"
+            model = ""
+
+            [[tier]]
+            id = "fallback"
+            kind = "cli"
+            bin = "{bin}"
+            args = ["{flag}", "{{prompt}}"]
+            "#
+        ));
+
+        let error = build(&Library::embedded(), &config, Path::new("/tmp"))
+            .await
+            .err()
+            .expect("a local tier with no reachable server and no model to ask for");
+
+        assert!(
+            error.contains("local"),
+            "it should name the local tier, not quietly move on: {error}"
+        );
     }
 
     #[test]

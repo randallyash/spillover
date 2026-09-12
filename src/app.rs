@@ -974,8 +974,13 @@ impl App {
                 self.running = None;
                 self.busy = false;
                 self.handoff = None;
-                self.messages
-                    .push(Message::system(format!("✗ no tier could answer: {reason}")));
+                // Names the next command, because this is the message someone
+                // sees when their configuration has stopped working and they
+                // have no idea which of the three commands to reach for.
+                self.messages.push(Message::system(format!(
+                    "✗ no tier could answer: {reason}\n{}",
+                    crate::tiers::UNREACHABLE_NEXT_STEPS
+                )));
                 // Every tier that was tried had been billed for it.
                 if let Some(line) = self.close_turn() {
                     self.messages.push(Message::system(line));

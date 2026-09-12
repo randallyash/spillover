@@ -1,158 +1,148 @@
-# spill configuration
+# A working config, with the reasons written down.
 #
-# Copy to ~/.config/spill/config.toml and edit, or run `spill setup` to have one
-# written for you. Secrets never belong in this file: name the environment
-# variable that holds a key instead, with api_key_env.
+# This is the arrangement I actually run, not a template with everything switched
+# off: two tiers, one below the other, and comments saying why each line is what
+# it is. Copy it to ~/.config/spill/config.toml and change what does not fit, or
+# run `spill setup` and let the wizard write one for you.
+#
+# Keys never belong in this file. Name the environment variable that holds one
+# with api_key_env, and keep the key itself in your shell.
 
 schema = 1
 
 [general]
-# Working directory used by the file tools and by delegated CLI agents.
+# Where the file tools and any delegated CLI agent do their work.
 #
-# On Windows, write this path in single quotes: workspace = 'C:\Users\me\project'
-# Inside double quotes a backslash starts an escape sequence, so "C:\Users"
-# is not valid TOML — and "C:\x86" parses into something that is not the path
-# you meant. Single quotes take it literally.
+# On Windows write this in single quotes — workspace = 'C:\Users\me\project' —
+# because inside double quotes a backslash starts an escape sequence, so
+# "C:\Users" is not valid TOML and "C:\x86" quietly parses into something that is
+# not the path you meant.
 workspace = "~"
-# Once a tier fails, stay on the lower tier for the rest of the session.
+
+# Once a turn has spilled to a lower tier, stay there for the rest of the
+# session. Flip it off if you would rather every message started local again and
+# only paid for the frontier on the messages that needed it.
 sticky_fallback = true
 
-# Nothing here controls sessions. Running `spill` with no arguments resumes the
-# conversation for this workspace, and writes it back as you go, one file per
-# workspace under the state directory (~/.local/state/spill/sessions on Linux).
-# `/clear` is how you start a conversation over; `spill -p` neither reads nor
-# writes a session, so scripts stay stateless.
+# Nothing here chooses a session. Running `spill` with no arguments resumes the
+# conversation for this workspace and writes it back as you go, one file per
+# workspace under the state directory (~/.local/state/spill on Linux). `/clear`
+# starts over, and `spill -p` neither reads nor writes one, so scripts stay
+# stateless.
 
-# Tiers are tried in the order they appear here.
-#
-# Run `spill presets` for the full list of names you can use, or see the two
-# shapes below:
-#
-#   kind = "openai"  an OpenAI-compatible endpoint — a local server, or a hosted
-#                    provider. Give it a preset, or a base_url.
-#   kind = "cli"     an agent CLI used as a tier, with its own agent loop and
-#                    its own tools.
+# ---------------------------------------------------------------------------
+# Tier 1: the local model. Everything below it is only reached when this one
+# stalls, loops, or fails outright — which is the whole point.
+# ---------------------------------------------------------------------------
 
-# A local server first, which is the usual arrangement: free and private, with
-# everything below it only reached when this one stalls or fails.
 [[tier]]
 id = "local"
 kind = "openai"
-name = "Local model"
+name = "LM Studio (Qwen3 Coder)"
 preset = "lmstudio"
-# Leave model empty to use whatever the server has loaded.
+
+# Empty on purpose. LM Studio is already holding Qwen3 Coder 30B — it will only
+# have loaded whatever I picked in its own window — so naming a model here would
+# mean keeping two lists in sync and a 404 the day I switch. Empty means "use
+# whatever this server has loaded", which is what I actually want.
 model = ""
-# Reading the key from the environment is only needed for hosted endpoints:
-# api_key_env = "LMSTUDIO_API_KEY"
 
-# What to do when this tier gets stuck. The two choices are genuinely different,
-# and neither is strictly better:
+# Ask the tier below instead of handing the turn over. Escalating is expensive:
+# the frontier re-reads the whole conversation, and then answers every remaining
+# turn of the session, all because one turn went wrong and I lost the cheap model
+# with it. A consult spends one call on one narrow question and the local model
+# keeps driving.
 #
-#   on_stuck = "escalate"  (default) abandon this tier and hand the whole turn to
-#                          the next one. It always works, and it means the cheaper
-#                          model stops being used for the rest of the session.
-#
-#   on_stuck = "consult"   keep this tier driving, and ask the next tier one
-#                          narrow question about what went wrong. The answer comes
-#                          back as advice and the turn carries on here, so a local
-#                          model that needed a nudge keeps doing the work. Costs
-#                          one call to the tier below instead of every remaining
-#                          turn, and the question is built from the evidence spill
-#                          already has — the raw tool call and its raw error, or the
-#                          output that was repeating — never a summary written by
-#                          the model that got stuck.
-#
-# Consult only helps when the answer is something this tier can act on. When the
-# answer has to be "go and look at five more files", escalation is the honest
-# move, so spill falls back to it: when the budget is spent, when the consult
-# fails, or when the answer comes back empty. A turn is never stranded by it.
-#
-# on_stuck = "consult"
-# How many times this tier may consult within one turn. The cap is what stops a
-# model stuck in a loop from spending the frontier indefinitely, and it is why
-# consult cannot make a stuck turn cost more than escalating would.
-# consults_per_turn = 2
+# This is safe to turn on. spill escalates anyway when the advice is no use —
+# when the consult fails, when the budget runs out, when the answer comes back
+# empty — so a turn can never be stranded by it. The two policies are genuinely
+# different rather than one being the good one: if the honest answer is "go and
+# read five more files", handing over is the right move, and consult is not.
+on_stuck = "consult"
 
-# Timeouts, as overrides on whatever this tier's class already implies.
-#
-# There are two default profiles, chosen by where the model actually is, and you
-# only need to write here to contradict one:
-#
-#   local   (loopback, a LAN address, *.local)   120s first token · 30s idle
-#   hosted  (anything over the network, and a cli tier)  30s · 60s
-#
-# A local tier gets longer to its first token because loading weights into VRAM
-# takes time, and less patience once it is streaming because a local server that
-# has gone quiet has wedged. A `cli` tier is judged as hosted: its first line of
-# output includes the harness starting up, which is slow for reasons a model
-# server is not.
-#
-# Each field is independent: set one and the others still follow the class, so a
-# local tier that writes only its idle budget keeps the first-token patience.
-# Run `spill doctor` to see what a tier actually ended up with.
+# Two is enough to get unstuck. More than that and a model in a loop is just
+# spending the frontier slowly, which is the thing consult exists to avoid.
+consults_per_turn = 2
 
+# Overrides on what a local tier already gets. Leaving a field out keeps the
+# class default rather than resetting it, so this block changes one number and
+# inherits the rest.
+#
+# The class is decided by where the endpoint is: loopback, a LAN address and
+# *.local get 120s to the first token and 30s of silence after that; anything
+# over the network — and every `cli` tier, whose first line includes a harness
+# starting up — gets 30s and 60s. `spill doctor` prints what each tier ended up
+# with, which is the only way to be sure.
 [tier.limits]
-# A hung server would otherwise block the session forever.
-first_token_timeout_ms = 30000
-idle_timeout_ms = 60000
-# Consecutive identical output repetitions that count as a loop.
+# The one I actually had to change. My local box is quick to its first token but
+# can still go quiet for half a minute part-way through a long file, and the
+# default 30s cut it off mid-answer.
+idle_timeout_ms = 45000
+# Consecutive identical lines that count as a loop. 4 is the default; lower it
+# for a model that degenerates quickly, raise it for one that is just repetitive
+# in the way prose is.
 max_repeat_run = 4
 
-# Then up to two online models, in the order you want them tried.
+# ---------------------------------------------------------------------------
+# Tier 2: the frontier, reached only when the local model cannot finish.
+#
+# THIS IS THE LINE TO CHANGE. I have SuperGrok; `spill presets` lists everything
+# spill can drive (Claude Code, Codex, Gemini CLI, Copilot, Cursor, opencode,
+# Command Code, …) and `spill doctor` says which of them are installed here. If
+# you have none of them, delete this tier — an all-local chain is a supported way
+# to run, and a stalled turn simply ends instead of spilling.
+# ---------------------------------------------------------------------------
+
+[[tier]]
+id = "grok"
+kind = "cli"
+name = "Grok 4.6 (SuperGrok)"
+preset = "grok"
+
+# The CLI would use its own default model, which is fine. Naming it keeps the
+# tier honest about what is answering, and `spill doctor` then reports the same
+# model the rail shows.
+model = "grok-4.6"
+
+# No on_stuck here: it is the last tier, so escalating is what happens whether or
+# not it is written down. `escalate` is also the default everywhere, so a tier
+# that says nothing about its policy behaves the way it always has.
+
+# ---------------------------------------------------------------------------
+# Everything past this point is optional. The config above is the whole working
+# setup; the rest is the other knobs, for when you want them.
+# ---------------------------------------------------------------------------
+
+# A hosted provider instead of an agent CLI. This one needs a key in the
+# environment, named rather than written down:
 #
 # [[tier]]
 # id = "deepseek"
-# kind = "cli"
-# name = "DeepSeek V4 Flash (Command Code)"
-# preset = "command-code"
-# model = "deepseek/deepseek-v4-flash"
-#
-# [[tier]]
-# id = "grok"
-# kind = "cli"
-# name = "Grok 4.6 (SuperGrok)"
-# preset = "grok"
-# model = "grok-4.6"
-# effort is passed through as --effort by the grok preset's extra args if set:
-# extra_args = ["--effort", "high"]
-#
-# Or a hosted endpoint rather than a CLI:
-#
-# [[tier]]
-# id = "openrouter"
 # kind = "openai"
 # preset = "openrouter"
 # api_key_env = "OPENROUTER_API_KEY"
 # model = "deepseek/deepseek-v4-flash"
+
+# `approve_all` is off unless you set it. Turning it on lets that tier's CLI run
+# without its own permission prompts, so it can change files unattended. spill
+# says so out loud at startup when it is on.
 #
-# `approve_all` is off unless you set it. Turning it on lets a tier run its CLI
-# without its own permission prompts, so it can change files unattended.
-#
-# A `cli` tier can only be a consultant if it has a read-only mode. spill cannot
-# withhold tools from a harness it does not run, so a consult launches the CLI with
-# that mode — a plan mode, a sandbox policy, a Q&A mode — and a hard instruction not
-# to act. A CLI with no such flag is never asked as a consultant: the turn escalates
-# instead. The shipped presets already name the flag for the CLIs that have one; this
-# is how you set it for a CLI that is not in the library, or override a preset.
+# A `cli` tier can only be a consultant — the tier that answers a consult — if it
+# has a read-only mode. spill cannot withhold tools from a harness it does not
+# run, so a consult launches the CLI with that flag and an instruction not to
+# act. The shipped presets already name the flag for the CLIs that have one:
 #
 # read_only_args = ["--permission-mode", "plan"]
+
+# Session continuity for a `cli` tier. Without these, the whole conversation is
+# flattened into the CLI's prompt on every turn, which means re-sending
+# everything the earlier turns established. With them, the CLI keeps the
+# conversation and spill sends only the new turn. Both take `{session}`; a CLI
+# that mints its own id gets only resume_args. The shipped `grok` and
+# `command-code` presets already set these.
 #
-# Session continuity for a `cli` tier. A CLI tier normally receives the whole
-# conversation flattened into its prompt on every turn, which means re-sending
-# everything the earlier turns established each time. Naming the session flags
-# lets the CLI keep the conversation and spill send only the new turn.
-#
-# Both take `{session}`. A CLI that lets you choose the id gets session_args to
-# open one; a CLI that picks its own gets only resume_args, and the id is read
-# out of its output. The shipped `grok` and `command-code` presets already set
-# these, so this is only needed for a CLI that is not in the preset library.
-#
-# [[tier]]
-# id = "grok"
-# kind = "cli"
-# preset = "grok"
 # session_args = ["-s", "{session}"]
 # resume_args = ["-r", "{session}"]
-#
-# Leaving both off is a supported arrangement, not a broken one: the tier works
-# exactly as it did before, sending the whole transcript every turn.
+
+# Leaving them off is a supported arrangement rather than a broken one: the tier
+# works exactly as it did before.

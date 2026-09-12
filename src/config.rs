@@ -660,16 +660,36 @@ mod tests {
     fn accepts_the_documented_example() {
         let text = include_str!("../config.example.toml");
         let config = parse(text).expect("config.example.toml must stay valid");
-        assert_eq!(config.tiers.len(), 1);
+
+        // A working config rather than a template: two tiers, in order, and the
+        // second one actually configured — because one tier is not the product.
+        // "Local until it isn't" needs a tier to spill to, and an example that
+        // ships with the fallback commented out is an example of half a thing.
+        assert_eq!(config.tiers.len(), 2);
         assert_eq!(config.tiers[0].id, "local");
         assert_eq!(config.tiers[0].kind, TierKind::OpenAi);
-        // The example writes a `[tier.limits]` block, so these are the values a
-        // user would actually get; a tier that omits the block takes its class's.
-        assert_eq!(config.tiers[0].limits.max_repeat_run, Some(4));
-        // The example documents consult but does not turn it on: the default has
-        // to stay the behaviour that always works.
-        assert_eq!(config.tiers[0].on_stuck, OnStuck::Escalate);
-        assert_eq!(config.tiers[0].consults_per_turn, DEFAULT_CONSULTS_PER_TURN);
+        assert_eq!(config.tiers[1].id, "grok");
+        assert_eq!(config.tiers[1].kind, TierKind::Cli);
+
+        // The local tier consults rather than escalating, and the comment in the
+        // example says why: escalating costs the frontier the whole conversation
+        // and then every remaining turn of the session. The *default* is still
+        // escalate — see `the_stuck_policy_defaults_to_escalating` — which is the
+        // difference between what a config may choose and what silence means.
+        assert_eq!(config.tiers[0].on_stuck, OnStuck::Consult);
+        assert_eq!(config.tiers[0].consults_per_turn, 2);
+
+        // The second tier says nothing, so it behaves as it always has.
+        assert_eq!(config.tiers[1].on_stuck, OnStuck::Escalate);
+    }
+
+    #[test]
+    fn the_documented_example_leaves_a_local_model_alone_to_use_what_is_loaded() {
+        // `model = ""` is deliberate and worth pinning: it is the difference
+        // between a config that survives restarting LM Studio with a different
+        // model and one that 404s until it is edited.
+        let config = parse(include_str!("../config.example.toml")).expect("valid");
+        assert_eq!(config.tiers[0].model.as_deref(), Some(""));
     }
 
     #[test]
@@ -1117,13 +1137,20 @@ mod tests {
     }
 
     #[test]
-    fn the_shipped_example_still_writes_overrides_that_parse() {
-        // The example carries a [tier.limits] block, so the override path is the
-        // one the documented configuration actually exercises.
+    fn the_shipped_example_writes_one_override_and_inherits_the_rest() {
+        // The example's [tier.limits] block sets two fields and leaves the
+        // timeouts alone, so it exercises the merge rather than a wholesale
+        // replacement: a field the class provides and the block does not mention
+        // has to survive. Writing the class's own defaults into the example
+        // would have hidden that, and hidden the mechanism with it.
         let config = parse(include_str!("../config.example.toml")).expect("valid");
         let limits = config.tiers[0].limits.resolve(TierClass::Local);
 
-        assert_eq!(limits.first_token_timeout_ms, 30_000);
+        assert_eq!(limits.idle_timeout_ms, 45_000, "the override applies");
+        assert_eq!(
+            limits.first_token_timeout_ms, 120_000,
+            "and the local class's own first-token budget still gets through"
+        );
         assert_eq!(limits.max_repeat_run, 4);
     }
 }

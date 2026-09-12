@@ -226,10 +226,37 @@ async fn run(mut config: Config) -> io::Result<()> {
             Some(server) => {
                 config.tiers.push(crate::setup::tier_for_local(server));
                 first_run.push(format!(
-                    "Nothing is configured yet, so this is the {} found on this machine ({}). \
-                     Run `spill setup` to choose your tiers and write a config.",
+                    "Nothing is configured yet, so this is the {} found on this machine ({}).",
                     server.name, server.base_url
                 ));
+
+                // One fallback, because one tier is not the product: "local
+                // until it isn't" has nowhere to spill to without a second, and
+                // the moment to add it is now rather than after the first
+                // stalled turn. A machine with no agent CLI gets an honest
+                // all-local chain and is told what that means.
+                match crate::setup::first_run_fallback(&library) {
+                    Some(preset) => {
+                        config.tiers.push(crate::setup::tier_for_cli(preset));
+                        first_run.push(format!(
+                            "{} is on your PATH, so it is the fallback when the local model \
+                             stalls or loops.",
+                            preset.name
+                        ));
+                    }
+                    None => first_run.push(
+                        "No agent CLI is on your PATH, so this is a local-only chain: a stalled \
+                         turn will end rather than spill to something else. `spill presets` \
+                         lists the ones spill knows how to drive, and `spill setup` will add one \
+                         once it is installed."
+                            .to_string(),
+                    ),
+                }
+
+                first_run.push(
+                    "`spill setup` changes any of this, or edit ~/.config/spill/config.toml."
+                        .to_string(),
+                );
             }
             None => {
                 println!("No config yet, and no local model is running.");
@@ -425,7 +452,14 @@ async fn start_agent(config: &Config, resume: Option<&SessionFile>) -> AgentStar
 
     let mut chain = match crate::tiers::chain(config, tiers) {
         Some(chain) => chain,
-        None => return AgentStart::Unavailable("no usable tiers".to_string()),
+        // Nothing reachable: refusing is the point. Starting a session with no
+        // tier that can answer is the state this whole path exists to avoid.
+        None => {
+            return AgentStart::Unavailable(format!(
+                "none of the configured tiers can be used, so no prompt could be answered. {}",
+                crate::tiers::NEXT_STEPS
+            ));
+        }
     };
     // Put the chain back the way the saved session left it, here rather than
     // inside the agent task, so the index the interface needs is readable

@@ -8,6 +8,32 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A first run is now a complete setup rather than half of one.** With nothing
+  configured, spill picks the local server it found as tier 1 — and then adds one
+  fallback, the first agent CLI on PATH, so "local until it isn't" has an "isn't" from
+  the very first turn. A one-tier chain has the headline behaviour switched off, and
+  the moment to notice that is not after the first stalled turn. The order it looks in
+  is `claude`, `codex`, `gemini`, `copilot`, `cursor-agent`, `grok`, `opencode`,
+  `crush`, `command-code`: a preference order among what is installed, not a ranking,
+  with `command-code` last because it is the harness you may be running spill inside
+  and choosing it would spend a plan you are already using. No agent CLI at all is a
+  normal answer — you get an all-local chain and are told that a stalled turn will end
+  rather than spill.
+
+- **A `cli` tier that is not installed is left out of the chain instead of carried.**
+  A harness that is not on PATH cannot answer, so building it just put a fallback in
+  the rail that never happens. It is dropped, `notes` says so in as many words, and
+  the tier that *is* usable still starts. A tier that is merely unreachable is
+  deliberately *not* dropped: pre-flighting the local server would mean silently
+  starting on the paid tier, which is the opposite of what this program is for.
+
+- **Every refusal names the next command.** `spill presets` to see what a tier can
+  be, `spill setup` to choose tiers and write a config, and `spill doctor` when the
+  tiers exist but nothing is reachable. A refusal that does not say what to do next
+  is where a first run turns into an uninstall; the zero-tier message named
+  `spill setup` and stopped there, and a chain that ran out of tiers named nothing at
+  all.
+
 - **`/why`: the stall call, made inspectable.** Handing a turn to another model is the
   one decision spill makes on its own, so it is the one that has to be arguable — a
   user who cannot tell why their turn was taken away will turn the fallback off. The
@@ -49,6 +75,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Both samples in the README — the `/why` report and the log record — are pinned by
   tests against the real output, so the documentation cannot drift from the program.
+
+### Changed
+
+- **`config.example.toml` is a working config now, not a template with everything
+  commented out.** Two tiers, in order, with the reasons written down the way a person
+  writes them: the model left empty because LM Studio is already holding Qwen3 Coder
+  and naming it here would mean a 404 the day you switch; `on_stuck = "consult"` on the
+  local tier because escalating costs the frontier the whole conversation and then
+  every remaining turn of the session; one `[tier.limits]` override that leaves the
+  class's own first-token budget alone, because that inheritance *is* the mechanism and
+  writing the defaults in would have hidden it.
 
 ### Fixed
 
