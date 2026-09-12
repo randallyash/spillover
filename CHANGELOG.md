@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.2] - 2026-09-12
 
 ### Added
 
@@ -60,6 +60,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   failed there; it asserts on the error number now. A test pinning the Windows wording
   runs on every platform, so the next hole of this kind is caught before a push rather
   than after it.
+- **The AUR `PKGBUILD` builds.** It never had: `conflicts=('spill', 'spill-bin-git')`
+  reads like a list with a comma between its items, but in bash the quote and the comma
+  are one token, so the first element is `spill,` and `makepkg` refuses the whole file
+  with `conflicts contains invalid characters: ','` before it does anything.
+  `updpkgsums` fails on the same validation, so the documented way to refresh the
+  checksums could not be run either. The file now carries the published 0.1.1 sums, and
+  the recipe has the `.SRCINFO` the AUR actually parses and a `.gitignore` so a build
+  inside the clone does not offer to commit the tarball it just downloaded. The package
+  is still unsubmitted, so `yay -S spill-bin` does not work yet.
 
 ## [0.1.1] - 2026-09-11
 
@@ -620,6 +629,6 @@ First release. Everything below is new.
   [`randallyash/spillover`](https://github.com/randallyash/homebrew-spillover)
   tap, so `brew install randallyash/spillover/spill` works.
 
-[Unreleased]: https://github.com/randallyash/spillover/compare/v0.1.1...HEAD
+[0.1.2]: https://github.com/randallyash/spillover/releases/tag/v0.1.2
 [0.1.1]: https://github.com/randallyash/spillover/releases/tag/v0.1.1
 [0.1.0]: https://github.com/randallyash/spillover/releases/tag/v0.1.0
