@@ -506,7 +506,7 @@ spill doctor
 ```
 
 ```
-spill 0.1.0 — doctor
+spill 0.1.2 — doctor
 
 config    /home/you/.config/spill/config.toml
           found at the default path · workspace ~ · sticky fallback on

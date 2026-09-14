@@ -131,6 +131,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Both samples in the README — the `/why` report and the log record — are pinned by
   tests against the real output, so the documentation cannot drift from the program.
 
+- **`packaging.yml` installs from the Homebrew tap on a clean macOS runner.** The
+  tap was already publishing a formula whose checksums matched the release, and
+  nobody had ever run it end to end on the platform it exists for. The workflow
+  installs `randallyash/spillover/spill` the way a user does, then checks that the
+  installed binary reports the version it was released as, and that it starts. The
+  same run verifies the Linux tarball through `verify-install.sh`. It is dispatched
+  by hand rather than run in CI, because it reaches the network for a published
+  artifact instead of building a commit.
+
 ### Changed
 
 - **Consult is now the default when a local tier has a paid one below it.** Escalating
@@ -158,6 +167,22 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   writing the defaults in would have hidden it.
 
 ### Fixed
+
+- **The AUR recipe was a release behind the release it downloads.** `pkgver` sat at
+  0.1.1 while 0.1.2 had shipped, so `yay -S spill-bin` would have fetched the older
+  archive and presented it as the newer version — a package that looks abandoned
+  and installs the wrong thing. Nothing failed, because a version kept in more than
+  one place is only checked in the place you are looking, so a test now holds the
+  recipe's `pkgver` and the changelog's newest release to `Cargo.toml`. Two more
+  defects came out of actually building it: `!strip` without `!debug` left an empty
+  `/usr/src/debug/spill-bin` directory in the package, and the block that installed
+  `config.example.toml` could never fire, since the release archive does not carry
+  one — `CHANGELOG.md` is installed in its place, which the archive does carry.
+
+- **The README's doctor sample showed a version two releases old.** `spill 0.1.0 —
+  doctor`, in the section a reader goes to when something is wrong, is the kind of
+  detail that says more about how maintained a project is than any wording around
+  it. It is pinned now, along with the sample's shape, so it cannot age again.
 
 - **A loop spelled differently was not a loop.** The "same tool with the same
   arguments" detector compared the arguments as the *text* that arrived, so a model

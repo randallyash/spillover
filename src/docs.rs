@@ -109,4 +109,69 @@ mod tests {
             }
         }
     }
+
+    // ---- the version, said the same way everywhere ------------------------
+
+    /// The version the binary reports, and the one a release is tagged with.
+    fn crate_version() -> &'static str {
+        env!("CARGO_PKG_VERSION")
+    }
+
+    /// The version a `PKGBUILD` declares, if it declares one at all.
+    fn pkgver(text: &str) -> Option<String> {
+        text.lines()
+            .find_map(|line| line.strip_prefix("pkgver="))
+            .map(|value| value.trim().to_string())
+    }
+
+    /// The newest released version in the changelog, `Unreleased` aside.
+    fn newest_release() -> Option<String> {
+        include_str!("../CHANGELOG.md")
+            .lines()
+            .filter_map(|line| line.strip_prefix("## "))
+            .find_map(|heading| {
+                let heading = heading.trim();
+                if heading.contains("Unreleased") {
+                    return None;
+                }
+                Some(heading.strip_prefix('[')?.split(']').next()?.to_string())
+            })
+    }
+
+    #[test]
+    fn every_manifest_names_the_version_the_binary_reports() {
+        // `spill --version` is the one figure a person can hold against the
+        // release tag, so anything left behind at the old number reads as an
+        // abandoned project. The AUR recipe sat at 0.1.1 while the crate was
+        // 0.1.2, and nothing noticed, because nothing was looking — which is the
+        // whole cost of a version kept in more than one place.
+        let version = crate_version();
+
+        let pkgbuild = include_str!("../packaging/arch/PKGBUILD");
+        let declared = pkgver(pkgbuild);
+        assert_eq!(
+            declared.as_deref(),
+            Some(version),
+            "the AUR recipe declares {declared:?} where the binary reports {version}"
+        );
+
+        let released = newest_release();
+        assert_eq!(
+            released.as_deref(),
+            Some(version),
+            "the changelog's newest release is {released:?} where the binary reports {version}"
+        );
+    }
+
+    #[test]
+    fn the_readme_shows_the_version_it_would_print() {
+        // The doctor sample is the first output a reader sees, and it carried
+        // 0.1.0 through two releases: a screenshot of an older binary says more
+        // about how maintained something is than any wording around it.
+        let expected = format!("spill {} — doctor", crate_version());
+        assert!(
+            include_str!("../README.md").contains(&expected),
+            "the README's doctor sample does not start with {expected:?}"
+        );
+    }
 }

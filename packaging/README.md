@@ -66,9 +66,10 @@ The formula is published to
 [randallyash/homebrew-spillover](https://github.com/randallyash/homebrew-spillover),
 which is what makes `brew install randallyash/spillover/spill` work.
 
-The tap is set up and working: v0.1.0's formula is published, with checksums that
-match the release archives. The steps below are what it took, kept for renewal
-when the token expires.
+The tap is set up and working: v0.1.2's formula is published, with checksums that
+match the release archives. `packaging.yml` installs from it on a clean macOS
+runner, which is the check that keeps that true rather than a claim about it. The
+steps below are what it took, kept for renewal when the token expires.
 
 1. Create a fine-grained personal access token at
    <https://github.com/settings/personal-access-tokens/new>:
@@ -137,6 +138,18 @@ are the real published ones. The package is named `spill-bin` because it install
 a prebuilt binary, and `-bin` is the AUR's convention for that; the crate is
 `spill`.
 
+Its `pkgver` has to name the release it downloads, which is the one thing here
+that goes stale silently: it sat at 0.1.1 through the 0.1.2 release. A test now
+holds it to `Cargo.toml`, along with the changelog's newest release, so a bump
+that misses this file fails `cargo test` instead of shipping a package that
+downloads one version and calls itself another.
+
+Two `options` are set, and both are about shipping the released artifact
+unaltered: `!strip` keeps the symbol table cargo-dist published, so panic
+backtraces stay useful, and `!debug` stops makepkg creating a debug package for a
+recipe that holds no source. Without the second one the package carries an empty
+`/usr/src/debug/spill-bin` directory.
+
 **It is not in the AUR yet, so `yay -S spill-bin` does not work.** Making it work
 is one push, but that push is authenticated and the AUR refuses a key it does not
 know, so it cannot be done for you from here.
@@ -151,8 +164,20 @@ know, so it cannot be done for you from here.
    cat ~/.ssh/id_ed25519_aur.pub
    ```
 
-3. Confirm the AUR accepts it. When the key is registered this answers with a
-   welcome naming your account; when it is not you get `Permission denied
+3. Teach `ssh` to use that key for the AUR. The name is not one of the defaults
+   `ssh` tries, so without this it offers the wrong keys and the AUR answers
+   `Permission denied (publickey)` even though the key is registered:
+
+   ```
+   Host aur.archlinux.org
+     HostName aur.archlinux.org
+     User aur
+     IdentityFile ~/.ssh/id_ed25519_aur
+     IdentitiesOnly yes
+   ```
+
+   Then confirm the AUR accepts it. When the key is registered this answers with
+   a welcome naming your account; when it is not you get `Permission denied
    (publickey)`, which is worth knowing before blaming the push:
 
    ```sh
@@ -196,7 +221,17 @@ git push aur master
 immediately, and a wrong one means `yay -S spill-bin` fails to build for everyone
 until it is fixed — so build it before pushing.
 
-`namcap PKGBUILD` lints the recipe, but is not installed here.
+`namcap PKGBUILD` lints the recipe, and `namcap spill-bin-<ver>-1-x86_64.pkg.tar.zst`
+the package. Four warnings are expected and none is a defect: the arch literal it
+wants rewritten as `$CARCH` is in the upstream download URL, which a `-bin`
+package cannot choose; the binary is deliberately unstripped; and the two
+dependency notes are about `gcc-libs` providing `libgcc_s.so.1`, which the binary
+needs. Anything else namcap says is new.
+
+One trap worth knowing before editing the recipe: **do not name a local variable
+inside `package()` after a makepkg variable.** `makepkg --printsrcinfo` picks up
+an assignment to one — a local called `changelog` ends up in `.SRCINFO` as the
+`changelog` field, holding whatever path it was given, and the AUR publishes it.
 
 ## Verifying a release
 
@@ -205,7 +240,17 @@ runs, reports the right version, and confirms the subcommands and licence are
 present:
 
 ```sh
-./packaging/verify-install.sh 0.1.0
+./packaging/verify-install.sh 0.1.2
 ```
 
 It installs nothing system-wide.
+
+`.github/workflows/packaging.yml` runs it after a release, and installs from the
+Homebrew tap on a clean macOS runner to check that the installed binary reports
+the version it was released as. It is not part of CI — it reaches the network for
+a published artifact rather than building a commit — so it is dispatched by hand,
+naming the version or taking the latest release:
+
+```sh
+gh workflow run packaging.yml -f version=0.1.2
+```

@@ -11,7 +11,7 @@
 # and confirm the version and the URLs match the tag you are packaging.
 
 pkgname=spill-bin
-pkgver=0.1.1
+pkgver=0.1.2
 pkgrel=1
 pkgdesc="Agentic AI TUI that runs your local model first and spills over when it stalls"
 arch=('x86_64' 'aarch64')
@@ -20,15 +20,20 @@ license=('MIT')
 depends=('glibc' 'gcc-libs')
 provides=('spill')
 conflicts=('spill' 'spill-bin-git')
-options=('!strip')
+# Both of these are about shipping the released artifact unaltered rather than
+# building it here: nothing is stripped, so the binary keeps the symbol table
+# upstream published and its panic backtraces stay useful, and no debug package
+# is made, because this recipe holds no source to debug it against. `!strip` on
+# its own leaves an empty `/usr/src/debug/spill-bin` directory in the package.
+options=('!strip' '!debug')
 
 _base="https://github.com/randallyash/spillover/releases/download/v${pkgver}"
 source_x86_64=("spill-${pkgver}-x86_64.tar.xz::${_base}/spill-x86_64-unknown-linux-gnu.tar.xz")
 source_aarch64=("spill-${pkgver}-aarch64.tar.xz::${_base}/spill-aarch64-unknown-linux-gnu.tar.xz")
 
-# Checksums from the v0.1.1 release. `updpkgsums` refreshes them for a new one.
-sha256sums_x86_64=('44d0c4dab52be3a6a5415f3d75be4531336761a9f66c73cd620755cd06407dad')
-sha256sums_aarch64=('24e8aff16a70aae9d7dba6f055e47ab36fc94e4e1d95e2582006cbb545a7615f')
+# Checksums from the v0.1.2 release. `updpkgsums` refreshes them for a new one.
+sha256sums_x86_64=('42884e95f70ddfea17bf42374bc31281b81602877d0435b0783374e1ce33d57c')
+sha256sums_aarch64=('53cae3a2056e48e2469d2b691d91545de0d73d73ba7e5b0e9891d0f05650a1eb')
 
 package() {
   # The archive holds the binary and its documentation, at the top level.
@@ -50,10 +55,9 @@ package() {
     install -Dm644 "$readme" "$pkgdir/usr/share/doc/$pkgname/README.md"
   fi
 
-  # Configuration examples, for people who would rather read than run setup.
-  local example
-  example="$(find "$srcdir" -maxdepth 2 -type f -name 'config.example.toml' | head -n 1)"
-  if [[ -n "$example" ]]; then
-    install -Dm644 "$example" "$pkgdir/usr/share/doc/$pkgname/config.example.toml"
+  local changes
+  changes="$(find "$srcdir" -maxdepth 2 -type f -name CHANGELOG.md | head -n 1)"
+  if [[ -n "$changes" ]]; then
+    install -Dm644 "$changes" "$pkgdir/usr/share/doc/$pkgname/CHANGELOG.md"
   fi
 }

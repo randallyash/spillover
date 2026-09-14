@@ -1,0 +1,87 @@
+name: Packaging
+
+# Confirms that what a person installs actually installs, and reports the version
+# it was released as — the tarball on Linux, and the Homebrew tap on a clean Mac.
+# Deliberately not part of CI: it reaches the network for a released artifact
+# rather than building the commit.
+#
+# Run it after a release, naming the version, or with no input to take the
+# latest one:
+#
+#   gh workflow run packaging.yml -f version=0.1.2
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: The released version to verify, without the leading "v"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  linux-tarball:
+    name: released tarball (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Work out which version to check
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ASKED: ${{ inputs.version }}
+        run: |
+          version="$ASKED"
+          if [ -z "$version" ]; then
+            version="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)"
+            version="${version#v}"
+          fi
+          echo "checking $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # The existing script: downloads the tarball for this machine, checks the
+      # binary runs and reports this version, and that the subcommands and the
+      # licence came with it. It installs nothing system-wide.
+      - run: ./packaging/verify-install.sh "${{ steps.version.outputs.version }}"
+
+  homebrew-macos:
+    name: brew install (macos)
+    runs-on: macos-latest
+    steps:
+      - name: Work out which version to check
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ASKED: ${{ inputs.version }}
+        run: |
+          version="$ASKED"
+          if [ -z "$version" ]; then
+            version="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)"
+            version="${version#v}"
+          fi
+          echo "checking $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # The whole point of a tap, on a machine that has never seen this project:
+      # the install a user runs, from the formula as it is published. A checksum
+      # that does not match the release fails here instead of on someone's laptop.
+      - name: Install from the tap, the way a user would
+        run: brew install randallyash/spillover/spill
+
+      - name: The installed binary reports the version it was released as
+        run: |
+          which spill
+          spill --version
+          test "$(spill --version)" = "spill ${{ steps.version.outputs.version }}"
+
+      # Installed is not the same as runs: this is the binary actually executing
+      # on the platform it was built for. A non-zero exit is correct with nothing
+      # configured, so the report is what is checked, not the status.
+      - name: It runs, rather than only existing
+        run: |
+          if spill doctor --json > doctor.json; then :; fi
+          cat doctor.json
+          grep -q '"version"' doctor.json
