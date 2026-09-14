@@ -680,4 +680,73 @@ mod tests {
             "bad arguments are the model's own doing, whatever the target"
         );
     }
+
+    // ---- silence after a tool, as opposed to before the first token ---------
+
+    #[test]
+    fn the_request_after_one_that_answered_is_judged_as_idle() {
+        // The mechanism behind a stall that begins *after* a tool result rather
+        // than before the first token. A server that has answered once is warm, so
+        // the next request gets the shorter idle budget instead of the generous
+        // first-token one again — otherwise every post-tool silence waits out a
+        // cold start that is not happening, which on a LAN tier is a minute of
+        // nothing.
+        let mut watchdog = Watchdog::new(&Limits {
+            first_token_timeout_ms: 2_000,
+            idle_timeout_ms: 50,
+            max_repeat_run: 4,
+        });
+        watchdog.note_activity();
+        watchdog.begin_request();
+
+        assert_eq!(watchdog.phase(), Phase::Idle);
+        assert_eq!(watchdog.allowance(), Duration::from_millis(50));
+    }
+
+    #[test]
+    fn the_time_a_tool_spent_is_not_measured_as_silence() {
+        // The other half of the same decision. Between one request and the next a
+        // tool runs, which can take minutes and says nothing about the model: if
+        // the gap were measured from the previous request's last frame, every tool
+        // call would look like a near miss on the wait, and a long build would look
+        // like a stall.
+        let mut watchdog = Watchdog::new(&Limits {
+            first_token_timeout_ms: 60_000,
+            idle_timeout_ms: 60_000,
+            max_repeat_run: 4,
+        });
+        watchdog.note_activity();
+
+        // The tool running, between one request and the next: still inside the
+        // attempt, and outside every request's silence. Long enough that counting
+        // it would be unmistakable, short enough to keep the test quick.
+        std::thread::sleep(Duration::from_millis(200));
+
+        watchdog.begin_request();
+        watchdog.note_activity();
+
+        let timing = watchdog.timing();
+        assert!(
+            timing.worst_gap_ms < 100,
+            "a tool's runtime was counted as the model going quiet: {timing:?}"
+        );
+    }
+
+    #[test]
+    fn a_worst_wait_survives_into_the_next_request() {
+        // An attempt is several requests, and the figure the report prints is the
+        // attempt's — so a quick second request must not erase the fact that the
+        // first nearly ran out. The near miss is the thing worth being able to read
+        // afterwards, and it is the whole tuning material.
+        let mut watchdog = Watchdog::new(&limits());
+        watchdog.note_activity();
+        watchdog.timed_out(Duration::from_millis(4_000));
+        let before = watchdog.timing();
+        assert_eq!(before.worst_phase, Phase::Idle);
+
+        watchdog.begin_request();
+        watchdog.note_activity();
+
+        assert_eq!(watchdog.timing(), before);
+    }
 }

@@ -1,0 +1,10 @@
+{"choices":[{"delta":{},"index":0}],"usage":{"prompt_tokens":1500,"completion_tokens":40}}
+{"choices":[{"delta":{"content":"I'll che"},"index":0}]}
+{"choices":[{"delta":{"content":"ck the tokenizer first.\nThe loop is in the sca"},"index":0}]}
+{"choices":[{"delta":{"content":"nner.\n"},"index":0}]}
+{"choices":[{"delta":{"content":"Looking at the same li"},"index":0}]}
+{"choices":[{"delta":{"content":"ne again.\nLooking at the same line again.\n"},"index":0}]}
+{"choices":[{"delta":{"content":"Looking at the sa"},"index":0}]}
+{"choices":[{"delta":{"content":"me line again.\n"},"index":0}]}
+{"choices":[{"delta":{"content":"Looking at the same line again.\n"},"index":0}]}
+{"choices":[{"delta":{},"finish_reason":"stop","index":0}]}

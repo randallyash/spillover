@@ -159,6 +159,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A loop spelled differently was not a loop.** The "same tool with the same
+  arguments" detector compared the arguments as the *text* that arrived, so a model
+  that re-sampled the same call with the space on the other side of the colon — or
+  with its keys in another order — looked like a model doing something new. It is the
+  failure the detector exists for, and it was the one way out of it: the model only had
+  to rewrite itself slightly to keep looping. Arguments are now compared as parsed
+  JSON, so meaning decides and spelling does not, while a changed value or a different
+  key is still a different call. The same held for the tighter budget on repeated
+  failures: one missing file reported two ways was not accumulating, so a model grinding
+  against a single obstacle kept the tier's full allowance. Found by writing the
+  detector's tests against the shapes a real loop arrives in rather than the shapes the
+  detector happened to be handed.
+
 - **A spill record was written in many small pieces, so two processes spilling at
   once spliced their records together.** The append is atomic, but only for a single
   write, and `Display` for a JSON value emits in pieces — each of which became its own

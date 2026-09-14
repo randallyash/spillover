@@ -254,9 +254,12 @@ A turn is abandoned, and retried on the next tier, when the active tier:
 
 - **repeats itself** — the same line, or the same twelve-token span, often enough to
   be a loop rather than an answer;
-- **stops making progress** — the same tool call with identical arguments over and
+- **stops making progress** — the same tool call with the same arguments over and
   over, a run of tool calls that all fail, or the *same kind* of failure from the same
-  tool three times. Reading three different files is work; reading the *same* missing
+  tool three times. The arguments are compared as parsed JSON rather than as the text
+  that arrived, so a call re-spelled — a space moved, keys in another order — is still
+  the same call, and a model cannot rewrite its way out of being caught. A changed
+  value is still a different call. Reading three different files is work; reading the *same* missing
   path three times is not, and looking for a `.env`, a `Makefile` and a
   `pyproject.toml` that are not there is investigation rather than a stall — so a
   file-shaped failure only counts when the path repeats, while a malformed call counts
@@ -886,9 +889,14 @@ before it will write), zero-config first run, `doctor`, and `-p`.
 
 The awkward paths are pinned by fixtures that drive the real provider, detector and
 tools against a local endpoint instead of a live model — a model looping on the same
-line, a consult that fails, a model stuck on a missing file, and a hunt for files
+line, a collapse arriving in the ragged frames a server actually sends (a sentence
+split mid-word, two lines in one frame), a model re-asking for the same file in new
+words every turn, a tier that goes quiet *after* a tool rather than before its first
+token, a consult that fails, a model stuck on a missing file, and a hunt for files
 that are not there. A change that quietly breaks failover fails `cargo test` instead
-of reaching you.
+of reaching you. Each detector is also tested on its own, fed the counters it is
+judged by, so a refactor that leaves the loop working by accident still has to keep
+the detectors working on purpose.
 
 The tool set is deliberately closed at seven. No MCP client, no browser, no image
 generation in 0.1.x: a tool has to earn its place, and every tool added is another

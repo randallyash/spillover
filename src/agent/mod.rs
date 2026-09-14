@@ -6196,4 +6196,217 @@ mod tests {
             consulted(&events)
         );
     }
+
+    // ---- the two detectors, and which one is being asked --------------------
+
+    /// A turn that says something new and asks for the same thing again.
+    ///
+    /// What a looping model actually looks like: it narrates, and the narration
+    /// changes every time, while the call underneath it does not.
+    fn narrates_and_repeats_the_call(prose: &str) -> TurnSummary {
+        TurnSummary {
+            text: prose.to_string(),
+            tool_calls: vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: r#"{"path":"note.txt"}"#.to_string(),
+            }],
+            stop_reason: Some("tool_calls".to_string()),
+            ..TurnSummary::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tier_that_keeps_asking_for_the_same_thing_in_new_words_is_caught() {
+        // The case the two detectors split between them, and the one that says
+        // which is which: the prose is different every step, so the *text* loop
+        // detector has nothing to go on, and the model is still stuck. Only the
+        // identical-call detector can catch this, and a refactor that fed the
+        // wrong thing to either one would show up here.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("note.txt"), "x").expect("write");
+
+        let stubborn = ScriptedProvider::new(vec![
+            narrates_and_repeats_the_call("Let me look at the note."),
+            narrates_and_repeats_the_call("I will read that file again."),
+            narrates_and_repeats_the_call("Reading the same file once more."),
+            narrates_and_repeats_the_call("Checking that note a final time."),
+        ]);
+        let healthy = ScriptedProvider::new(vec![answer("recovered")]);
+
+        let tiers: Vec<(Arc<dyn Provider>, Limits)> = vec![
+            (stubborn.clone(), Limits::default()),
+            (healthy, Limits::default()),
+        ];
+        let (tx, rx) = spawn(
+            config(dir.path(), DEFAULT_MAX_STEPS),
+            chain_of_with(tiers, OnStuck::Escalate),
+            Arc::new(Registry::with_default_tools()),
+            Arc::new(AlwaysApprove::default()),
+        );
+        tx.send(Command::Prompt("read the note".to_string()))
+            .expect("send");
+        let events = drain(rx).await;
+
+        let verdict = verdicts(&events)[0];
+        assert!(
+            matches!(
+                verdict.reason,
+                StuckReason::RepeatedToolCall { ref tool, times: 4 } if tool == "read_file"
+            ),
+            "the call loop is what is wrong here: {:?}",
+            verdict.reason
+        );
+        assert_eq!(verdict.counters.progress.same_run, 4);
+        assert!(
+            verdict.counters.repetition.span_repeats < verdict.counters.repetition.threshold,
+            "the prose never repeated, so the text detector should not be near it: {:?}",
+            verdict.counters.repetition
+        );
+        assert!(
+            !matches!(verdict.reason, StuckReason::Repetition { .. }),
+            "and it must not be reported as a text loop: {:?}",
+            verdict.reason
+        );
+    }
+
+    #[tokio::test]
+    async fn a_model_written_out_of_arguments_is_still_stuck() {
+        // The same loop, spelled differently each time. Sampling the call twice can
+        // move the space or reorder the keys, and neither makes it a different
+        // request — so the detector has to be reading the arguments rather than the
+        // text of them, or a model can rewrite its way out of being caught.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("note.txt"), "x").expect("write");
+
+        let spelled = |arguments: &str| TurnSummary {
+            text: "reading".to_string(),
+            tool_calls: vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: arguments.to_string(),
+            }],
+            stop_reason: Some("tool_calls".to_string()),
+            ..TurnSummary::default()
+        };
+
+        let stubborn = ScriptedProvider::new(vec![
+            spelled(r#"{"path":"note.txt"}"#),
+            spelled(r#"{"path": "note.txt"}"#),
+            spelled(r#"{ "path" : "note.txt" }"#),
+            spelled(r#"{"path":"note.txt"}"#),
+        ]);
+        let healthy = ScriptedProvider::new(vec![answer("recovered")]);
+
+        let tiers: Vec<(Arc<dyn Provider>, Limits)> = vec![
+            (stubborn.clone(), Limits::default()),
+            (healthy, Limits::default()),
+        ];
+        let (tx, rx) = spawn(
+            config(dir.path(), DEFAULT_MAX_STEPS),
+            chain_of_with(tiers, OnStuck::Escalate),
+            Arc::new(Registry::with_default_tools()),
+            Arc::new(AlwaysApprove::default()),
+        );
+        tx.send(Command::Prompt("read the note".to_string()))
+            .expect("send");
+        let events = drain(rx).await;
+
+        let verdict = verdicts(&events)[0];
+        assert!(
+            matches!(
+                verdict.reason,
+                StuckReason::RepeatedToolCall { times: 4, .. }
+            ),
+            "four readings of one file, however they were written: {:?}",
+            verdict.reason
+        );
+    }
+
+    /// Answers once, with a tool call, and then never answers again.
+    ///
+    /// A model that was working and went quiet with the tool result in front of it
+    /// — the case the phase distinction exists for.
+    struct AnswersThenHangs {
+        first: TurnSummary,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl AnswersThenHangs {
+        fn new(first: TurnSummary) -> Arc<Self> {
+            Arc::new(Self {
+                first,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl Provider for AnswersThenHangs {
+        fn describe(&self) -> String {
+            "answers-then-hangs".to_string()
+        }
+
+        async fn stream(
+            &self,
+            _request: ChatRequest,
+            events: UnboundedSender<StreamEvent>,
+        ) -> Result<TurnSummary, ProviderError> {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                let _ = events.send(StreamEvent::Text("looking at the note".to_string()));
+                return Ok(self.first.clone());
+            }
+            std::future::pending::<()>().await;
+            unreachable!("pending never resolves")
+        }
+    }
+
+    #[tokio::test]
+    async fn silence_after_a_tool_is_judged_against_the_idle_budget() {
+        // Silence means opposite things either side of the first frame, and the
+        // interesting side is the second one: a tier that has answered, run a tool,
+        // and then gone quiet is wedged, where one that has not answered yet may
+        // still be loading its weights. The budgets are set far apart so the two
+        // readings are unmistakable — the generous one would take two seconds and
+        // the idle one fifty milliseconds — and the counters say which was used.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("note.txt"), "x").expect("write");
+
+        let hanging = AnswersThenHangs::new(calls_tool("read_file", r#"{"path":"note.txt"}"#));
+        let healthy = ScriptedProvider::new(vec![answer("recovered")]);
+
+        let tight = Limits {
+            first_token_timeout_ms: 2_000,
+            idle_timeout_ms: 50,
+            max_repeat_run: 4,
+        };
+        let tiers: Vec<(Arc<dyn Provider>, Limits)> =
+            vec![(hanging.clone(), tight), (healthy, Limits::default())];
+        let (tx, mut rx) = spawn(
+            config(dir.path(), DEFAULT_MAX_STEPS),
+            chain_of_with(tiers, OnStuck::Escalate),
+            Arc::new(Registry::with_default_tools()),
+            Arc::new(AlwaysApprove::default()),
+        );
+
+        tx.send(Command::Prompt("read the note".to_string()))
+            .expect("send");
+        let events = drain_from(&mut rx).await;
+
+        let verdict = verdicts(&events)[0];
+        assert!(
+            matches!(verdict.reason, StuckReason::Stall { .. }),
+            "a tier with the tool result in front of it that stops talking has stalled: {:?}",
+            verdict.reason
+        );
+        assert_eq!(
+            verdict.counters.timing.worst_phase,
+            crate::detect::Phase::Idle,
+            "the wait after a tool is an idle wait, not a cold start"
+        );
+        assert_eq!(
+            verdict.counters.timing.worst_allowance_ms, 50,
+            "and it is the idle budget that measured it, not the first-token one"
+        );
+    }
 }

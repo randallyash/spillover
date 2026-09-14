@@ -980,6 +980,74 @@ async fn a_local_tier_that_sets_only_one_timeout_keeps_the_rest() {
     );
 }
 
+/// A local model losing the plot, in the frames a server actually sends.
+///
+/// Not a captured recording — the shape is constructed, because what is worth
+/// pinning is not one model's wording but how a collapse arrives over the wire.
+/// Three things about it are the point, and none of them happen in a fixture whose
+/// frames each hold one whole line:
+///
+/// - a sentence split across frames *inside a word*;
+/// - one frame holding two complete lines at once, which a detector that judged
+///   each chunk as a line would count as one;
+/// - exactly four repeats and no more, so a detector that undercounts them does
+///   not trip at all rather than tripping late.
+const DEGENERATE: &str = include_str!("provider/fixtures/openai-degenerate-loop.jsonl");
+
+/// The sentence that stream collapses into.
+const DEGENERATE_LINE: &str = "Looking at the same line again.";
+
+#[tokio::test]
+async fn a_collapse_arriving_over_the_wire_is_caught_frame_by_frame() {
+    // The detector's own tests feed it strings. This is the other half: real
+    // frames, through the real parser, into the real watchdog — so a change to how
+    // a stream is chunked or reassembled cannot quietly stop the loop from being
+    // noticed.
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let frames: Vec<String> = DEGENERATE.lines().map(str::to_string).collect();
+    let local = FakeTier::new(vec![frames]);
+    let frontier = FakeTier::new(vec![plain_answer("Try the scanner instead.")]);
+
+    let mut local_server = mockito::Server::new_async().await;
+    let mut frontier_server = mockito::Server::new_async().await;
+    let local_mock = local.mount(&mut local_server, 1).await;
+    let frontier_mock = frontier.mount(&mut frontier_server, 1).await;
+
+    let chain = FallbackChain::new(
+        vec![
+            escalating(local.tier("local", "Local", &local_server.url())),
+            frontier.tier("frontier", "Frontier", &frontier_server.url()),
+        ],
+        true,
+    )
+    .expect("a chain of two");
+
+    let events = run_turn(workspace.path(), chain).await;
+
+    let (from, to, reason) = escalation(&events).expect("a repeated sentence is a stall");
+    assert!(from.starts_with("Local"), "{from}");
+    assert!(to.starts_with("Frontier"), "{to}");
+    assert_eq!(
+        reason, "repeated the same output 4 times",
+        "the repeats are counted across frames, not per frame"
+    );
+
+    // Caught as it arrived rather than after the answer finished: the tier was
+    // asked once, and the stream that would have gone on repeating was cut at the
+    // fourth repeat.
+    assert_eq!(local.seen().count(), 1);
+
+    // And the collapse does not travel: the frontier gets the question and a
+    // model's own guess, never the loop.
+    assert!(
+        !frontier.seen().nth_contains(0, DEGENERATE_LINE),
+        "the looped text reached the next tier"
+    );
+
+    local_mock.assert_async().await;
+    frontier_mock.assert_async().await;
+}
+
 /// The whole claim, end to end: the real tool wrote it, the real undo put it back.
 ///
 /// A unit test can prove the tool returns the previous bytes and that the undo

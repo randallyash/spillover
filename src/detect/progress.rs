@@ -13,10 +13,27 @@
 //!   waiting through the tier's whole allowance would spend several more calls
 //!   learning nothing.
 
+use serde_json::Value;
+
 use crate::detect::{ErrorClass, StuckReason};
 
 /// Below this, the "pattern" is just normal tool use.
 const MIN_THRESHOLD: usize = 2;
+
+/// The arguments of a call, as two calls can be compared.
+///
+/// Two calls that mean the same thing are the same call. Sampling the same JSON
+/// twice can put the space on the other side of the colon, or name the keys in the
+/// other order, and neither makes it a different request — comparing the raw text,
+/// which is what this did first, lets a model rewrite its way out of the detector
+/// one character at a time. That is precisely the loop this exists to catch, so
+/// the comparison is on meaning and the spelling is dropped.
+///
+/// Arguments that are not JSON at all are kept as they arrived: every tool refuses
+/// them, and until then the text is the only thing there is to compare.
+fn comparable(arguments: &str) -> Value {
+    serde_json::from_str(arguments).unwrap_or_else(|_| Value::String(arguments.to_string()))
+}
 
 /// What the detector has seen so far.
 ///
@@ -38,7 +55,9 @@ pub struct ProgressCounters {
 
 pub struct ProgressDetector {
     threshold: usize,
-    last_call: Option<(String, String)>,
+    /// The last call as `(tool, arguments-as-meaning)`, so a repeat is judged on
+    /// what was asked for rather than on how it was written.
+    last_call: Option<(String, Value)>,
     same_run: usize,
     failure_run: usize,
     last_failed_tool: String,
@@ -49,7 +68,11 @@ pub struct ProgressDetector {
     /// a different error, or a different *file* all break the run. That last one
     /// is the difference between probing and grinding: looking for three files
     /// that turn out not to exist is three obstacles, not one.
-    error_streak: Option<(String, ErrorClass, Option<String>)>,
+    ///
+    /// The target is compared as meaning for the same reason the call is: one
+    /// missing file is one obstacle whether or not the model spelled the path the
+    /// same way twice.
+    error_streak: Option<(String, ErrorClass, Option<Value>)>,
     error_run: usize,
 }
 
@@ -88,7 +111,7 @@ impl ProgressDetector {
         arguments: &str,
         failure: Option<ErrorClass>,
     ) -> Option<StuckReason> {
-        let call = (tool.to_string(), arguments.to_string());
+        let call = (tool.to_string(), comparable(arguments));
         if self.last_call.as_ref() == Some(&call) {
             self.same_run += 1;
         } else {
@@ -104,7 +127,7 @@ impl ProgressDetector {
                 // `None` for the target when the class blames the call rather
                 // than the thing it was aimed at, so those accumulate across
                 // different targets; a file-shaped failure carries its path.
-                let target = class.needs_the_same_target().then(|| arguments.to_string());
+                let target = class.needs_the_same_target().then(|| comparable(arguments));
                 let key = (tool.to_string(), class, target);
                 if self.error_streak.as_ref() == Some(&key) {
                     self.error_run += 1;
@@ -530,6 +553,154 @@ mod tests {
             .expect("it still trips, but only on the fourth");
         assert!(
             matches!(reason, StuckReason::RepeatedToolFailure { .. }),
+            "{reason:?}"
+        );
+    }
+
+    // ---- what "the same call" means ----------------------------------------
+
+    #[test]
+    fn the_same_call_spelled_differently_is_still_the_same_call() {
+        // A loop does not have to be byte-identical to be a loop. Sampling the
+        // same call twice can put the space on the other side of the colon, and
+        // that is not a different request — comparing the raw text lets a model
+        // rewrite its way out of the detector one character at a time, which is
+        // exactly the failure mode this exists to catch.
+        let mut detector = ProgressDetector::new(3);
+        assert!(
+            detector
+                .record("read_file", r#"{"path":"note.txt"}"#, None)
+                .is_none()
+        );
+        assert!(
+            detector
+                .record("read_file", r#"{"path": "note.txt"}"#, None)
+                .is_none()
+        );
+        let reason = detector
+            .record("read_file", r#"{ "path" : "note.txt" }"#, None)
+            .expect("three readings of one file is a loop, however they are spelled");
+        assert_eq!(
+            reason,
+            StuckReason::RepeatedToolCall {
+                tool: "read_file".to_string(),
+                times: 3
+            }
+        );
+    }
+
+    #[test]
+    fn the_same_call_with_its_keys_in_another_order_is_the_same_call() {
+        // The other way round the same fact: an object's meaning does not depend
+        // on the order its keys were written in.
+        let mut detector = ProgressDetector::new(3);
+        assert!(
+            detector
+                .record("edit_file", r#"{"path":"a.rs","old":"x","new":"y"}"#, None)
+                .is_none()
+        );
+        assert!(
+            detector
+                .record("edit_file", r#"{"new":"y","path":"a.rs","old":"x"}"#, None)
+                .is_none()
+        );
+        let reason = detector
+            .record("edit_file", r#"{"old":"x","new":"y","path":"a.rs"}"#, None)
+            .expect("key order is not a different edit");
+        assert_eq!(
+            reason,
+            StuckReason::RepeatedToolCall {
+                tool: "edit_file".to_string(),
+                times: 3
+            }
+        );
+    }
+
+    #[test]
+    fn a_call_that_means_something_else_is_a_different_call() {
+        // The other half, so the comparison is not loosened into uselessness: a
+        // changed value is a changed call, and different keys are too.
+        let mut detector = ProgressDetector::new(3);
+        assert!(
+            detector
+                .record("read_file", r#"{"path":"a.rs"}"#, None)
+                .is_none()
+        );
+        assert!(
+            detector
+                .record("read_file", r#"{"path":"b.rs"}"#, None)
+                .is_none()
+        );
+        assert!(
+            detector
+                .record("read_file", r#"{"file":"a.rs"}"#, None)
+                .is_none(),
+            "a different key is a different call"
+        );
+    }
+
+    #[test]
+    fn the_same_missing_file_spelled_differently_is_the_same_wall() {
+        // The error streak keys on the arguments as the target, so the same
+        // obstacle written two ways has to accumulate: otherwise a model grinding
+        // against one missing path can keep the tighter budget from ever firing.
+        let mut detector = ProgressDetector::new(4);
+        failed(&mut detector, "read_file", "a.rs", ErrorClass::NotFound);
+        assert!(
+            detector
+                .record(
+                    "read_file",
+                    r#"{"path": "a.rs"}"#,
+                    Some(ErrorClass::NotFound)
+                )
+                .is_none()
+        );
+        let reason = detector
+            .record(
+                "read_file",
+                r#"{ "path" : "a.rs" }"#,
+                Some(ErrorClass::NotFound),
+            )
+            .expect("one path, three attempts, whichever way it is written");
+        assert!(
+            matches!(
+                reason,
+                StuckReason::RepeatedToolError {
+                    class: ErrorClass::NotFound,
+                    times: 3,
+                    ..
+                }
+            ),
+            "{reason:?}"
+        );
+    }
+
+    #[test]
+    fn arguments_that_are_not_json_are_compared_as_they_arrived() {
+        // A malformed call never reaches a tool, but it must still be seen as the
+        // same malformed call: that is what the InvalidArguments budget is for, and
+        // it accumulates across targets because the target was never the problem.
+        // Different text each time, so the identical-call rule cannot be what
+        // fires.
+        // Three, because that is the class's own budget on a tier that allows
+        // four — the floor where repeating a malformed call stops reading as bad
+        // luck.
+        let mut detector = ProgressDetector::new(4);
+        assert!(
+            detector
+                .record("read_file", "not json", Some(ErrorClass::InvalidArguments))
+                .is_none()
+        );
+        assert!(
+            detector
+                .record("read_file", "nor json", Some(ErrorClass::InvalidArguments))
+                .is_none()
+        );
+        let reason = detector
+            .record("read_file", "noh json", Some(ErrorClass::InvalidArguments))
+            .expect("three malformed calls is the same mistake three times");
+        assert!(
+            matches!(reason, StuckReason::RepeatedToolError { times: 3, .. }),
             "{reason:?}"
         );
     }
