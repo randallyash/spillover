@@ -1,6 +1,6 @@
 pkgbase = spill-bin
 	pkgdesc = Agentic AI TUI that runs your local model first and spills over when it stalls
-	pkgver = 0.1.2
+	pkgver = 0.2.0
 	pkgrel = 1
 	url = https://github.com/randallyash/spillover
 	arch = x86_64
@@ -13,9 +13,9 @@ pkgbase = spill-bin
 	conflicts = spill-bin-git
 	options = !strip
 	options = !debug
-	source_x86_64 = spill-0.1.2-x86_64.tar.xz::https://github.com/randallyash/spillover/releases/download/v0.1.2/spill-x86_64-unknown-linux-gnu.tar.xz
+	source_x86_64 = spill-0.2.0-x86_64.tar.xz::https://github.com/randallyash/spillover/releases/download/v0.2.0/spill-x86_64-unknown-linux-gnu.tar.xz
 	sha256sums_x86_64 = 42884e95f70ddfea17bf42374bc31281b81602877d0435b0783374e1ce33d57c
-	source_aarch64 = spill-0.1.2-aarch64.tar.xz::https://github.com/randallyash/spillover/releases/download/v0.1.2/spill-aarch64-unknown-linux-gnu.tar.xz
+	source_aarch64 = spill-0.2.0-aarch64.tar.xz::https://github.com/randallyash/spillover/releases/download/v0.2.0/spill-aarch64-unknown-linux-gnu.tar.xz
 	sha256sums_aarch64 = 53cae3a2056e48e2469d2b691d91545de0d73d73ba7e5b0e9891d0f05650a1eb
 
 pkgname = spill-bin

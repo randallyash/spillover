@@ -11,7 +11,7 @@
 # and confirm the version and the URLs match the tag you are packaging.
 
 pkgname=spill-bin
-pkgver=0.1.2
+pkgver=0.2.0
 pkgrel=1
 pkgdesc="Agentic AI TUI that runs your local model first and spills over when it stalls"
 arch=('x86_64' 'aarch64')
@@ -31,7 +31,10 @@ _base="https://github.com/randallyash/spillover/releases/download/v${pkgver}"
 source_x86_64=("spill-${pkgver}-x86_64.tar.xz::${_base}/spill-x86_64-unknown-linux-gnu.tar.xz")
 source_aarch64=("spill-${pkgver}-aarch64.tar.xz::${_base}/spill-aarch64-unknown-linux-gnu.tar.xz")
 
-# Checksums from the v0.1.2 release. `updpkgsums` refreshes them for a new one.
+# Still the v0.1.2 sums: the 0.2.0 artifacts do not exist until the tag is pushed,
+# so these are refreshed with `updpkgsums` in the commit that follows the release.
+# Until then the recipe names 0.2.0 and would fail to verify, which is the one order
+# these two things can be done in.
 sha256sums_x86_64=('42884e95f70ddfea17bf42374bc31281b81602877d0435b0783374e1ce33d57c')
 sha256sums_aarch64=('53cae3a2056e48e2469d2b691d91545de0d73d73ba7e5b0e9891d0f05650a1eb')
 

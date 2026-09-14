@@ -38,9 +38,17 @@ mod tests {
         // every other assertion here vacuously true.
         let releases = sections();
         assert!(releases.len() >= 3, "parsed {} releases", releases.len());
+
+        // Either there is work waiting, or the newest thing here is the release
+        // the binary reports. Demanding an `Unreleased` section outright was the
+        // earlier spelling of this, and it is unsatisfiable in exactly the place
+        // it matters most: the moment a release is cut, there is genuinely
+        // nothing pending, so the only way to satisfy it would be a placeholder.
         assert!(
-            releases.iter().any(|(name, _)| name.contains("Unreleased")),
-            "{releases:?}"
+            releases
+                .iter()
+                .any(|(name, _)| name.contains("Unreleased") || name.contains(crate_version())),
+            "the changelog is neither ahead of nor level with the binary: {releases:?}"
         );
     }
 
