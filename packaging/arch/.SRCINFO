@@ -14,8 +14,8 @@ pkgbase = spill-bin
 	options = !strip
 	options = !debug
 	source_x86_64 = spill-0.2.0-x86_64.tar.xz::https://github.com/randallyash/spillover/releases/download/v0.2.0/spill-x86_64-unknown-linux-gnu.tar.xz
-	sha256sums_x86_64 = 42884e95f70ddfea17bf42374bc31281b81602877d0435b0783374e1ce33d57c
+	sha256sums_x86_64 = b529095103f1476bdcb729294c8db3376302b034b96c030ab865206b79f158dd
 	source_aarch64 = spill-0.2.0-aarch64.tar.xz::https://github.com/randallyash/spillover/releases/download/v0.2.0/spill-aarch64-unknown-linux-gnu.tar.xz
-	sha256sums_aarch64 = 53cae3a2056e48e2469d2b691d91545de0d73d73ba7e5b0e9891d0f05650a1eb
+	sha256sums_aarch64 = 66f2c58e4112c90967cdc989b4965607892a6d1c3f17f45a8ebb1a79e6fa2feb
 
 pkgname = spill-bin

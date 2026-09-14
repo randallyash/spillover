@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **The AUR recipe names 0.2.0, with that release's checksums.** The recipe and the
+  crate have to agree on the version or `cargo test` fails, but the checksums cannot
+  exist until the artifacts are published — so the two are done in the order the
+  release flow allows, and the sums here come from the release's own `.sha256` files
+  rather than from a build made locally.
+
 ## [0.2.0] - 2026-09-13
 
 ### Added
