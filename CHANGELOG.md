@@ -4,13 +4,23 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.0] - 2026-09-15
 
-### Changed
+### Added
 
-- **The AUR recipe names 0.3.0, with that release's checksums.** Same two-step
-  as 0.2.0: the version pin and the sums cannot land in one commit, because the
-  sums do not exist until the tag is pushed.
+- **Named session history and a picker.** A workspace keeps every conversation,
+  titled from the first prompt (or `/session rename`). `/sessions` or Ctrl-P
+  opens a picker: enter to switch, `n` new, `d` delete, `r` rename. `/new` and
+  Ctrl-N start a blank session without throwing the last one away. A leftover
+  single `{hash}.json` is migrated on first open.
+
+- **Thinking is visible.** Grok `thought` frames, Command Code `thinking_delta`,
+  and OpenAI `reasoning_content` stream as a dim "thinking" block above the
+  answer, the way the Grok TUI does. They are not kept as the answer and are
+  not sent back to a model.
+
+- **`/deescalate`.** Go back to the first tier (`/tier auto` and `/tier 1` do
+  the same). Sticky no longer swallows the climb.
 
 ### Fixed
 
@@ -19,22 +29,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   like a stuck model, so Grok was asked about a flag. Spill now drops the id
   and resends the conversation it already holds.
 
-- **`/escalate` moves the rail, and `/deescalate` exists.** The command used to
-  change the chain without telling the header, so the chip stayed on the cheap
-  tier. `/tier auto` also ignored sticky and would not climb back. `/deescalate`
-  (or `/tier auto`, or `/tier 1`) returns to the first tier and clears its spent
-  mark.
-
-- **Thinking is visible.** Grok `thought` frames, Command Code `thinking_delta`,
-  and OpenAI `reasoning_content` stream as a dim "thinking" block above the
-  answer, the way the Grok TUI does. They are not kept as the answer and are
-  not sent back to a model.
-
-- **Named session history and a picker.** A workspace keeps every conversation,
-  titled from the first prompt (or `/session rename`). `/sessions` or Ctrl-P
-  opens a picker: enter to switch, `n` new, `d` delete, `r` rename. `/new` still
-  starts a blank session without throwing the last one away. A leftover single
-  `{hash}.json` is migrated on first open.
+- **`/escalate` moves the rail.** The command used to change the chain without
+  telling the header, so the chip stayed on the cheap tier.
 
 ## [0.3.0] - 2026-09-15
 
@@ -927,6 +923,7 @@ First release. Everything below is new.
   [`randallyash/spillover`](https://github.com/randallyash/homebrew-spillover)
   tap, so `brew install randallyash/spillover/spill` works.
 
+[0.4.0]: https://github.com/randallyash/spillover/releases/tag/v0.4.0
 [0.3.0]: https://github.com/randallyash/spillover/releases/tag/v0.3.0
 [0.1.2]: https://github.com/randallyash/spillover/releases/tag/v0.1.2
 [0.1.1]: https://github.com/randallyash/spillover/releases/tag/v0.1.1

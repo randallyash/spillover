@@ -11,7 +11,7 @@
 # and confirm the version and the URLs match the tag you are packaging.
 
 pkgname=spill-bin
-pkgver=0.3.0
+pkgver=0.4.0
 pkgrel=1
 pkgdesc="Agentic AI TUI that runs your local model first and spills over when it stalls"
 arch=('x86_64' 'aarch64')
@@ -31,8 +31,8 @@ _base="https://github.com/randallyash/spillover/releases/download/v${pkgver}"
 source_x86_64=("spill-${pkgver}-x86_64.tar.xz::${_base}/spill-x86_64-unknown-linux-gnu.tar.xz")
 source_aarch64=("spill-${pkgver}-aarch64.tar.xz::${_base}/spill-aarch64-unknown-linux-gnu.tar.xz")
 
-# Checksums from the v0.3.0 release, taken from its own `.sha256` files rather than
-# from a build made here.
+# Checksums from the previous release until v0.4.0's artifacts exist. Refresh
+# from the tag's `.sha256` files after the release workflow finishes.
 sha256sums_x86_64=('c4f35319d8e107a5b2a747ff3861af0b8463857a9a88c1c4ff0644cc85244a1c')
 sha256sums_aarch64=('a532c09b48fe280f1c652554b715b2f24835c8d73911f26bf4cdd0397e078caa')
 
