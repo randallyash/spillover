@@ -22,8 +22,6 @@ const PROMPT: &str = "❯";
 const PROMPT_WIDTH: usize = 2;
 
 /// How tall the prompt box wants to be for this app and this width.
-///
-/// The layout asks before it renders, so the two always agree.
 pub fn height(app: &App, width: u16) -> u16 {
     let body = body_width(width);
     let lines = wrapped(app, body).len().clamp(1, MAX_LINES);

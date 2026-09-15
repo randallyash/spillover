@@ -16,10 +16,6 @@ use crate::session_store::SessionFile;
 use crate::stalls::Verdict;
 
 /// How much of the prompt a single paste may add, in characters.
-///
-/// Bracketed paste hands over whatever the clipboard held, and a stray
-/// clipboard can hold a whole file. Without a limit that lands in the editor and
-/// is then sent to a model; this is a guard against an accident, not a policy.
 const MAX_PASTE: usize = 100_000;
 
 /// How many lines PageUp and PageDown move the approval preview.
@@ -35,12 +31,6 @@ const HISTORY: usize = 48;
 pub(crate) const HANDOFF_TICKS: u64 = 4;
 
 /// How often the interface redraws while a turn is running.
-///
-/// Fast enough that the spinner reads as motion rather than as a sequence of
-/// stills, slow enough that a redraw is nothing next to the model it is waiting
-/// on. It lives here rather than in the event loop because this file also
-/// *measures* in ticks — the streaming rate is characters against ticks — and a
-/// second copy of the figure could disagree with the first.
 pub const TICK: std::time::Duration = std::time::Duration::from_millis(90);
 
 /// Characters per token assumed until a turn reports real usage. English prose
@@ -66,10 +56,6 @@ const RATE_MIN_CHARS: usize = 24;
 const RATE_MIN_TICKS: u64 = 3;
 
 /// A handoff that has been announced and is still being shown.
-///
-/// The beat is presentation only: the agent retries the moment the verdict
-/// lands, so nothing here delays the work. What it buys is that the reason is on
-/// screen before the tier below starts answering underneath it.
 #[derive(Debug, Clone, Copy)]
 pub struct Handoff {
     /// The tier being abandoned, as a position in the rail.
@@ -206,19 +192,10 @@ pub struct App {
     pub usage_history: Vec<u64>,
     /// What this turn has cost so far, summed across every tier and consult it
     /// has used.
-    ///
-    /// Held here because a turn is not one request: it makes one per tool call,
-    /// and may spill or consult on the way, so the figure the transcript shows
-    /// has to be accumulated as the parts arrive rather than read off any one of
-    /// them. Cleared when the turn ends.
     turn_usage: Option<crate::provider::Usage>,
     /// User turns completed.
     pub turns: u32,
     /// The most recent stall and everything the verdict was made from.
-    ///
-    /// One, not a history: `/why` answers "why was my turn taken away", and that
-    /// question is about the stall that just happened. The log file is where the
-    /// history lives.
     pub last_stall: Option<Verdict>,
 }
 
@@ -267,10 +244,6 @@ impl App {
     }
 
     /// Connect to a running agent, so prompts have somewhere to go.
-    ///
-    /// The tier labels are taken structurally rather than joined into a
-    /// sentence, because the header rail needs to know which one is active and
-    /// which have been spilled past.
     pub fn attach(
         &mut self,
         commands: UnboundedSender<Command>,
@@ -294,11 +267,6 @@ impl App {
     }
 
     /// Pick up where the last run in this workspace left off.
-    ///
-    /// Applied after `attach`, which is what fills in the tier mirror this needs
-    /// to bound the restored index against — a session saved when three tiers
-    /// were configured must not leave the rail pointing at a fourth that is no
-    /// longer there.
     pub fn restore(&mut self, saved: &SessionFile, active_index: usize) {
         self.sticky = saved.sticky;
         self.on_stuck = saved.on_stuck;
@@ -337,9 +305,6 @@ impl App {
 
     /// Add one turn's tokens to the session totals, and to the tier that spent
     /// them.
-    ///
-    /// Cache counts are summed as reported and never subtracted from the input
-    /// figure: whether they are included in it differs by provider.
     pub fn record_usage_on(&mut self, tier: Option<&str>, usage: &crate::provider::Usage) {
         self.tokens_in = self.tokens_in.saturating_add(usage.prompt_tokens);
         self.tokens_out = self.tokens_out.saturating_add(usage.completion_tokens);
@@ -375,13 +340,6 @@ impl App {
     }
 
     /// Finish the current turn's tally, returning the line to show for it.
-    ///
-    /// A turn is not one request: it makes one per tool call, and may spill to
-    /// another tier or consult one on the way. Every part arrives as a `Spent`
-    /// event and is summed here, so what the transcript reports is what the turn
-    /// actually cost rather than the last request in it. Returns `None` when a
-    /// tier reported nothing, so a provider without usage does not get a line of
-    /// invented zeros.
     fn close_turn(&mut self) -> Option<String> {
         let usage = self.turn_usage.take()?;
 
@@ -412,10 +370,6 @@ impl App {
     }
 
     /// Whether a tier is being narrated as abandoned right now, and which one.
-    ///
-    /// Time here is the redraw counter, which only runs during a turn — exactly
-    /// the window a spill happens in. Reading it from the renderer rather than
-    /// clearing the field keeps the beat a pure function of the clock.
     pub fn abandoning_tier(&self) -> Option<usize> {
         match self.handoff {
             Some(handoff) if self.tick < handoff.until => handoff.from,
@@ -424,12 +378,6 @@ impl App {
     }
 
     /// The stuck policy actually in force, for the rail to state.
-    ///
-    /// A session choice wins; otherwise it is the answering tier's own from
-    /// configuration, which can differ per tier — consulting a hesitant local
-    /// model is the point, while a frontier tier has nothing better to ask. So
-    /// the answer follows whichever tier is active, and the rail says the truth
-    /// for the tier you are on rather than a global setting that may not apply.
     pub fn on_stuck(&self) -> OnStuck {
         if let Some(chosen) = self.on_stuck {
             return chosen;
@@ -576,10 +524,6 @@ impl App {
     }
 
     /// Stop the turn that is running.
-    ///
-    /// The turn is stopped where it stands rather than retried on another tier,
-    /// so the model is not changed out from under a decision the user just made
-    /// about it.
     fn cancel_turn(&mut self) {
         match &self.cancel {
             Some(cancel) => cancel.cancel(),
@@ -590,10 +534,6 @@ impl App {
     }
 
     /// Take a pasted block of text into the prompt.
-    ///
-    /// Newlines are kept: a pasted snippet is often several lines, and flattening
-    /// it would silently change what the model is asked. The prompt box already
-    /// wraps and scrolls, so a multi-line paste is exactly what it handles.
     pub fn paste(&mut self, text: &str) {
         if self.approval.is_some() || self.help {
             // The keys belong elsewhere; a paste must not land in a prompt that
@@ -621,10 +561,6 @@ impl App {
     }
 
     /// Move the approval preview by `delta` lines, staying within it.
-    ///
-    /// Clamped against the same geometry the renderer uses, so holding Down at
-    /// the end does not leave the offset stranded past the content where an Up
-    /// press would appear to do nothing.
     fn scroll_approval(&mut self, delta: i32) {
         let Some(pending) = &self.approval else {
             return;
@@ -642,10 +578,6 @@ impl App {
     }
 
     /// Switch between building and planning.
-    ///
-    /// The interface does not change a mode the agent cannot be told about: with
-    /// no agent there is nothing to enforce it, and showing a read-only badge
-    /// over a mode that nothing is honouring would be a lie.
     fn toggle_mode(&mut self) {
         let next = self.mode.toggled();
         let sent = matches!(&self.commands, Some(commands) if commands.send(Command::SetMode(next)).is_ok());
@@ -704,26 +636,6 @@ impl App {
     }
 
     /// How fast the model is writing, in tokens per second.
-    ///
-    /// Estimated rather than counted, and the reason is worth stating: tokens are
-    /// reported only by the tiers that choose to report them, and at the end of a
-    /// reply, so a figure that moves while the text arrives has to come from the
-    /// characters instead. What it divides by is learned from any turn that did
-    /// report real usage (`learn_chars_per_token`) and is a conventional guess
-    /// until one has.
-    ///
-    /// The clock starts at the first character of the message being written rather
-    /// than at the request, so a local model's prefill — which for a long prompt is
-    /// seconds of reading before a single token — is not charged to writing. That
-    /// is the difference between a figure that describes generation and one that
-    /// makes a fast model look slow.
-    ///
-    /// `None` when no text is arriving, which is most of the time, and until there
-    /// is enough of a stream for the answer to mean anything.
-    ///
-    /// The clock is the redraw tick rather than a wall clock, since that is what
-    /// this file already measures in — and a tick the loop was too busy to take is
-    /// skipped rather than replayed, so a starved interface reads a little fast.
     pub fn stream_rate(&self) -> Option<f64> {
         // Nothing is being written, so there is no rate to report.
         self.streaming?;
@@ -743,23 +655,6 @@ impl App {
     }
 
     /// Learn what a token is worth in characters from a reply that reported one.
-    ///
-    /// The divisor is the one part of the estimate that can be *known* rather than
-    /// assumed, and this is where it stops being assumed. The gates are what make
-    /// the comparison fair:
-    ///
-    /// - A turn that ran a tool is skipped, because its completion tokens include
-    ///   the call's arguments, which never stream as text — the ratio would come
-    ///   out low and every rate after it high.
-    /// - A consult is skipped, by requiring that the usage belongs to the tier
-    ///   that is answering: a consultant's answer goes to a discard channel, so
-    ///   the characters to hand belong to somebody else.
-    /// - A reply too short to be a measurement is skipped, and the result is
-    ///   clamped, so one strange turn cannot spoil the figure for the session.
-    ///
-    /// The measurement is taken rather than read, so a report is paired with the
-    /// stream it belongs to and a later one cannot reuse an earlier reply's
-    /// characters.
     fn learn_chars_per_token(&mut self, tier: &str, completion_tokens: u64) {
         let streamed = std::mem::take(&mut self.stream_chars);
 
@@ -992,10 +887,6 @@ impl App {
 
     /// Drop the assistant message being streamed, if it is still the last thing
     /// in the transcript.
-    ///
-    /// Only that one is removed: anything after it came from a tool that really
-    /// ran, and the rollback between tiers undoes the conversation, not the
-    /// side effects.
     fn discard_streaming_message(&mut self) {
         if let Some(index) = self.streaming.take() {
             if index + 1 == self.messages.len() {
@@ -1051,9 +942,6 @@ impl App {
     }
 
     /// Act on a slash command.
-    ///
-    /// The ones whose state lives in the render loop are answered here; the rest
-    /// are handed to the agent, which owns the chain and the conversation.
     fn run_command(&mut self, name: &str, argument: &str) {
         // Anything with nowhere to go is reported rather than dropped.
         let send = |app: &mut App, command: Command| match &app.commands {
@@ -1256,10 +1144,6 @@ impl App {
     }
 
     /// Where the session's tokens went, tier by tier: what `/cost` shows.
-    ///
-    /// Reachable from the golden-loop fixture, which is the one test that can
-    /// assert on real tokens having been spent across a real spill.
-    /// `/why`: the last stall, with every counter it was decided against.
     pub(crate) fn describe_why(&self) -> String {
         let Some(verdict) = self.last_stall.as_ref() else {
             return "nothing has spilled this session, so there is nothing to explain".to_string();
@@ -1321,17 +1205,6 @@ impl App {
 }
 
 /// One line of token accounting for the transcript.
-///
-/// Cache figures are shown only when a provider reports them, so a tier with no
-/// cache reads the same as it always did. The numbers are grouped the same way
-/// the session panel groups them, because both are on screen at once and a
-/// figure that reads "15360" in one place and "15,360" in the other looks like
-/// two different numbers.
-/// Read `/allow`'s argument into the change it asks for.
-///
-/// `Ok(None)` is a bare `/allow`, which lists. `Err` carries what to say, so the
-/// one way of getting this wrong that has an obvious fix is explained rather than
-/// silently read as a rule.
 fn allow_change(argument: &str) -> Result<Option<AllowChange>, &'static str> {
     /// The one word that makes `save` unmistakable for a rule.
     const USAGE: &str = "usage: /allow save <words>, such as /allow save git status";
@@ -1388,11 +1261,6 @@ fn usage_line(usage: &crate::provider::Usage) -> String {
 }
 
 /// Render a saved conversation into the transcript the interface draws.
-///
-/// Deliberately lossy: the session file holds the conversation the models saw,
-/// not the notices and spinners the interface showed while producing it. What
-/// comes back is what was said and what was run, which is what someone returning
-/// to a session needs to see, without replaying tool activity frame by frame.
 fn render_session(messages: &[crate::session::ChatMessage]) -> Vec<Message> {
     use crate::session::Role as Wire;
 
@@ -1429,9 +1297,6 @@ fn render_session(messages: &[crate::session::ChatMessage]) -> Vec<Message> {
 }
 
 /// How long ago something happened, in the few words a one-line notice wants.
-///
-/// Coarse on purpose: "3h ago" is the useful fact, and a timestamp precise to
-/// the second would be read as an audit trail rather than a greeting.
 fn ago(saved_at: u64) -> String {
     let seconds = crate::session_store::now_epoch().saturating_sub(saved_at);
     match seconds {
@@ -2960,9 +2825,6 @@ mod tests {
     }
 
     /// An attached app whose tiers carry the given stuck policies.
-    ///
-    /// The receiver comes back with it: dropping it would close the channel, and
-    /// every command would then be refused as "no agent is running".
     fn app_with_policies(
         policies: &[OnStuck],
     ) -> (App, tokio::sync::mpsc::UnboundedReceiver<Command>) {

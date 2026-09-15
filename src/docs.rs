@@ -13,8 +13,6 @@ mod tests {
     use std::collections::BTreeSet;
 
     /// Every release in the changelog, with the section kinds it declares.
-    ///
-    /// A section is a `## ` heading; the kinds under it are its `### ` headings.
     fn sections() -> Vec<(String, Vec<String>)> {
         let text = include_str!("../CHANGELOG.md");
         let mut releases: Vec<(String, Vec<String>)> = Vec::new();

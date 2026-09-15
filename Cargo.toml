@@ -5,8 +5,8 @@ edition = "2024"
 rust-version = "1.85"
 description = "Agentic AI TUI that spills over across local and hosted models when a tier stalls"
 # The MSI installer takes the publisher's name from here, and it is shown to
-# anyone installing. Change it if you would rather publish a real name.
-authors = ["randallyash"]
+# anyone installing.
+authors = ["Randall Yash"]
 license = "MIT"
 repository = "https://github.com/randallyash/spillover"
 homepage = "https://github.com/randallyash/spillover"

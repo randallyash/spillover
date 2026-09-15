@@ -58,9 +58,6 @@ pub struct SessionFile {
     /// file name, so a load can confirm it found the right conversation.
     pub workspace: PathBuf,
     /// When this was written, as seconds since the Unix epoch.
-    ///
-    /// A plain integer rather than a formatted timestamp, so the file needs no
-    /// date library to read and a clock that is wrong cannot make it unreadable.
     pub saved_at: u64,
     /// The tier answering, by its configured id rather than its position, so
     /// reordering `config.toml` does not silently move the user elsewhere.
@@ -99,20 +96,11 @@ impl SessionFile {
     }
 
     /// Whether there is anything worth remembering.
-    ///
-    /// An empty session is not written; the file is removed instead. Otherwise
-    /// a session cleared with `/clear` would leave a file that resumes into an
-    /// empty conversation, which is a strange thing to be told you resumed.
     pub fn is_empty(&self) -> bool {
         self.messages.is_empty() && self.cli_sessions.is_empty()
     }
 
     /// The chain state this session was saved with.
-    ///
-    /// Kept here rather than at the call site so the mapping between the file
-    /// and the chain lives in one place: the two are written and read by
-    /// different modules, and a field added to one but not the other is exactly
-    /// the bug that would go unnoticed.
     pub fn chain_state(&self) -> ChainState {
         ChainState {
             active: self.active_tier.clone(),
@@ -132,8 +120,6 @@ pub struct SessionStore {
 
 impl SessionStore {
     /// The store for a workspace, under the platform's state directory.
-    ///
-    /// On Linux that is `~/.local/state/spill/sessions/<key>.json`.
     pub fn for_workspace(workspace: &Path) -> Result<Self, StoreError> {
         let dirs = directories::ProjectDirs::from("", "", "spill").ok_or(StoreError::NoStateDir)?;
         let dir = dirs
@@ -158,10 +144,6 @@ impl SessionStore {
     }
 
     /// Read the session, or `None` when there is not a usable one.
-    ///
-    /// Deliberately total: a missing, unreadable, corrupt, wrong-version, or
-    /// foreign file all mean "no session to resume", because the alternative is
-    /// an agent that will not start because of a file it does not need.
     pub fn load(&self) -> Option<SessionFile> {
         let text = std::fs::read_to_string(&self.path).ok()?;
         let file: SessionFile = serde_json::from_str(&text).ok()?;
@@ -178,10 +160,6 @@ impl SessionStore {
     }
 
     /// Write the session, atomically.
-    ///
-    /// Written to a sibling temporary file and renamed into place, so an
-    /// interrupted write cannot leave a half-serialised transcript behind — the
-    /// failure mode this has to avoid is resuming from a truncated file.
     pub fn save(&self, file: &SessionFile) -> io::Result<()> {
         if file.is_empty() {
             return self.clear();
@@ -214,12 +192,6 @@ impl SessionStore {
 }
 
 /// The file name for a workspace: a stable hash of its canonical path.
-///
-/// A hash rather than the path itself because a path is full of separators and
-/// can be longer than a file name is allowed to be. Canonicalised first so a
-/// symlinked or relative spelling of the same directory lands on one file;
-/// falling back to the path as given when canonicalisation is impossible, which
-/// is the normal case for a directory that does not exist yet.
 fn key_for(workspace: &Path) -> String {
     // FNV-1a, written out rather than taken from `DefaultHasher`, whose output
     // is explicitly not stable across Rust releases — a key that changes when
@@ -234,8 +206,6 @@ fn key_for(workspace: &Path) -> String {
 }
 
 /// Seconds since the Unix epoch, or zero if the clock is before it.
-///
-/// A clock set to 1970 or earlier is not worth failing a save over.
 pub fn now_epoch() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

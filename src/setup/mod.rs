@@ -21,48 +21,24 @@ use crate::setup::probe::{Found, Readiness, unserved_model};
 pub const MAX_ONLINE: usize = 2;
 
 /// The agent CLIs a first run will accept as a fallback, most likely first.
-///
-/// A *preference order among the ones actually installed* — the first on PATH
-/// wins and the rest are never looked at — so this says nothing about which is
-/// better. It is roughly by how common each is, because a first run should land
-/// on something the person already uses rather than on a niche one they happen
-/// to also have.
-///
-/// `command-code` is last on purpose. It is the harness you may be running spill
-/// inside, and quietly choosing it bills a plan the person is already using —
-/// fine to offer, not fine to pick for them.
 const FIRST_RUN_FALLBACKS: &[&str] = &[
     "claude",
     "codex",
     "gemini",
     "copilot",
     "cursor-agent",
-    "grok",
     "opencode",
     "crush",
     "command-code",
+    "grok",
 ];
 
 /// The first agent CLI on this machine, if there is one.
-///
-/// This is what makes a first run a *complete* setup instead of half of one.
-/// "Local until it isn't" has nowhere to spill to with a single tier, so the
-/// headline behaviour is inert until a second one exists — and the moment to
-/// add it is the moment someone has nothing configured, not after their first
-/// stalled turn.
-///
-/// `None` is a normal answer, not a failure: plenty of machines have no agent
-/// CLI installed, and an all-local chain is a legitimate way to run.
 pub fn first_run_fallback(library: &Library) -> Option<&Cli> {
     first_run_fallback_with(library, on_path)
 }
 
 /// The same question, with "is it installed" supplied.
-///
-/// `PATH` is process-wide and tests run in threads, so the one thing worth
-/// varying here — which CLIs exist on this machine — is passed in rather than
-/// read, and the ordering can be tested without one test's environment leaking
-/// into another's.
 fn first_run_fallback_with(library: &Library, installed: impl Fn(&str) -> bool) -> Option<&Cli> {
     FIRST_RUN_FALLBACKS.iter().find_map(|id| {
         let preset = library.cli.iter().find(|preset| preset.id == *id)?;
@@ -93,10 +69,6 @@ pub enum Step {
 impl Step {
     /// Whether this step is a text box, and so every printable key belongs to
     /// what is being typed rather than to a shortcut.
-    ///
-    /// Kept here so that adding a text step cannot leave it routed to the
-    /// shortcut keys by omission — which would swallow what the user typed and
-    /// could fire `w` or `q` from inside an address.
     pub fn accepts_text(self) -> bool {
         matches!(
             self,
@@ -299,12 +271,6 @@ impl Wizard {
 
     /// The hosted endpoint waiting on a model choice, as its id, address, and
     /// the environment variable its key comes from.
-    ///
-    /// The id returned is the *choice's*, not the preset's. They are the same
-    /// for a shipped preset, but a typed endpoint has no preset and carries an
-    /// empty one — so returning the preset id named the custom endpoint `""` and
-    /// the model list fetched for it was discarded as belonging to someone else,
-    /// leaving the screen asking forever.
     pub fn pending_endpoint(&self) -> Option<(String, String, Option<String>)> {
         let choice = self.pending.as_ref()?;
         match &choice.source {
@@ -449,12 +415,6 @@ impl Wizard {
     }
 
     /// Why the config cannot be written yet, if it cannot.
-    ///
-    /// The README promises that every choice is checked before anything is
-    /// written. Until now nothing enforced it: a failed check was only drawn, and
-    /// `w` wrote regardless, so a tier that could not answer — a typed model id
-    /// the endpoint does not serve, a CLI that is not installed — reached the
-    /// config and failed on the first turn instead of here.
     pub fn write_blocked(&self) -> Option<String> {
         if self.tiers().is_empty() {
             return Some("no tiers chosen yet, so there is nothing to write".to_string());
@@ -480,15 +440,6 @@ impl Wizard {
     }
 
     /// The endpoint whose model list still needs asking for, if any.
-    ///
-    /// The only place that decides whether to ask, so the answer cannot be asked
-    /// for repeatedly: once it lands, `models_loading` is false and this stops
-    /// saying yes.
-    ///
-    /// Without that, the wizard re-requested the list on every arrival while the
-    /// model step was open — a request per round trip against the endpoint, and
-    /// a cursor that snapped back to the top each time, which made "type it
-    /// myself" unreachable behind a list that kept re-selecting its first row.
     pub fn wants_models(&self) -> Option<(String, String, Option<String>)> {
         if self.step != Step::ChooseModel || !self.models_loading {
             return None;
@@ -760,9 +711,6 @@ fn check_url(url: &str) -> Result<(), String> {
 }
 
 /// The tier for a local server that was found running.
-///
-/// Used when spill starts with no configuration at all: rather than making
-/// someone configure a thing that is already working, it uses it and says so.
 pub fn tier_for_local(found: &Found) -> Tier {
     make_tier(
         "local",
@@ -777,9 +725,6 @@ pub fn tier_for_local(found: &Found) -> Tier {
 }
 
 /// The tier for an agent CLI that was found on PATH.
-///
-/// Same shape the wizard writes for the same choice — the preset id as the tier
-/// id, and no model, because a CLI tier's model is the CLI's own business.
 pub fn tier_for_cli(preset: &Cli) -> Tier {
     make_tier(
         &preset.id,
@@ -840,9 +785,6 @@ fn make_tier(
 }
 
 /// Write the config, keeping a copy of whatever was there before.
-///
-/// Written to a temporary file and renamed into place, so an interrupted setup
-/// cannot leave a half-written config behind.
 pub fn write_config(path: &Path, text: &str) -> io::Result<Option<PathBuf>> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -1911,13 +1853,16 @@ mod first_run_tests {
 
     #[test]
     fn the_fallback_is_chosen_in_the_declared_order_not_the_library_order() {
-        // The library happens to list `command-code` first, which is the last
-        // thing a first run should pick. Both are installed; the preference
-        // order is what decides.
+        // The library happens to list `command-code` first. Both are installed;
+        // the preference order is what decides, and command-code is the cheaper
+        // of the two, so it wins over grok.
         let library = Library::embedded();
         let chosen = first_run_fallback_with(&library, only(&["grok", "cmd"]));
 
-        assert_eq!(chosen.map(|preset| preset.id.as_str()), Some("grok"));
+        assert_eq!(
+            chosen.map(|preset| preset.id.as_str()),
+            Some("command-code")
+        );
     }
 
     #[test]

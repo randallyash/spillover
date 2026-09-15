@@ -51,6 +51,9 @@ impl OpenAiProvider {
             "model": request.model,
             "messages": messages,
             "stream": true,
+            // Several providers only attach usage to the stream if asked. Without
+            // this the sidebar can sit at zero and look like a bug.
+            "stream_options": { "include_usage": true },
         });
 
         if !request.tools.is_empty() {
@@ -203,11 +206,6 @@ struct PartialToolCall {
 }
 
 /// Assembles a turn out of streaming frames.
-///
-/// Tool calls are collected rather than emitted as they arrive: they are only
-/// safe to act on once the arguments are complete, and they arrive split across
-/// many frames keyed by `index`, sometimes with the id or name in only the
-/// first one.
 #[derive(Debug, Default)]
 pub struct StreamAccumulator {
     text: String,
@@ -332,10 +330,6 @@ impl StreamAccumulator {
 }
 
 /// Ask an OpenAI-compatible endpoint which models it serves, and take the first.
-///
-/// This is what makes an empty `model` in the config work for a local server:
-/// whatever the user has loaded is the right answer, and they should not have to
-/// type its id.
 pub async fn first_model(base_url: &str, api_key: Option<&str>) -> Result<String, String> {
     let url = format!("{}/models", base_url.trim_end_matches('/'));
     list_models(base_url, api_key)
@@ -346,9 +340,6 @@ pub async fn first_model(base_url: &str, api_key: Option<&str>) -> Result<String
 }
 
 /// Every model an OpenAI-compatible endpoint advertises.
-///
-/// Used by discovery and by the setup wizard's reachability check, which is why
-/// it returns the whole list rather than just the first id.
 pub async fn list_models(base_url: &str, api_key: Option<&str>) -> Result<Vec<String>, String> {
     let url = format!("{}/models", base_url.trim_end_matches('/'));
     let client = reqwest::Client::builder()
@@ -507,6 +498,22 @@ mod tests {
     }
 
     #[test]
+    fn records_usage_from_a_trailing_usage_only_frame() {
+        // What `stream_options.include_usage` actually produces: a last frame
+        // with empty choices and the usage object, not usage glued onto a delta.
+        let accumulator = accumulate(&[
+            r#"{"choices":[{"delta":{"content":"x"}}]}"#,
+            r#"{"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":7}}"#,
+        ]);
+        let usage = accumulator
+            .finish()
+            .usage
+            .expect("usage should be recorded");
+        assert_eq!(usage.prompt_tokens, 11);
+        assert_eq!(usage.completion_tokens, 7);
+    }
+
+    #[test]
     fn ignores_done_empty_and_unparseable_frames() {
         let accumulator = accumulate(&[
             "[DONE]",
@@ -586,8 +593,21 @@ mod tests {
         };
         let body = provider.build_body(&request);
         assert_eq!(body["stream"], true);
+        assert_eq!(body["stream_options"]["include_usage"], true);
         assert_eq!(body["tool_choice"], "auto");
         assert_eq!(body["tools"][0]["function"]["name"], "read_file");
+    }
+
+    #[test]
+    fn asks_the_endpoint_for_usage_on_the_stream() {
+        let provider = OpenAiProvider::new("Local", "http://localhost:1234/v1", None);
+        let request = ChatRequest {
+            model: "m".to_string(),
+            messages: vec![ChatMessage::user("hi")],
+            tools: Vec::new(),
+        };
+        let body = provider.build_body(&request);
+        assert_eq!(body["stream_options"]["include_usage"], true);
     }
 
     #[test]

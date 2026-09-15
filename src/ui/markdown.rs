@@ -432,10 +432,6 @@ fn words(segments: &[(String, Style)], fallback: Style) -> Vec<(String, Style)> 
 
 /// Greedy word wrap. A word too long for a whole line is split at the edge,
 /// because the alternative is overflow.
-///
-/// The queue is what makes the over-long case correct: the tail of a split word
-/// is put back at the front to be measured again, so it lands immediately after
-/// the piece that was just emitted rather than somewhere else in the paragraph.
 fn wrap_words(words: &[(String, Style)], width: usize) -> Vec<Vec<Span<'static>>> {
     use std::collections::VecDeque;
 

@@ -209,9 +209,6 @@ async fn main() {
 }
 
 /// How long the wizard waits for an endpoint to list its models.
-///
-/// The same figure the tier checks use: one round trip to a hosted endpoint,
-/// with room for a slow one.
 const MODELS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 async fn run(mut config: Config) -> io::Result<()> {
@@ -388,10 +385,6 @@ async fn run(mut config: Config) -> io::Result<()> {
 }
 
 /// Await the next item from a channel that may have been put away.
-///
-/// `None` disables the branch entirely. Without this a closed channel would
-/// keep resolving with `None` and win every `select!`, starving the others —
-/// which is exactly how the wizard's checks failed to appear.
 async fn next_or_pending<T>(slot: &mut Option<UnboundedReceiver<T>>) -> Option<T> {
     match slot {
         Some(receiver) => receiver.recv().await,
@@ -421,14 +414,6 @@ enum AgentStart {
 }
 
 /// Build the chain and start the agent.
-///
-/// Every tier kind is supported and nothing is dropped quietly: a tier that
-/// cannot be built stops startup with the reason, rather than shortening the
-/// chain into a fallback that never happens.
-///
-/// `resume` is the session saved for this workspace, when there is one. It is
-/// what makes this the interactive path: a run that was given a session to
-/// resume is the same run that writes one back.
 async fn start_agent(config: &Config, resume: Option<&SessionFile>) -> AgentStart {
     let workspace = config.general.workspace_path();
     let library = crate::preset::Library::embedded();
@@ -492,7 +477,7 @@ async fn start_agent(config: &Config, resume: Option<&SessionFile>) -> AgentStar
     let (commands, events) = crate::agent::spawn_seeded(
         AgentConfig {
             workspace,
-            max_steps: crate::agent::DEFAULT_MAX_STEPS,
+            max_steps: config.general.max_steps,
             cancel: canceller.clone(),
             store,
             log,
@@ -500,7 +485,9 @@ async fn start_agent(config: &Config, resume: Option<&SessionFile>) -> AgentStar
             origin: config.origin.clone(),
         },
         chain,
-        Arc::new(Registry::with_default_tools()),
+        Arc::new(Registry::with_shell_timeout(
+            std::time::Duration::from_secs(config.general.shell_timeout_secs),
+        )),
         Arc::new(UiApprover::new(approval_tx)),
         seed,
     );
@@ -754,9 +741,6 @@ async fn run_wizard(path: PathBuf) -> io::Result<Option<PathBuf>> {
 }
 
 /// Write the config and mark the wizard finished.
-///
-/// A failure is reported in the wizard rather than by dropping out of the
-/// terminal, so the user keeps their choices and can try somewhere else.
 fn write_and_finish(wizard: &mut Wizard, path: &std::path::Path) {
     match crate::setup::write_config(path, &wizard.to_toml()) {
         Ok(_) => wizard.written = Some(path.to_path_buf()),
@@ -767,9 +751,6 @@ fn write_and_finish(wizard: &mut Wizard, path: &std::path::Path) {
 }
 
 /// Owns raw mode and the alternate screen, and always gives them back.
-///
-/// Restoring in `Drop` means a panic or an early return still leaves the user
-/// with a usable shell rather than a wedged terminal.
 struct TerminalGuard;
 
 impl TerminalGuard {

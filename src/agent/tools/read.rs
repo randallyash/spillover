@@ -28,7 +28,7 @@ impl Tool for ReadFile {
             json!({
                 "path": {
                     "type": "string",
-                    "description": "Path to the file, relative to the workspace or absolute."
+                    "description": "Path to the file, relative to the workspace. An absolute path is accepted only when it stays inside the workspace."
                 },
                 "offset": {
                     "type": "integer",
@@ -60,12 +60,15 @@ impl Tool for ReadFile {
             Ok(path) => path,
             Err(error) => return error,
         };
-        let path = resolve(workspace, raw);
+        let path = match resolve(workspace, raw) {
+            Ok(path) => path,
+            Err(error) => return error,
+        };
 
         let text = match tokio::fs::read_to_string(&path).await {
             Ok(text) => text,
             Err(error) => {
-                return ToolOutcome::error(format!("could not read {}: {error}", path.display()));
+                return ToolOutcome::io(format!("could not read {}", path.display()), &error);
             }
         };
 
@@ -222,6 +225,18 @@ mod tests {
         let outcome = tool().run(&json!({}), &workspace).await;
         assert!(outcome.is_error);
         assert!(outcome.content.contains("path"), "{}", outcome.content);
+    }
+
+    #[tokio::test]
+    async fn a_path_outside_the_workspace_is_refused() {
+        let (_dir, workspace) = workspace_with("x");
+        let outcome = tool().run(&json!({"path": "/etc/hosts"}), &workspace).await;
+        assert!(outcome.is_error);
+        assert!(
+            outcome.content.contains("outside the workspace"),
+            "{}",
+            outcome.content
+        );
     }
 
     #[test]

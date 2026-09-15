@@ -26,7 +26,7 @@ impl Tool for WriteFile {
             json!({
                 "path": {
                     "type": "string",
-                    "description": "Path to write, relative to the workspace or absolute."
+                    "description": "Path to write, relative to the workspace. An absolute path is accepted only when it stays inside the workspace."
                 },
                 "content": {
                     "type": "string",
@@ -49,7 +49,10 @@ impl Tool for WriteFile {
         let Ok(content) = args.required_text("content") else {
             return format!("write {raw} (content missing)");
         };
-        let path = resolve(workspace, raw);
+        let path = match resolve(workspace, raw) {
+            Ok(path) => path,
+            Err(error) => return error.content,
+        };
         let incoming = content.len();
 
         match tokio::fs::metadata(&path).await {
@@ -72,7 +75,10 @@ impl Tool for WriteFile {
             Ok(content) => content,
             Err(error) => return error,
         };
-        let path = resolve(workspace, raw);
+        let path = match resolve(workspace, raw) {
+            Ok(path) => path,
+            Err(error) => return error,
+        };
         let content = content.to_string();
 
         // Read before the write, which is the only moment the old bytes exist.
@@ -85,16 +91,16 @@ impl Tool for WriteFile {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 if let Err(error) = tokio::fs::create_dir_all(parent).await {
-                    return ToolOutcome::error(format!(
-                        "could not create {}: {error}",
-                        parent.display()
-                    ));
+                    return ToolOutcome::io(
+                        format!("could not create {}", parent.display()),
+                        &error,
+                    );
                 }
             }
         }
 
         if let Err(error) = tokio::fs::write(&path, &content).await {
-            return ToolOutcome::error(format!("could not write {}: {error}", path.display()));
+            return ToolOutcome::io(format!("could not write {}", path.display()), &error);
         }
 
         let verb = match previous {
@@ -247,6 +253,27 @@ mod tests {
         assert!(
             !dir.path().join("brand").exists(),
             "and so should the directory it created"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_path_outside_the_workspace_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outcome = WriteFile
+            .run(
+                &json!({"path": "/tmp/spill-outside.txt", "content": "nope"}),
+                dir.path(),
+            )
+            .await;
+        assert!(outcome.is_error);
+        assert!(
+            outcome.content.contains("outside the workspace"),
+            "{}",
+            outcome.content
+        );
+        assert!(
+            !std::path::Path::new("/tmp/spill-outside.txt").exists(),
+            "must not have written outside the workspace"
         );
     }
 

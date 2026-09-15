@@ -56,14 +56,6 @@ impl Readiness {
 }
 
 /// Whether an endpoint cannot serve a model id it was asked for.
-///
-/// `None` when it can — or when the endpoint does not say which models it
-/// serves. An endpoint that lists nothing tells us nothing, and refusing there
-/// would block the case this fallback exists for: a gateway that answers chat
-/// completions without advertising its models.
-///
-/// This is the one place the question is answered, so the wizard's text step,
-/// the review screen and `spill doctor` cannot disagree about it.
 pub fn unserved_model(models: &[String], typed: &str) -> Option<String> {
     if models.is_empty() || models.iter().any(|model| model == typed) {
         return None;
@@ -83,10 +75,6 @@ pub fn unserved_model(models: &[String], typed: &str) -> Option<String> {
 }
 
 /// The advertised ids closest to what was typed, best first.
-///
-/// A mistyped model id is nearly always a near miss — a transposition, a
-/// missing separator, the wrong case — so naming a couple of candidates is worth
-/// far more than a bare refusal.
 fn closest(models: &[String], typed: &str) -> Vec<String> {
     let needle = typed.to_lowercase();
     let mut scored: Vec<(usize, &String)> = models
@@ -110,9 +98,6 @@ fn closest(models: &[String], typed: &str) -> Vec<String> {
 }
 
 /// Levenshtein distance, for "did you mean".
-///
-/// Model ids are short, so the quadratic cost is irrelevant next to saving
-/// someone from a typo that would only surface as a 404 mid-conversation.
 fn distance(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
@@ -133,9 +118,6 @@ fn distance(a: &str, b: &str) -> usize {
 }
 
 /// Probe the given local servers, keeping the ones that answered.
-///
-/// Concurrent, so a machine where nothing is running does not take four
-/// timeouts to find out.
 pub async fn find_local(candidates: &[Endpoint]) -> Vec<Found> {
     let probes = candidates.iter().map(|preset| async move {
         let answer = tokio::time::timeout(LOCAL_TIMEOUT, list_models(&preset.base_url, None)).await;

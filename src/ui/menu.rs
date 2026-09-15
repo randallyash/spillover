@@ -18,22 +18,9 @@ use crate::ui::centered;
 use crate::ui::theme::Theme;
 
 /// How wide the menu will grow.
-///
-/// Wide enough that the longest command and its summary fit on one row at a
-/// normal terminal size; narrower terminals clip the summary, which is the part
-/// that can be spared.
 const MENU_MAX_WIDTH: u16 = 96;
 const MENU_MIN_WIDTH: u16 = 40;
 /// Rows of menu before it starts scrolling: one more than the catalogue holds.
-///
-/// Derived from the catalogue rather than written down, because the two drifting
-/// apart is exactly how a command becomes unreachable without anyone noticing —
-/// a hard-coded 12 once hid `/quit` the same way. The menu scrolls, so a command
-/// below the fold is still reachable; the point of the extra row is that adding
-/// one should not be what puts another out of sight.
-///
-/// A ceiling rather than a target: what actually decides is the room above the
-/// prompt, so the menu never pushes the conversation off screen.
 fn menu_max_rows() -> usize {
     commands::CATALOGUE.len() + 1
 }
@@ -363,10 +350,6 @@ mod tests {
     }
 
     /// Print the popups, to look at them without running spill.
-    ///
-    /// ```text
-    /// cargo test print_the_popups -- --ignored --nocapture
-    /// ```
     #[test]
     #[ignore = "prints the popups to look at; asserts nothing"]
     fn print_the_popups() {

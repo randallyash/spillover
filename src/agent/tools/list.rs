@@ -29,8 +29,9 @@ impl Tool for ListDir {
             json!({
                 "path": {
                     "type": "string",
-                    "description": "Directory to list, relative to the workspace or absolute. \
-                                    Defaults to the workspace root."
+                    "description": "Directory to list, relative to the workspace. An absolute path \
+                                    is accepted only when it stays inside the workspace. Defaults \
+                                    to the workspace root."
                 }
             }),
             &[],
@@ -50,12 +51,15 @@ impl Tool for ListDir {
 
     async fn run(&self, arguments: &Value, workspace: &Path) -> ToolOutcome {
         let raw = Args::new(arguments).optional_str("path").unwrap_or(".");
-        let path = resolve(workspace, raw);
+        let path = match resolve(workspace, raw) {
+            Ok(path) => path,
+            Err(error) => return error,
+        };
 
         let mut entries = match tokio::fs::read_dir(&path).await {
             Ok(entries) => entries,
             Err(error) => {
-                return ToolOutcome::error(format!("could not list {}: {error}", path.display()));
+                return ToolOutcome::io(format!("could not list {}", path.display()), &error);
             }
         };
 

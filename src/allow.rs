@@ -12,25 +12,12 @@
 //! allow-list.
 
 /// Characters that mean a line is something other than a list of words.
-///
-/// Every one of these can make a line mean something its words do not say: `;`
-/// and `&&` add a command, a pipe hands the output to another program, `>`
-/// writes a file, `$` and a backtick run one, the quotes can hide any of them,
-/// and the glob characters change which file a word names.
-///
-/// Checked against the whole command and against a rule itself, and the answer is
-/// always the same: not covered. So a character that turns out to be harmless in
-/// some position costs a question, never an execution.
 const OPERATORS: &[char] = &[
     ';', '&', '|', '<', '>', '`', '$', '\\', '(', ')', '{', '}', '[', ']', '*', '?', '~', '"',
     '\'', '\n', '\r',
 ];
 
 /// A command that may run without asking: the words a line must begin with.
-///
-/// One word covers anything starting with it — a rule for `ls` covers
-/// `ls -la src` — so a rule names a program, or a program and its subcommand
-/// where the program has one that matters (`git status`, never plain `git`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rule {
     words: Vec<String>,
@@ -38,9 +25,6 @@ pub struct Rule {
 
 impl Rule {
     /// Read a rule from what a person typed or wrote in a config.
-    ///
-    /// The one validator: `Config` uses it to reject a bad line at startup, and
-    /// `/allow` uses it to explain a bad one as it is typed.
     pub fn parse(text: &str) -> Result<Self, String> {
         let words: Vec<String> = text.split_whitespace().map(str::to_string).collect();
 
@@ -93,10 +77,6 @@ pub struct AllowRules {
 
 impl AllowRules {
     /// The rules a configuration asks for.
-    ///
-    /// A rule that will not parse is dropped rather than carried: `Config` refuses
-    /// one at startup, so this is the backstop for anything that reaches here by
-    /// another route, and the safe direction is to ask.
     pub fn new(config: &[String]) -> Self {
         Self {
             from_config: config
@@ -116,9 +96,6 @@ impl AllowRules {
     }
 
     /// Stick a rule for the rest of the session.
-    ///
-    /// `false` when it is already in force, so `/allow` can say so rather than
-    /// pretend something changed.
     pub fn add_session(&mut self, rule: Rule) -> bool {
         if self.session.contains(&rule) || self.from_config.contains(&rule) {
             return false;
@@ -135,9 +112,6 @@ impl AllowRules {
     }
 
     /// The rules split by where they came from, in the order they are tried.
-    ///
-    /// For the listing, which has to show the difference between a rule that
-    /// lasts until the file changes and one that lasts until spill exits.
     pub fn texts_by_source(&self) -> (Vec<String>, Vec<String>) {
         (
             self.from_config.iter().map(Rule::text).collect(),
@@ -146,10 +120,6 @@ impl AllowRules {
     }
 
     /// Every rule in force as it would be written down.
-    ///
-    /// What `/allow save` persists. The whole list rather than the new rule,
-    /// because the key *is* the list: writing one rule would drop the read-only
-    /// set that was in force a moment ago.
     pub fn texts(&self) -> Vec<String> {
         let (mut from_config, session) = self.texts_by_source();
         from_config.extend(session);
@@ -157,9 +127,6 @@ impl AllowRules {
     }
 
     /// Whether this is exactly what a configuration saying nothing would give.
-    ///
-    /// The report prints the rules when it is not, on the same reasoning as the
-    /// stuck policy: what is worth showing is the choice somebody made.
     pub fn is_default(&self) -> bool {
         self.session.is_empty()
             && self
@@ -175,17 +142,6 @@ impl AllowRules {
 }
 
 /// The commands that run unasked before anyone has said anything.
-///
-/// Each is read-only by construction, and each is the shell spelling of something
-/// spill already does without asking — `read_file`, `list_dir`, `glob` and `grep`
-/// are all `Risk::Read` and never reach the approver — so this list adds no reach
-/// the agent did not have. What it removes is a prompt.
-///
-/// Deliberately absent, because a word-prefix rule cannot save a command that has
-/// a flag for it: `find` (`-delete` deletes, `-exec` runs), `sort` (`-o` writes),
-/// `sed` (reads until `-i`), `xargs`, `awk` (`system`), `make`, `cargo`, `npm`,
-/// `python`. Leaving them out costs a question; putting them in would be a hole
-/// shaped like a flag.
 pub const READ_ONLY_SHELL: &[&str] = &[
     // Reading and listing: the reach of read_file and list_dir.
     "ls",

@@ -15,10 +15,6 @@ pub enum InputEvent {
 }
 
 /// Read terminal events on a blocking thread and forward them to the UI loop.
-///
-/// A single long-lived thread is used deliberately: spawning a blocking task per
-/// iteration would leave orphans racing each other on `event::read()`, which
-/// loses keystrokes.
 pub fn spawn_input_thread(tx: UnboundedSender<InputEvent>) {
     std::thread::spawn(move || {
         while let Ok(event) = event::read() {

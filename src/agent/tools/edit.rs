@@ -30,7 +30,7 @@ impl Tool for EditFile {
             json!({
                 "path": {
                     "type": "string",
-                    "description": "Path to the file to change."
+                    "description": "Path to the file to change, relative to the workspace. An absolute path is accepted only when it stays inside the workspace."
                 },
                 "old_string": {
                     "type": "string",
@@ -62,7 +62,10 @@ impl Tool for EditFile {
         ) else {
             return "edit a file (arguments incomplete)".to_string();
         };
-        let path = resolve(workspace, raw);
+        let path = match resolve(workspace, raw) {
+            Ok(path) => path,
+            Err(error) => return error.content,
+        };
 
         let occurrences = match tokio::fs::read_to_string(&path).await {
             Ok(text) => count_matches(&text, old),
@@ -98,7 +101,10 @@ impl Tool for EditFile {
             Err(error) => return error,
         };
         let replace_all = args.optional_bool("replace_all");
-        let path = resolve(workspace, raw);
+        let path = match resolve(workspace, raw) {
+            Ok(path) => path,
+            Err(error) => return error,
+        };
 
         // An empty search string would match everywhere and corrupt the file.
         if old.is_empty() {
@@ -115,7 +121,7 @@ impl Tool for EditFile {
         let text = match tokio::fs::read_to_string(&path).await {
             Ok(text) => text,
             Err(error) => {
-                return ToolOutcome::error(format!("could not read {}: {error}", path.display()));
+                return ToolOutcome::io(format!("could not read {}", path.display()), &error);
             }
         };
 
@@ -151,7 +157,7 @@ impl Tool for EditFile {
         );
 
         if let Err(error) = tokio::fs::write(&path, &updated).await {
-            return ToolOutcome::error(format!("could not write {}: {error}", path.display()));
+            return ToolOutcome::io(format!("could not write {}", path.display()), &error);
         }
 
         ToolOutcome::ok(format!(

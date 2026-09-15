@@ -12,11 +12,16 @@ use crate::provider::dialect::Dialect;
 /// The only configuration schema this build understands.
 const SUPPORTED_SCHEMA: u32 = 1;
 
+/// Default cap on tool steps in a single turn.
+pub const DEFAULT_MAX_STEPS: usize = 32;
+
+/// Default number of seconds a `run_shell` command may run.
+pub const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 300;
+
+/// Ceiling on a per-call `timeout_secs`, so a model cannot hang a turn forever.
+pub const MAX_SHELL_TIMEOUT_SECS: u64 = 1_800;
+
 /// How many consults a tier gets per turn unless it says otherwise.
-///
-/// One source of truth, because the config default and the programmatic
-/// construction of a tier have to agree: a tier built with a different cap from
-/// the one its config file implies would be a difference nobody could see.
 pub const DEFAULT_CONSULTS_PER_TURN: u32 = 2;
 
 #[derive(Debug, Error)]
@@ -55,10 +60,6 @@ pub enum ConfigError {
 }
 
 /// Guidance for the errors people actually hit.
-///
-/// The phrasing is matched against the TOML parser's own wording, which differs
-/// by what follows the backslash: `\U` reports too few unicode digits, while
-/// `\m` reports a missing escaped value.
 fn parse_hint(error: &toml::de::Error) -> &'static str {
     let message = error.to_string();
     if message.contains("escaped value") || message.contains("unicode value digits") {
@@ -78,13 +79,6 @@ pub struct Config {
     #[serde(default, rename = "tier")]
     pub tiers: Vec<Tier>,
     /// Where this configuration came from, recorded by `load`.
-    ///
-    /// Not part of the file, and not re-derivable afterwards: a missing default
-    /// path and a found one both produce a `Config` that is perfectly valid, and
-    /// the difference is the first thing anyone asks when the run does not
-    /// behave like the file they edited. Kept here rather than worked out again
-    /// by whoever reports it, because a second copy of the resolution rules is a
-    /// second chance to be confidently wrong about it.
     #[serde(skip)]
     pub origin: Origin,
 }
@@ -124,10 +118,6 @@ impl Origin {
     }
 
     /// The configuration file a command can write a rule into.
-    ///
-    /// Each way there can be no file wants different advice, so the refusal says
-    /// which one it is: not set up yet is a thing to run, and no file at all is a
-    /// thing to know.
     pub fn writable_path(&self) -> Result<&Path, String> {
         match self {
             Self::Given(path) | Self::Found(path) => Ok(path),
@@ -145,11 +135,6 @@ impl Origin {
     }
 
     /// Which origin a load produced, from the two facts it has.
-    ///
-    /// `required` is whether the path was named by `--config`, which is also
-    /// whether a missing file is an error rather than a first run. Kept out of
-    /// `load` so the three cases can be tested without a test moving the default
-    /// path, which means reaching into the environment every test shares.
     fn after_load(path: &Path, required: bool, read: bool) -> Self {
         match (read, required) {
             (true, true) => Self::Given(path.to_path_buf()),
@@ -168,14 +153,15 @@ pub struct General {
     #[serde(default = "default_true")]
     pub sticky_fallback: bool,
     /// Shell commands that may run without being asked about.
-    ///
-    /// The default is the read-only set in [`crate::allow`], and the value *is*
-    /// the list, which gives the key three honest states: absent means those,
-    /// written out means the ones you chose, and `[]` means ask about everything.
-    /// Rules added at runtime with `/allow` are not here — they last for the
-    /// session, and `/allow save` is what writes them back to this file.
     #[serde(default = "default_allow_shell")]
     pub allow_shell: Vec<String>,
+    /// How many tool steps a turn may take before it is judged stuck.
+    #[serde(default = "default_max_steps")]
+    pub max_steps: usize,
+    /// How many seconds a `run_shell` command may run unless the call names
+    /// `timeout_secs` of its own.
+    #[serde(default = "default_shell_timeout_secs")]
+    pub shell_timeout_secs: u64,
 }
 
 impl Default for General {
@@ -184,6 +170,8 @@ impl Default for General {
             workspace: default_workspace(),
             sticky_fallback: true,
             allow_shell: default_allow_shell(),
+            max_steps: default_max_steps(),
+            shell_timeout_secs: default_shell_timeout_secs(),
         }
     }
 }
@@ -230,23 +218,8 @@ impl fmt::Display for TierKind {
 #[serde(rename_all = "lowercase")]
 pub enum OnStuck {
     /// Abandon this tier and hand the whole turn to the next one.
-    ///
-    /// What a chain of one always gets, since there is nothing below to consult,
-    /// and what you ask for when the honest answer really is "someone else should
-    /// finish this". Set it with `on_stuck = "escalate"` on a tier, or for the
-    /// rest of a session with `/on-stuck escalate`.
     Escalate,
     /// Keep this tier driving, and ask the next one a narrow question about it.
-    ///
-    /// The default, because escalating is the expensive mistake: the turn goes to
-    /// the frontier, and once a tier has spilled the session stays there — one
-    /// bad turn costs the cheap model for every turn after it. A consult spends
-    /// one question on the tier below and the driver carries on with the answer.
-    ///
-    /// It only pays off when the answer is something the driver can act on, so
-    /// spill escalates anyway when the answer comes back empty, when the consult
-    /// fails, or when the cap is spent: a turn can never be stranded by it. See
-    /// `consult.rs`.
     #[default]
     Consult,
 }
@@ -290,13 +263,6 @@ pub struct Tier {
     pub approve_args: Vec<String>,
     /// Flags that make this CLI read-only for a single run — a plan mode, a
     /// sandbox policy, a Q&A mode.
-    ///
-    /// Used only for a consult. A CLI runs its own harness and its own tools,
-    /// which spill cannot withhold the way it can for an `openai` endpoint, so
-    /// a read-only flag is the only way to keep a consultant from acting
-    /// instead of answering. A tier with none is not consulted at all: the
-    /// turn escalates instead. The shipped presets set this wherever the CLI
-    /// has such a flag.
     #[serde(default)]
     pub read_only_args: Vec<String>,
     #[serde(default)]
@@ -321,11 +287,6 @@ pub struct Tier {
     #[serde(default)]
     pub on_stuck: OnStuck,
     /// How many times this tier may consult within a single turn.
-    ///
-    /// The cap exists for the same reason the step limit does: a driver stuck in
-    /// a loop would otherwise be able to spin the frontier indefinitely, and each
-    /// consult is a frontier call. Once it is spent, the turn escalates, which is
-    /// the behaviour that always terminates.
     #[serde(
         default = "default_consults_per_turn",
         deserialize_with = "consults_per_turn"
@@ -336,10 +297,6 @@ pub struct Tier {
 }
 
 /// A missing cap takes the default; a present zero is refused.
-///
-/// Zero would mean "consult is configured but never happens", which is more
-/// likely a mistake than a request. Leaving the key out is how you accept the
-/// default, and `on_stuck = "escalate"` is how you turn consult off.
 fn consults_per_turn<'de, D>(deserializer: D) -> Result<u32, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -361,12 +318,6 @@ impl Tier {
 }
 
 /// The limits a tier is judged by at runtime.
-///
-/// `Default` is the **hosted** profile, and that is deliberate: it is what every
-/// tier got before there was more than one, so the call sites that do not care
-/// about the distinction — tests, and a tier built by hand — keep the behaviour
-/// they had. A tier from configuration gets its class's profile instead, through
-/// `LimitOverrides::resolve`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     pub first_token_timeout_ms: u64,
@@ -381,28 +332,16 @@ impl Default for Limits {
 }
 
 /// Where a tier's model actually is, which decides the timeouts it is judged by.
-///
-/// One profile cannot fit both ends: a 30B loading into a 5090's VRAM may need a
-/// minute before its first token, while a local server that goes quiet *once it
-/// is streaming* is more likely to have wedged than a hosted one is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TierClass {
     /// A model server on this machine or the LAN.
     Local,
     /// Reached over the network — a hosted endpoint, or a CLI tier.
-    ///
-    /// A CLI harness runs locally but reaches a remote model, and its first line
-    /// of output includes the harness starting up (`cmd` pays ~15k tokens of its
-    /// own prompt on every call). That is slow for reasons a local server is not,
-    /// so a CLI keeps the hosted numbers.
     Hosted,
 }
 
 impl TierClass {
     /// Classify a tier by where its endpoint lives.
-    ///
-    /// Loopback, the private ranges, link-local, and mDNS names mean the model is
-    /// on this machine or the LAN. Anything else is reached over the network.
     pub fn of_endpoint(base_url: &str) -> Self {
         let host = host_of(base_url);
         if is_local_host(&host) {
@@ -441,11 +380,6 @@ impl TierClass {
 }
 
 /// The limits a tier's config asks for.
-///
-/// Every field is optional so an omitted value falls through to its *class*
-/// default rather than to one global number. A tier that writes only
-/// `idle_timeout_ms` keeps the patient first-token budget its locality implies,
-/// which is the whole point — that value is the one a slow 30B needs.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct LimitOverrides {
     #[serde(default)]
@@ -472,10 +406,6 @@ impl LimitOverrides {
 }
 
 /// The host part of a base URL, lowercased.
-///
-/// Hand-rolled rather than pulled from a URL crate: `base_url` is whatever the
-/// user wrote, it may have no scheme at all, and the only question being asked is
-/// whether the host is on this machine or the LAN.
 fn host_of(base_url: &str) -> String {
     let rest = match base_url.find("://") {
         Some(at) => &base_url[at + 3..],
@@ -578,10 +508,15 @@ fn default_allow_shell() -> Vec<String> {
         .collect()
 }
 
+fn default_max_steps() -> usize {
+    DEFAULT_MAX_STEPS
+}
+
+fn default_shell_timeout_secs() -> u64 {
+    DEFAULT_SHELL_TIMEOUT_SECS
+}
+
 /// A TOML array holding the rules.
-///
-/// Every rule is a bare token — `Rule::parse` refuses quotes, backslashes and
-/// control characters — so quoting each one is the whole job.
 fn toml_array(rules: &[String]) -> String {
     let quoted: Vec<String> = rules.iter().map(|rule| format!("{rule:?}")).collect();
     format!("[{}]", quoted.join(", "))
@@ -615,10 +550,6 @@ fn ending_of(line: &str) -> &'static str {
 }
 
 /// Replace the `allow_shell` line inside `[general]`, if there is one.
-///
-/// Split inclusively on the newline rather than by lines, so every byte that is
-/// not the one line comes through untouched — including the carriage returns of a
-/// file checked out on Windows.
 fn replace_allow_line(text: &str, line: &str) -> Option<String> {
     let mut in_general = false;
     let mut replaced = false;
@@ -696,10 +627,6 @@ pub fn default_path() -> Result<PathBuf, ConfigError> {
 
 impl Config {
     /// Load configuration, falling back to defaults when no file exists.
-    ///
-    /// An explicit path that does not exist is an error, so a typo is never
-    /// silently ignored. A missing default path is not: it means "not set up
-    /// yet", which the app reports in its own way.
     pub fn load(explicit: Option<&Path>) -> Result<Self, ConfigError> {
         let path = match explicit {
             Some(path) => path.to_path_buf(),
@@ -726,15 +653,6 @@ impl Config {
 
     /// Write shell rules into a configuration file, leaving every other byte
     /// alone.
-    ///
-    /// A text edit rather than a rewrite, because this file is meant to be
-    /// written by hand, comments included: rendering a parsed `Config` back out
-    /// would silently delete every comment in it. The only line that changes is
-    /// `allow_shell` under `[general]`.
-    ///
-    /// Refuses rather than guesses. A file this build cannot parse, or one with
-    /// no `[general]` table to put the line in, is an error naming what to add by
-    /// hand — the alternative is inventing a configuration nobody wrote.
     pub fn save_allow(path: &Path, rules: &[String]) -> Result<(), ConfigError> {
         let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
             path: path.to_path_buf(),
@@ -793,6 +711,27 @@ impl Config {
                     "in [general] allow_shell, {rule:?} is not a rule: {error}"
                 )));
             }
+        }
+
+        if self.general.max_steps == 0 {
+            return Err(ConfigError::Invalid(
+                "in [general], max_steps = 0 would refuse every tool call; omit it to accept \
+                 the default of 32"
+                    .to_string(),
+            ));
+        }
+        if self.general.shell_timeout_secs == 0 {
+            return Err(ConfigError::Invalid(
+                "in [general], shell_timeout_secs = 0 would kill every command immediately; omit \
+                 it to accept the default of 300"
+                    .to_string(),
+            ));
+        }
+        if self.general.shell_timeout_secs > MAX_SHELL_TIMEOUT_SECS {
+            return Err(ConfigError::Invalid(format!(
+                "in [general], shell_timeout_secs is capped at {MAX_SHELL_TIMEOUT_SECS}; a \
+                 single call can still name timeout_secs up to that"
+            )));
         }
 
         if self.schema != SUPPORTED_SCHEMA {
@@ -923,6 +862,33 @@ mod tests {
         assert!(config.tiers.is_empty());
         assert!(config.general.sticky_fallback);
         assert_eq!(config.general.workspace, "~");
+        assert_eq!(config.general.max_steps, DEFAULT_MAX_STEPS);
+        assert_eq!(
+            config.general.shell_timeout_secs,
+            DEFAULT_SHELL_TIMEOUT_SECS
+        );
+    }
+
+    #[test]
+    fn a_zero_step_budget_is_refused() {
+        let error = parse("[general]\nmax_steps = 0\n").expect_err("refused");
+        let message = error.to_string();
+        assert!(message.contains("max_steps"), "{message}");
+        assert!(message.contains("32"), "{message}");
+    }
+
+    #[test]
+    fn a_zero_shell_timeout_is_refused() {
+        let error = parse("[general]\nshell_timeout_secs = 0\n").expect_err("refused");
+        let message = error.to_string();
+        assert!(message.contains("shell_timeout_secs"), "{message}");
+    }
+
+    #[test]
+    fn a_shell_timeout_above_the_cap_is_refused() {
+        let error = parse("[general]\nshell_timeout_secs = 10000\n").expect_err("refused");
+        let message = error.to_string();
+        assert!(message.contains("1800"), "{message}");
     }
 
     #[test]
@@ -935,12 +901,18 @@ mod tests {
         // "Local until it isn't" needs a tier to spill to, and an example that
         // ships with the fallback commented out is an example of half a thing.
         assert_eq!(config.tiers.len(), 2);
-        assert_eq!(config.tiers[0].id, "local");
-        assert_eq!(config.tiers[0].kind, TierKind::OpenAi);
+        assert_eq!(config.tiers[0].id, "deepseek");
+        assert_eq!(config.tiers[0].kind, TierKind::Cli);
+        assert_eq!(config.tiers[0].preset.as_deref(), Some("command-code"));
+        assert_eq!(
+            config.tiers[0].model.as_deref(),
+            Some("deepseek/deepseek-v4-flash")
+        );
         assert_eq!(config.tiers[1].id, "grok");
         assert_eq!(config.tiers[1].kind, TierKind::Cli);
+        assert_eq!(config.tiers[1].preset.as_deref(), Some("grok"));
 
-        // The local tier consults rather than escalating, and the comment in the
+        // The cheap tier consults rather than escalating, and the comment in the
         // example says why: escalating costs the frontier the whole conversation
         // and then every remaining turn of the session. It is also what the tier
         // would get by saying nothing — see `the_stuck_policy_defaults_to_consulting`
@@ -950,15 +922,6 @@ mod tests {
 
         // The second tier says nothing and takes the default with it.
         assert_eq!(config.tiers[1].on_stuck, OnStuck::Consult);
-    }
-
-    #[test]
-    fn the_documented_example_leaves_a_local_model_alone_to_use_what_is_loaded() {
-        // `model = ""` is deliberate and worth pinning: it is the difference
-        // between a config that survives restarting LM Studio with a different
-        // model and one that 404s until it is edited.
-        let config = parse(include_str!("../config.example.toml")).expect("valid");
-        assert_eq!(config.tiers[0].model.as_deref(), Some(""));
     }
 
     #[test]
@@ -1497,13 +1460,22 @@ mod tests {
     }
 
     #[test]
-    fn the_shipped_example_writes_one_override_and_inherits_the_rest() {
-        // The example's [tier.limits] block sets two fields and leaves the
-        // timeouts alone, so it exercises the merge rather than a wholesale
-        // replacement: a field the class provides and the block does not mention
-        // has to survive. Writing the class's own defaults into the example
-        // would have hidden that, and hidden the mechanism with it.
-        let config = parse(include_str!("../config.example.toml")).expect("valid");
+    fn a_limits_block_writes_one_override_and_inherits_the_rest() {
+        // A [tier.limits] block that sets two fields and leaves the timeouts
+        // alone exercises the merge rather than a wholesale replacement: a field
+        // the class provides and the block does not mention has to survive.
+        let config = parse(
+            r#"
+            [[tier]]
+            id = "local"
+            kind = "openai"
+            base_url = "http://127.0.0.1:1234/v1"
+            [tier.limits]
+            idle_timeout_ms = 45000
+            max_repeat_run = 4
+            "#,
+        )
+        .expect("valid");
         let limits = config.tiers[0].limits.resolve(TierClass::Local);
 
         assert_eq!(limits.idle_timeout_ms, 45_000, "the override applies");

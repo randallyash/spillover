@@ -13,9 +13,6 @@ pub mod input;
 pub mod markdown;
 pub mod menu;
 /// Frame inspection, for making the pictures in the README.
-///
-/// Test-only on purpose: it is a build tool rather than a feature, so there is
-/// no reason for a released binary to carry it.
 #[cfg(test)]
 pub mod screenshot;
 pub mod sidebar;
@@ -218,11 +215,6 @@ fn active_tier(app: &App) -> &str {
 /// A tier label without its parenthetical detail: "Local (http://…)" becomes
 /// "Local". The address belongs in the session panel, not in a one-line rail.
 /// A path with the home directory folded to `~`.
-///
-/// The one place this is done, so a path reads the same in a notice, in the
-/// session panel, and in the answer to `/why`. A full `/home/name/...` is long
-/// enough to push a line over the width it is shown in, and the home directory
-/// is the part that says the least.
 pub fn short_path(path: &std::path::Path) -> String {
     let Some(home) = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()) else {
         return path.display().to_string();
@@ -346,8 +338,8 @@ mod tests {
         let mut app = App::new(crate::config::Config::default());
         app.messages.clear();
         app.tier_labels = vec![
-            "Local (http://192.168.1.50:1234/v1)".to_string(),
             "DeepSeek V4 Flash (Command Code)".to_string(),
+            "Grok 4.6".to_string(),
         ];
         app.tier_failed = vec![true, false];
         app.active_tier = 1;
@@ -368,7 +360,7 @@ mod tests {
         app.messages
             .push(Message::system("✓ read_file  dialect.rs (503 lines)"));
         app.messages.push(Message::system(
-            "✗ Local repeated the same output 4 times — spilling over to DeepSeek V4 Flash",
+            "✗ DeepSeek V4 Flash repeated the same output 4 times — spilling over to Grok 4.6",
         ));
         app.messages
             .push(Message::system("→ grep  fn classify  src/provider"));
@@ -423,7 +415,7 @@ mod tests {
             "a narrow frame drops the panel:\n{narrow}"
         );
         // The tier that is answering is still said out loud, in the footer.
-        assert!(narrow.contains("DeepSeek V4 Flash"), "{narrow}");
+        assert!(narrow.contains("Grok 4.6"), "{narrow}");
     }
 
     #[test]
@@ -495,14 +487,14 @@ mod tests {
     fn the_footer_never_runs_a_hint_into_the_tier_name() {
         // Hints longer than the space left for them used to be clipped by the
         // paragraph, so the last one ran straight into the tier on the right and
-        // read as one word ("shiftDeepSeek V4 Flash").
+        // read as one word ("shiftGrok 4.6").
         for width in [46u16, 48, 52, 60, 70, 80, 100] {
             let mut app = realistic();
             let out = rendered(&mut app, width, 20);
             let last = out.lines().last().expect("a footer");
 
             assert!(
-                !last.contains("shiftDeepSeek"),
+                !last.contains("shiftGrok"),
                 "a hint ran into the tier name at {width}: {last:?}"
             );
             assert!(
@@ -542,12 +534,6 @@ mod tests {
     }
 
     /// Print a frame, to look at the interface without running it.
-    ///
-    /// Ignored by default because it asserts nothing — it is a viewing aid:
-    ///
-    /// ```text
-    /// cargo test print_a_frame -- --ignored --nocapture
-    /// ```
     #[test]
     #[ignore = "prints a frame to look at; asserts nothing"]
     fn print_a_frame() {

@@ -27,9 +27,6 @@ pub fn thousands(value: u64) -> String {
 }
 
 /// Split `text` into lines no wider than `width` cells.
-///
-/// Breaks on spaces where possible and hard-splits a word that cannot fit on a
-/// line of its own, so a long URL or a base64 blob still renders.
 pub fn wrap(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut out: Vec<String> = Vec::new();
@@ -135,11 +132,6 @@ fn split_at_width(text: &str, width: usize) -> (&str, &str) {
 }
 
 /// Lay atoms out in lines of at most `width` columns, never splitting one.
-///
-/// An atom is a phrase that has to stay whole to mean anything: a credential name,
-/// or a shell rule like `git status`. Wrapped the ordinary way, half of
-/// `git rev-parse` at one end of a line and half at the other reads as two rules
-/// nobody wrote.
 pub fn pack<'a>(atoms: impl IntoIterator<Item = &'a str>, indent: &str, width: usize) -> String {
     let mut out = String::new();
     let mut line = String::new();

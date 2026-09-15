@@ -18,10 +18,6 @@ use crate::app::App;
 use crate::ui::theme::Theme;
 
 /// Render a frame and describe it as JSON.
-///
-/// Shape: `{"width":w,"height":h,"rows":[[cell,...],...]}` where a cell is
-/// `{"s":"text","fg":"red","bg":null,"b":true,...}`. Absent attributes are
-/// false, and a null colour means "the terminal's own default".
 pub fn frame_json(app: &mut App, width: u16, height: u16) -> String {
     let backend = ratatui::backend::TestBackend::new(width, height);
     let mut terminal = ratatui::Terminal::new(backend).expect("a terminal");
@@ -125,9 +121,6 @@ fn write_json_string(out: &mut String, text: &str) {
 }
 
 /// Whether the theme in use has colour at all.
-///
-/// The images are always made with colour; this exists so the test can say so
-/// rather than silently depending on the environment it runs in.
 pub fn colour_is_on() -> bool {
     let _ = Theme::detect();
     std::env::var_os("NO_COLOR").is_none()
@@ -140,19 +133,12 @@ mod tests {
     use crate::provider::Usage;
     use tokio::sync::oneshot;
 
-    /// A local tier that looped, and a hosted one that answered.
-    ///
-    /// This is the picture the whole project exists to be, so it is built the
-    /// way the real thing gets there: the failing tier is marked, the reason is
-    /// in the transcript, and the tier that answered is the one wearing the
-    /// filled chip.
+    /// Cheap tier looped; Grok answered. This is the picture the project exists
+    /// to be.
     fn spilled() -> App {
         let mut app = App::new(crate::config::Config::default());
         app.messages.clear();
-        app.tier_labels = vec![
-            "Local (LM Studio)".to_string(),
-            "DeepSeek V4 Flash".to_string(),
-        ];
+        app.tier_labels = vec!["DeepSeek V4 Flash".to_string(), "Grok 4.6".to_string()];
         app.tier_failed = vec![true, false];
         app.active_tier = 1;
 
@@ -163,7 +149,7 @@ mod tests {
         app.messages
             .push(Message::system("✓ read_file  dialect.rs (503 lines)"));
         app.messages.push(Message::system(
-            "✗ Local repeated the same output 4 times — spilling over to DeepSeek V4 Flash",
+            "✗ DeepSeek V4 Flash repeated the same output 4 times — spilling over to Grok 4.6",
         ));
         app.messages.push(Message::assistant(
             "It does not drop them — it never sees them.\n\n\
@@ -177,7 +163,7 @@ mod tests {
             .push(Message::system("tokens: 15,412 in, 284 out · 7,168 cached"));
 
         app.record_usage_on(
-            Some("Local (LM Studio)"),
+            Some("DeepSeek V4 Flash"),
             &Usage {
                 prompt_tokens: 2_048,
                 completion_tokens: 96,
@@ -187,7 +173,7 @@ mod tests {
         );
         for prompt_tokens in [15_300, 15_412, 16_010, 15_880, 15_412, 16_240] {
             app.record_usage_on(
-                Some("DeepSeek V4 Flash"),
+                Some("Grok 4.6"),
                 &Usage {
                     prompt_tokens,
                     completion_tokens: 240,
@@ -198,6 +184,7 @@ mod tests {
         }
         app.turns = 6;
         app.tick = 3;
+        app.usage_history = vec![2_048, 15_300, 15_412, 16_010, 15_880, 16_240];
         app
     }
 
@@ -256,13 +243,6 @@ mod tests {
     }
 
     /// Write every picture's JSON to `dir`.
-    ///
-    /// Ignored so it does not run with the suite; it is a build step for the
-    /// README, not a test of anything.
-    ///
-    /// ```text
-    /// SPILL_SCREENSHOTS=/tmp/shots cargo test dump_screens -- --ignored --nocapture
-    /// ```
     #[test]
     #[ignore = "writes the README pictures; asserts nothing"]
     fn dump_screens() {
@@ -297,10 +277,6 @@ mod tests {
     }
 
     /// The frame's text, read back out of its JSON.
-    ///
-    /// Parsing it rather than searching the raw string does two things: it
-    /// proves the JSON is well formed, and it reconstructs the screen, which a
-    /// substring search cannot do because every cell is quoted separately.
     fn text_of(json: &str) -> String {
         let value: serde_json::Value =
             serde_json::from_str(json).expect("the frame should be valid JSON");

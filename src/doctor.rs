@@ -18,17 +18,9 @@ use crate::text::pack;
 
 /// What a `cli` tier resolved to, which is the half of it that is not visible
 /// anywhere else.
-///
-/// A CLI tier's behaviour depends on flags that come from a preset the user has
-/// never read, so "why does this not resume its session?" is otherwise
-/// unanswerable without knowing which preset was picked and what it carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliDetail {
     /// Where the binary actually is.
-    ///
-    /// Not the same question as whether it is on PATH, and the difference is the
-    /// answer more often than anything else here: a second copy earlier on PATH
-    /// is the usual reason a tier behaves differently here than in your shell.
     pub bin_path: Option<PathBuf>,
     /// Whether this tier continues a session between turns, and with which
     /// flags — empty means the whole transcript is sent every turn instead.
@@ -65,17 +57,9 @@ pub struct TierReport {
     pub detail: String,
     pub milliseconds: u128,
     /// What this tier does when it gets stuck.
-    ///
-    /// Reported because consult is opt-in and its whole argument is that a
-    /// choice was made: a diagnostic that cannot show which tiers consult cannot
-    /// help anyone decide whether it is working.
     pub on_stuck: OnStuck,
     /// Which timeouts this tier is judged by, once its class and its own
     /// overrides are applied.
-    ///
-    /// Reported because the class is otherwise invisible: when a slow local model
-    /// is spilled over, the first question is whether it was given the local
-    /// grace period, and nothing else on screen answers it.
     pub limits: Limits,
     pub class: TierClass,
     /// Present for a `cli` tier whose spec resolved.
@@ -83,10 +67,6 @@ pub struct TierReport {
 }
 
 /// The model credentials removed from a delegated CLI's environment.
-///
-/// Reported as the whole list rather than only the ones set, because the
-/// question a person arrives with is "is my key the one being taken away?", and
-/// a list that answers it by omission cannot be read.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Credentials {
     /// Every name spill removes before starting a delegated CLI.
@@ -98,9 +78,6 @@ pub struct Credentials {
 }
 
 /// What this machine offers the interface.
-///
-/// The other half of "it does not work here", and the half nobody can see: the
-/// reader of a pasted report is not sitting at the terminal it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Machine {
     /// Columns and rows, when there is a terminal to ask. `None` when there is
@@ -157,15 +134,13 @@ pub struct Report {
     pub origin: Origin,
     pub workspace: String,
     pub sticky_fallback: bool,
+    pub max_steps: usize,
+    pub shell_timeout_secs: u64,
     /// Present only when there is a `cli` tier to start: with none, nothing is
     /// removed from anything.
     pub credentials: Option<Credentials>,
     pub machine: Machine,
     /// Which shell commands run without being asked about.
-    ///
-    /// Reported because a rule is invisible by design — the whole point is that
-    /// nothing stops to say so — which makes "why did that run without asking
-    /// me?" a question only the report can answer.
     pub allow: AllowRules,
 }
 
@@ -289,9 +264,6 @@ impl Report {
     }
 
     /// Which file is in force, and how it was chosen.
-    ///
-    /// The first thing anyone asks when the run does not match the file they
-    /// edited, and the one question a report could not previously answer at all.
     fn render_config(&self) -> String {
         let mut out = String::new();
         let (path, how) = match &self.origin {
@@ -314,10 +286,12 @@ impl Report {
             width = LABEL_WIDTH
         ));
         out.push_str(&format!(
-            "{:width$} {how} · workspace {} · sticky fallback {}\n",
+            "{:width$} {how} · workspace {} · sticky fallback {} · {} steps · shell {}s\n",
             "",
             self.workspace,
             if self.sticky_fallback { "on" } else { "off" },
+            self.max_steps,
+            self.shell_timeout_secs,
             width = LABEL_WIDTH
         ));
         out
@@ -388,6 +362,8 @@ impl Report {
                 "source": self.origin.token(),
                 "workspace": self.workspace,
                 "stickyFallback": self.sticky_fallback,
+                "maxSteps": self.max_steps,
+                "shellTimeoutSecs": self.shell_timeout_secs,
             },
             "credentials": self.credentials.as_ref().map(|credentials| json!({
                 "removed": credentials.removed,
@@ -441,18 +417,9 @@ impl Report {
 const LABEL_WIDTH: usize = 9;
 
 /// How wide the report wraps, in columns.
-///
-/// Fixed rather than taken from the terminal, because the report is written to
-/// be pasted: a line wrapped to the writer's window arrives at the reader's
-/// terminal wrapped somewhere else, or not at all.
 const REPORT_WIDTH: usize = 78;
 
 /// What a `cli` tier resolved to, as the lines that belong under it.
-///
-/// Each line is a fact that changes what the tier does and that nothing else in
-/// the report shows: which binary will run, whether the session is continued or
-/// the whole transcript is resent every turn, and whether this tier can be
-/// consulted at all.
 fn cli_lines(cli: &CliDetail) -> Vec<String> {
     let mut lines = Vec::new();
 
@@ -581,6 +548,8 @@ pub async fn diagnose(library: &Library, config: &Config) -> Report {
         origin: config.origin.clone(),
         workspace: config.general.workspace.clone(),
         sticky_fallback: config.general.sticky_fallback,
+        max_steps: config.general.max_steps,
+        shell_timeout_secs: config.general.shell_timeout_secs,
         credentials,
         machine: Machine::detect(),
         allow: AllowRules::new(&config.general.allow_shell),
@@ -622,6 +591,8 @@ mod tests {
             origin: Origin::Found(PathBuf::from("/home/you/.config/spill/config.toml")),
             workspace: "~".to_string(),
             sticky_fallback: true,
+            max_steps: crate::config::DEFAULT_MAX_STEPS,
+            shell_timeout_secs: crate::config::DEFAULT_SHELL_TIMEOUT_SECS,
             credentials: None,
             machine: machine(),
             allow: AllowRules::new(
@@ -1054,6 +1025,8 @@ mod tests {
             text.contains("sticky fallback off"),
             "a session that does not stick is worth seeing before it surprises someone: {text}"
         );
+        assert!(text.contains("32 steps"), "{text}");
+        assert!(text.contains("shell 300s"), "{text}");
     }
 
     #[test]
@@ -1254,6 +1227,14 @@ mod tests {
         );
         assert_eq!(parsed["config"]["workspace"], "/home/you/code");
         assert_eq!(parsed["config"]["stickyFallback"], false);
+        assert_eq!(
+            parsed["config"]["maxSteps"],
+            crate::config::DEFAULT_MAX_STEPS
+        );
+        assert_eq!(
+            parsed["config"]["shellTimeoutSecs"],
+            crate::config::DEFAULT_SHELL_TIMEOUT_SECS
+        );
         assert_eq!(
             parsed["credentials"]["removed"].as_array().map(Vec::len),
             Some(crate::spawn::MODEL_CREDENTIALS.len())

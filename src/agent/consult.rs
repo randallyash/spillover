@@ -29,17 +29,10 @@ use crate::detect::StuckReason;
 use crate::session::{ChatMessage, Role};
 
 /// How much of the failed attempt's evidence to include.
-///
-/// A consult is a fresh, uncached call, so every character is billed — but too
-/// little evidence and the consultant is guessing. These bound the two ends.
 const MAX_EVIDENCE_CHARS: usize = 6_000;
 const MAX_EVIDENCE_MESSAGES: usize = 12;
 
 /// How long the injected answer may be.
-///
-/// A driving model re-reads its whole history on every subsequent turn, so this
-/// is the figure that compounds. Generous enough for a real explanation, tight
-/// enough that a rambling consultant cannot halve the context budget.
 pub const MAX_ANSWER_CHARS: usize = 2_000;
 
 /// The question put to the consultant, and a one-line version of it for the
@@ -50,10 +43,6 @@ pub struct Consult {
 }
 
 /// A consult that has already happened in this turn.
-///
-/// Passed to the next one so the consultant is not asked the same question
-/// again: advice that did not work is the most useful thing to know, and
-/// repeating it is the most likely failure of a second consult.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Previous {
     pub consultant: String,
@@ -61,9 +50,6 @@ pub struct Previous {
 }
 
 /// Build the question from what spill already knows.
-///
-/// `goal` is the user's own message, not the driver's restatement of it.
-/// `evidence` is the messages the failed attempt added, in order.
 pub fn build(
     goal: &str,
     reason: &StuckReason,
@@ -137,16 +123,6 @@ pub fn build(
 }
 
 /// The failed attempt, rendered as raw evidence rather than prose.
-///
-/// Tool calls are shown as the call and its result, which is the pair that
-/// actually explains a stuck loop. Tool results are the raw output, because a
-/// summarised error is exactly the paraphrase this module exists to avoid.
-///
-/// The budget is spent from the *newest* message backwards, and what survives is
-/// a contiguous run of recent messages. The ordering matters twice over: the
-/// newest activity is the state the driver is stuck in, so it is what the
-/// consultant most needs, and a message that does not fit is dropped rather than
-/// cut, so the consultant is never shown half an error and asked to trust it.
 fn render_evidence(evidence: &[ChatMessage]) -> String {
     let window = &evidence[evidence.len().saturating_sub(MAX_EVIDENCE_MESSAGES)..];
 
@@ -198,10 +174,6 @@ fn render_evidence(evidence: &[ChatMessage]) -> String {
 }
 
 /// The message injected into the driver's history for a successful consult.
-///
-/// Phrased as something the driver is *told* by a stronger reader of the same
-/// evidence, and explicitly not as a tool result or a user turn — a model that
-/// mistook this for the user speaking would answer it rather than act on it.
 pub fn injection(consultant: &str, answer: &str) -> String {
     format!(
         "A more capable model ({consultant}) was asked about this and said:\n\n{}\n\n\

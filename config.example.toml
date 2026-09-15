@@ -19,9 +19,17 @@ schema = 1
 # not the path you meant.
 workspace = "~"
 
+# How many tool steps a turn may take before it is judged stuck. 32 is enough
+# for a modest refactor; a model that never concludes still stops.
+# max_steps = 32
+
+# How many seconds a run_shell command may run. A single call can name a
+# longer timeout_secs of its own, up to 1800.
+# shell_timeout_secs = 300
+
 # Once a turn has spilled to a lower tier, stay there for the rest of the
-# session. Flip it off if you would rather every message started local again and
-# only paid for the frontier on the messages that needed it.
+# session. Flip it off if you would rather every message started on DeepSeek
+# again and only paid for Grok on the messages that needed it.
 sticky_fallback = true
 
 # Shell commands that run without being asked about.
@@ -54,28 +62,27 @@ sticky_fallback = true
 # stateless.
 
 # ---------------------------------------------------------------------------
-# Tier 1: the local model. Everything below it is only reached when this one
+# Tier 1: the cheap model. Everything below it is only reached when this one
 # stalls, loops, or fails outright — which is the whole point.
+#
+# Command Code's DeepSeek V4 Flash is what I actually run first: fast, cheap,
+# and already logged in. A local OpenAI-compatible server (LM Studio, Ollama)
+# belongs here instead if you have one — put it first and move this down.
 # ---------------------------------------------------------------------------
 
 [[tier]]
-id = "local"
-kind = "openai"
-name = "LM Studio (Qwen3 Coder)"
-preset = "lmstudio"
-
-# Empty on purpose. LM Studio is already holding Qwen3 Coder 30B — it will only
-# have loaded whatever I picked in its own window — so naming a model here would
-# mean keeping two lists in sync and a 404 the day I switch. Empty means "use
-# whatever this server has loaded", which is what I actually want.
-model = ""
+id = "deepseek"
+kind = "cli"
+name = "DeepSeek V4 Flash (Command Code)"
+preset = "command-code"
+model = "deepseek/deepseek-v4-flash"
 
 # Ask the tier below instead of handing the turn over. This is also what a tier
 # gets for saying nothing, and it is written out because it is the decision that
-# matters most in this file: escalating is expensive. The frontier re-reads the
-# whole conversation, and then answers every remaining turn of the session, all
+# matters most in this file: escalating is expensive. Grok re-reads the whole
+# conversation, and then answers every remaining turn of the session, all
 # because one turn went wrong and I lost the cheap model with it. A consult
-# spends one call on one narrow question and the local model keeps driving.
+# spends one call on one narrow question and DeepSeek keeps driving.
 #
 # It is safe either way. spill escalates anyway when the advice is no use — when
 # the consult fails, when the budget runs out, when the answer comes back empty —
@@ -89,44 +96,20 @@ on_stuck = "consult"
 # spending the frontier slowly, which is the thing consult exists to avoid.
 consults_per_turn = 2
 
-# Overrides on what a local tier already gets. Leaving a field out keeps the
-# class default rather than resetting it, so this block changes one number and
-# inherits the rest.
-#
-# The class is decided by where the endpoint is: loopback, a LAN address and
-# *.local get 120s to the first token and 30s of silence after that; anything
-# over the network — and every `cli` tier, whose first line includes a harness
-# starting up — gets 30s and 60s. `spill doctor` prints what each tier ended up
-# with, which is the only way to be sure.
-[tier.limits]
-# The one I actually had to change. My local box is quick to its first token but
-# can still go quiet for half a minute part-way through a long file, and the
-# default 30s cut it off mid-answer.
-idle_timeout_ms = 45000
-# Consecutive identical lines that count as a loop. 4 is the default; lower it
-# for a model that degenerates quickly, raise it for one that is just repetitive
-# in the way prose is.
-max_repeat_run = 4
-
 # ---------------------------------------------------------------------------
-# Tier 2: the frontier, reached only when the local model cannot finish.
+# Tier 2: Grok, reached only when DeepSeek cannot finish.
 #
-# THIS IS THE LINE TO CHANGE. I have SuperGrok; `spill presets` lists everything
-# spill can drive (Claude Code, Codex, Gemini CLI, Copilot, Cursor, opencode,
-# Command Code, …) and `spill doctor` says which of them are installed here. If
-# you have none of them, delete this tier — an all-local chain is a supported way
-# to run, and a stalled turn simply ends instead of spilling.
+# THIS is the expensive one, so it stays unspent until a stall actually happens.
+# `spill presets` lists everything else spill can drive. If you have none of
+# them, delete this tier — a chain of one is a supported way to run, and a
+# stalled turn simply ends instead of spilling.
 # ---------------------------------------------------------------------------
 
 [[tier]]
 id = "grok"
 kind = "cli"
-name = "Grok 4.6 (SuperGrok)"
+name = "Grok 4.6"
 preset = "grok"
-
-# The CLI would use its own default model, which is fine. Naming it keeps the
-# tier honest about what is answering, and `spill doctor` then reports the same
-# model the rail shows.
 model = "grok-4.6"
 
 # No on_stuck here: it takes the default like any tier that says nothing, and it
@@ -138,15 +121,14 @@ model = "grok-4.6"
 # setup; the rest is the other knobs, for when you want them.
 # ---------------------------------------------------------------------------
 
-# A hosted provider instead of an agent CLI. This one needs a key in the
-# environment, named rather than written down:
+# A local server instead of Command Code, tried first. Empty model means
+# whatever the server has loaded:
 #
 # [[tier]]
-# id = "deepseek"
+# id = "local"
 # kind = "openai"
-# preset = "openrouter"
-# api_key_env = "OPENROUTER_API_KEY"
-# model = "deepseek/deepseek-v4-flash"
+# preset = "lmstudio"
+# model = ""
 
 # `approve_all` is off unless you set it. Turning it on lets that tier's CLI run
 # without its own permission prompts, so it can change files unattended. spill

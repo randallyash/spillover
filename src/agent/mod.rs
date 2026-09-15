@@ -28,12 +28,10 @@ use crate::stalls::{Counters, Miss, Policy, SpillEntry, SpillLog, Verdict};
 
 /// Default cap on tool steps in a single turn, so a model that keeps calling
 /// tools without concluding cannot spin forever.
-pub const DEFAULT_MAX_STEPS: usize = 12;
+#[cfg(test)]
+pub use crate::config::DEFAULT_MAX_STEPS;
 
 /// How many recent user turns compaction leaves intact.
-///
-/// Enough that the model still knows what is being worked on, few enough that
-/// the frontier's cold prefix stays small. Only older turns are folded away.
 pub const KEEP_TURNS: usize = 3;
 
 /// Below this many user turns there is nothing worth compacting, so an
@@ -41,11 +39,6 @@ pub const KEEP_TURNS: usize = 3;
 const COMPACT_ABOVE_TURNS: usize = KEEP_TURNS + 2;
 
 /// Stops a turn that is already running.
-///
-/// Deliberately not a `Command`: the command channel is read by the very loop
-/// that is *awaiting* the turn, so a cancel sent down it would sit in the queue
-/// until the turn it was meant to stop had already finished. This is shared state
-/// instead, which the turn watches directly.
 #[derive(Clone, Debug)]
 pub struct Canceller {
     flag: Arc<watch::Sender<bool>>,
@@ -84,9 +77,6 @@ impl Canceller {
 }
 
 /// Resolve when a cancel is asked for.
-///
-/// If every sender is gone this never resolves, which is what the turn wants: no
-/// signal, nothing to stop for.
 async fn cancelled(mut watcher: watch::Receiver<bool>) {
     loop {
         if *watcher.borrow_and_update() {
@@ -99,12 +89,6 @@ async fn cancelled(mut watcher: watch::Receiver<bool>) {
 }
 
 /// What a turn is allowed to do.
-///
-/// Two modes, because there are two things a person wants from an agent: work
-/// it out, or do it. Plan is read-only, and that is a promise kept in three
-/// places rather than one — the write tools are not offered, a call for one is
-/// refused anyway, and the system prompt says why. A read-only mode that relies
-/// on the model choosing to behave is not read-only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
@@ -143,10 +127,6 @@ impl Mode {
     }
 
     /// The system prompt for this mode.
-    ///
-    /// Plan mode needs its own prompt rather than a sentence appended to the
-    /// usual one: the usual prompt explains that writes need approval, which is
-    /// the wrong thing to teach a turn that has no writes to approve.
     pub fn system_prompt(self, workspace: &std::path::Path) -> String {
         match self {
             Self::Build => build_prompt(workspace),
@@ -156,9 +136,6 @@ impl Mode {
 }
 
 /// What the interface asks the agent to do.
-///
-/// Most of these exist because the state they touch lives with the agent — the
-/// chain and the conversation — and cannot be reached from the render loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     /// An ordinary message, and a turn.
@@ -168,10 +145,6 @@ pub enum Command {
     /// Move to the next tier now, and stay there.
     Escalate,
     /// Ask the next tier about the next stall, and keep the driver.
-    ///
-    /// A one-shot rather than a mode: "try a consult here" is a different
-    /// intention from "consult from now on", and the second one has a command of
-    /// its own.
     Consult,
     /// Choose the stuck policy for the rest of the session. `None` hands the
     /// choice back to each tier's own, which is the only way to return to a
@@ -193,17 +166,8 @@ pub enum Command {
     /// Report what is being sent each turn.
     Context,
     /// Put back an approved write.
-    ///
-    /// Reaches the newest write on the stack. The user typed it, so it does not
-    /// ask again — what it does instead is refuse when the file has moved on
-    /// since, which is the safety that matters here.
     Undo,
     /// Add, list or drop the shell rules this session runs without asking about.
-    ///
-    /// Answered with a notice rather than kept in the app, for the same reason the
-    /// undo pre-image lives with the agent: this is what runs the tool, so there
-    /// is one copy of the list and no second one that could report a rule which is
-    /// not in force.
     Allow(AllowChange),
 }
 
@@ -244,24 +208,12 @@ pub enum AgentEvent {
         reason: String,
     },
     /// The same move, announced before it happens.
-    ///
-    /// Sent the moment the verdict lands and before the attempt is discarded, so
-    /// the interface can say what is about to happen and why. A handoff that
-    /// arrives already complete reads as sudden; the reason is worth a beat of
-    /// its own, and the tier is already stopped when this is sent, so the beat
-    /// costs the retry nothing.
     Spilling {
         from: String,
         to: String,
         reason: String,
     },
     /// Tokens a tier spent on this turn.
-    ///
-    /// The single accounting path, and deliberately separate from the events
-    /// that say what *happened*: every request is billed, including the ones
-    /// behind an answer that was thrown away, so the money has to be reported
-    /// whether the attempt answered, was abandoned, or was stopped. Emitting it
-    /// from one place is what keeps it from being counted twice or not at all.
     Spent { tier: String, usage: Usage },
     /// The turn ended normally.
     Finished { stop_reason: Option<String> },
@@ -282,17 +234,8 @@ pub enum AgentEvent {
     /// Every tier was tried and none of them produced an answer.
     Exhausted { reason: String },
     /// A tier was abandoned, with everything the decision was made from.
-    ///
-    /// Separate from `Spilling` and `Escalated`, which narrate the move: this is
-    /// the evidence, and it is what `/why` reads back. Sending it whether or not
-    /// the move happens is deliberate — a user asking why their turn was taken
-    /// away should get the same answer as one asking why it stopped.
     Stalled { verdict: Box<Verdict> },
     /// A turn that finished, having come within one step of being abandoned.
-    ///
-    /// Reported rather than kept quiet: an almost-failure is the only evidence
-    /// that a threshold is close to right, and a warning that is never seen
-    /// teaches nothing about whether it is.
     AlmostStalled { tier: String, miss: Miss },
 }
 
@@ -303,28 +246,12 @@ pub struct AgentConfig {
     /// How a running turn is stopped from outside.
     pub cancel: Canceller,
     /// Where the session is written so it can be resumed after a restart.
-    ///
-    /// `None` for one-shot mode. That is how "interactive only" is enforced:
-    /// a run with nowhere to save has nothing to resume, rather than having a
-    /// flag that has to be checked in the right places.
     pub store: Option<SessionStore>,
     /// Where spills are recorded, or `None` to keep no record.
-    ///
-    /// Separate from `store` rather than derived from it, because the two answer
-    /// different questions: a one-shot run has no session to resume and every
-    /// reason to log why it spilled.
     pub log: Option<SpillLog>,
     /// Shell commands that may run without being asked about.
-    ///
-    /// The configuration's own list, which is the read-only set unless it says
-    /// otherwise. Rules stuck with `/allow` are added to this at runtime and are
-    /// not part of it.
     pub allow_shell: Vec<String>,
     /// Which configuration file is in force, so `/allow save` can write to it.
-    ///
-    /// Carried rather than guessed at: the difference between the default path
-    /// and one named by `--config` is a file, and writing to the wrong one would
-    /// be worse than refusing.
     pub origin: Origin,
 }
 
@@ -349,24 +276,10 @@ struct Loop {
     /// The turn most recently started, so it can be retried.
     last: Option<LastTurn>,
     /// The approved writes that can still be put back, newest first.
-    ///
-    /// Bounded in `UndoStack` rather than here, because what bounds it is the
-    /// bytes it holds: an entry is a copy of a file as it was, so the depth and
-    /// the budget are the same decision.
     undo: UndoStack,
     /// Which shell commands run without being asked about.
-    ///
-    /// Held with the loop rather than the app because this is what runs a tool,
-    /// and because the rules cannot change while a turn is in flight — commands
-    /// queue behind the turn they arrive in. `/allow` answers from here, so there
-    /// is one copy of the list and no second one to report a rule that is not in
-    /// force.
     allow: AllowRules,
     /// Whether the spill log has already been reported as unwritable.
-    ///
-    /// Once per run: a full disk would otherwise print the same line on every
-    /// spill, and the point of saying it at all is that a log nobody knows is
-    /// broken is worse than no log.
     log_warned: bool,
 }
 
@@ -390,10 +303,6 @@ pub fn spawn(
 }
 
 /// The same, picking up a conversation saved by an earlier run.
-///
-/// A separate entry point rather than another argument on `spawn`, because
-/// every caller that starts fresh — one-shot mode, and the tests — would
-/// otherwise have to pass a `None` that means nothing to it.
 pub fn spawn_seeded(
     config: AgentConfig,
     chain: FallbackChain,
@@ -453,9 +362,6 @@ pub fn spawn_seeded(
 }
 
 /// Everything about this session that is worth keeping.
-///
-/// A free function rather than a method so it can be checked without starting a
-/// loop and driving it into the right state first.
 fn snapshot(config: &AgentConfig, state: &Loop) -> SessionFile {
     let chain = state.chain.state();
 
@@ -477,9 +383,6 @@ fn snapshot(config: &AgentConfig, state: &Loop) -> SessionFile {
 }
 
 /// Write the session out, reporting a failure rather than interrupting anything.
-///
-/// Losing a session is worth saying out loud — the user is about to find their
-/// history gone — but it is never a reason to abandon a turn that is working.
 fn persist(config: &AgentConfig, state: &Loop, events: &UnboundedSender<AgentEvent>) {
     let Some(store) = &config.store else {
         return;
@@ -869,19 +772,11 @@ fn describe_context(session: &Session, chain: &FallbackChain) -> String {
 }
 
 /// A tier's name without its address, for anything a person reads.
-///
-/// The address belongs in the session panel; repeating it in every notice is how
-/// a one-line message turns into three wrapped ones.
 fn short(label: &str) -> &str {
     crate::fallback::tier_name(label)
 }
 
 /// What one tier made of a turn, and what finding out cost.
-///
-/// The usage is carried out of the attempt rather than reported from inside it,
-/// because the money is owed whichever way the attempt went: a tier that looped
-/// five times and was abandoned has been billed for all five requests. The
-/// caller reports it through one path so nothing is counted twice.
 enum Attempt {
     Answered {
         stop_reason: Option<String>,
@@ -901,14 +796,6 @@ enum ToolRun {
 }
 
 /// Run one user turn, moving down the tiers until one of them answers.
-///
-/// Every tier gets the turn in full: the session is rolled back to the
-/// checkpoint before the next tier starts, so a tier never inherits the
-/// half-finished output of a tier that was looping.
-///
-/// The rollback undoes the *conversation*, not the world. If a tier that later
-/// stalled already wrote a file or ran a command, that has happened, and the
-/// next tier is told so by the tool results still present in its history.
 #[allow(clippy::too_many_arguments)]
 async fn run_turn(
     config: &AgentConfig,
@@ -1145,11 +1032,6 @@ async fn run_turn(
 }
 
 /// Write one spill, and say so once if the log cannot be written.
-///
-/// A log that has quietly stopped is worse than no log: the thresholds would go
-/// on being tuned from a file that is no longer growing. So a failure is
-/// announced — once per run, because a full disk would otherwise repeat it on
-/// every spill — and the turn carries on regardless.
 #[allow(clippy::too_many_arguments)]
 fn record_spill(
     config: &AgentConfig,
@@ -1193,10 +1075,6 @@ fn usage_of(attempt: &Attempt) -> Option<Usage> {
 }
 
 /// The user's own words for this turn.
-///
-/// Found by searching back for the user turn rather than assuming it sits at
-/// `checkpoint - 1`, so a later change to how a turn is opened cannot silently
-/// start sending something else as the goal.
 fn goal_before(session: &Session, checkpoint: usize) -> String {
     session.messages()[..checkpoint]
         .iter()
@@ -1218,9 +1096,6 @@ struct Answer {
 }
 
 /// Put the stuck driver's question to the tier below it, as a fresh call.
-///
-/// `None` when the consult itself failed or was stopped, which the caller turns
-/// into an escalation: a consult that cannot complete must not strand the turn.
 #[allow(clippy::too_many_arguments)]
 async fn try_consult(
     config: &AgentConfig,
@@ -1322,10 +1197,6 @@ async fn try_consult(
 
 /// Shrink the history when a tier is about to be abandoned, so the tier that
 /// takes over does not open with a large cold read.
-///
-/// A fallback is a cache miss whatever we do — caches are per provider — so the
-/// only lever is making the thing being re-read small. Compaction is deliberately
-/// not attempted on a short session: the churn would cost more than it saved.
 fn compact_before_falling(
     session: &mut Session,
     chain: &FallbackChain,
@@ -1357,10 +1228,6 @@ fn compact_before_falling(
 }
 
 /// Give one tier the turn, up to the step limit.
-///
-/// The pieces of the loop arrive separately rather than as the loop itself: the
-/// tier is borrowed from the chain, so handing over `&mut Loop` would borrow it
-/// twice.
 #[allow(clippy::too_many_arguments)]
 async fn try_tier(
     config: &AgentConfig,
@@ -1493,9 +1360,11 @@ async fn try_tier(
                 // failure is available to the detector. `Other` for anything
                 // unrecognised, which is judged by the tier's own allowance rather
                 // than a tighter one.
-                let failure = outcome
-                    .is_error
-                    .then(|| ErrorClass::classify(&outcome.content));
+                let failure = outcome.is_error.then(|| {
+                    outcome
+                        .class
+                        .unwrap_or_else(|| ErrorClass::classify(&outcome.content))
+                });
                 if let Some(reason) = progress.record(&call.name, &call.arguments, failure) {
                     break 'attempt Attempt::Stuck(reason, spent);
                 }
@@ -1530,12 +1399,6 @@ async fn try_tier(
 }
 
 /// Which entry point of a provider a turn runs through.
-///
-/// The two differ in more than a flag: an ordinary turn may use tools and loop,
-/// while a consult is one round trip of prose with no session behind it. Naming
-/// the distinction keeps `stream_turn`'s job — watchdogging and accounting —
-/// identical for both, which is what lets a consult be cut off and billed like
-/// any other attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TurnKind {
     Normal,
@@ -1543,10 +1406,6 @@ enum TurnKind {
 }
 
 /// Stream one turn from one tier, cutting it off if it goes quiet or loops.
-///
-/// The request runs as a task so that deciding to abandon it can also *stop*
-/// it: a tier that is looping would otherwise keep generating, and keep
-/// billing, while nobody is listening.
 async fn stream_turn(
     provider: &Arc<dyn Provider>,
     request: ChatRequest,
@@ -1628,11 +1487,6 @@ async fn stream_turn(
 }
 
 /// Feed one stream event to the watchdog, forwarding text to the UI.
-///
-/// `observed` collects whatever the tier said the request had cost. It is filled
-/// in as the frames arrive rather than read off the finished response, because
-/// an attempt that is abandoned — a loop, a stall, a cancel — never produces a
-/// finished response, and its bills are owed all the same.
 fn observe(
     event: StreamEvent,
     events: &UnboundedSender<AgentEvent>,
@@ -1788,9 +1642,6 @@ async fn run_tool(
 }
 
 /// How much of the undo stack is still reachable, in words.
-///
-/// Said after every undo, because a stack that does not report its depth makes
-/// each press a guess about whether anything is behind it.
 fn reachable(depth: usize) -> String {
     match depth {
         0 => " — that was the last write on the stack".to_string(),
@@ -1923,11 +1774,6 @@ fn build_prompt(workspace: &std::path::Path) -> String {
 }
 
 /// The system prompt for a read-only turn.
-///
-/// It says plainly that the write tools are not merely discouraged but absent,
-/// because a model told only "do not change anything" tends to announce changes
-/// it did not make, and one that discovers the absence for itself tends to spend
-/// turns trying.
 fn plan_prompt(workspace: &std::path::Path) -> String {
     format!(
         "You are spill, a coding agent working in the user's terminal. The workspace is {}.\n\n\
@@ -2100,11 +1946,6 @@ mod tests {
     }
 
     /// The same, with the stuck policy named on every tier.
-    ///
-    /// Escalating is no longer the default, so a test whose subject *is* the
-    /// spill — the hand-over itself, the abandoned attempt, the log record — has
-    /// to ask for it. A test that is about the default leaves it out, which is
-    /// what makes the default visible.
     fn chain_of_with(tiers: Vec<(Arc<dyn Provider>, Limits)>, policy: OnStuck) -> FallbackChain {
         let tiers = tiers
             .into_iter()
@@ -3024,12 +2865,6 @@ mod tests {
 
     /// A two-tier chain whose first tier repeats itself and whose second
     /// answers, with the ids a log would name.
-    ///
-    /// The repeating tier escalates on purpose. Consulting is the default, so a
-    /// chain left alone would ask the second tier a question and then stall
-    /// again — and every test that uses this helper at or past the threshold is
-    /// about *one* stall: one verdict, one near-miss decision, one log record.
-    /// The consult path has its own tests, built on `consultable`.
     fn looping_into_a_second(times: usize) -> (FallbackChain, Arc<Loops>) {
         let looping = Loops::new("the same line", times);
         let mut first = Tier::new(
@@ -3115,9 +2950,6 @@ mod tests {
     }
 
     /// Collect whatever the agent emits, stopping once it goes quiet.
-    ///
-    /// Most commands answer with a notice and no turn, so there is no terminal
-    /// event to wait for.
     async fn collect(rx: &mut UnboundedReceiver<AgentEvent>) -> Vec<AgentEvent> {
         let mut out = Vec::new();
         while let Ok(Some(event)) = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await
@@ -4445,10 +4277,6 @@ mod tests {
     // ---- usage reported before a stream ends ------------------------------
 
     /// Reports what it has spent, then goes quiet for good.
-    ///
-    /// Stands in for a stream that is killed before it can report a total: a
-    /// loop, a stall, a cancel. The request was billed and the figure arrived,
-    /// so losing it would be this program's error rather than the provider's.
     struct ReportsThenHangs {
         usage: Usage,
     }
@@ -4624,9 +4452,6 @@ mod tests {
     // ---- consult ----------------------------------------------------------
 
     /// A driver that loops, and a consultant that answers.
-    ///
-    /// The driver is given a second turn so it can answer once it has been
-    /// helped, which is what distinguishes a consult from an escalation.
     fn consultable(
         consult_cap: u32,
     ) -> (FallbackChain, Arc<ScriptedProvider>, Arc<ScriptedProvider>) {
@@ -5120,10 +4945,6 @@ mod tests {
     }
 
     /// A tier that answers as a driver but must never be consulted.
-    ///
-    /// `consult` panics rather than returning, because the guarantee under test
-    /// is that a refusal happens *before* anything is asked — a call to it would
-    /// mean the refusal had been skipped.
     struct RefusesConsult;
 
     #[async_trait]
@@ -5382,11 +5203,6 @@ mod tests {
     }
 
     /// Collect events until the stream goes quiet.
-    ///
-    /// Unlike `drain_from` this does not stop at the terminal event, because the
-    /// save happens *after* it: the notice saying the session could not be
-    /// written arrives on the far side of `Finished`, and a drain that stopped
-    /// there would never see it.
     async fn drain_quiet(rx: &mut UnboundedReceiver<AgentEvent>) -> Vec<AgentEvent> {
         let mut events = Vec::new();
         while let Ok(Some(event)) =
@@ -6200,9 +6016,6 @@ mod tests {
     // ---- the two detectors, and which one is being asked --------------------
 
     /// A turn that says something new and asks for the same thing again.
-    ///
-    /// What a looping model actually looks like: it narrates, and the narration
-    /// changes every time, while the call underneath it does not.
     fn narrates_and_repeats_the_call(prose: &str) -> TurnSummary {
         TurnSummary {
             text: prose.to_string(),
@@ -6324,9 +6137,6 @@ mod tests {
     }
 
     /// Answers once, with a tool call, and then never answers again.
-    ///
-    /// A model that was working and went quiet with the tool result in front of it
-    /// — the case the phase distinction exists for.
     struct AnswersThenHangs {
         first: TurnSummary,
         calls: std::sync::atomic::AtomicUsize,

@@ -57,10 +57,6 @@ impl Approver for UiApprover {
 }
 
 /// Refuses anything that needs permission.
-///
-/// Used when there is nobody to ask, which is the safe default: a headless run
-/// should not be able to change the user's files just because no prompt was
-/// shown.
 pub struct RefuseAll;
 
 #[async_trait]
@@ -71,9 +67,6 @@ impl Approver for RefuseAll {
 }
 
 /// Approves anything that needs permission.
-///
-/// Only used when the user has explicitly asked for an unattended run, since it
-/// hands the model write and shell access with no confirmation.
 pub struct PermitAll;
 
 #[async_trait]

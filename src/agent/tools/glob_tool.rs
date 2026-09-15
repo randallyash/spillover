@@ -5,7 +5,9 @@ use std::path::Path;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use crate::agent::tools::{Args, Risk, Tool, ToolOutcome, cap, object_schema, should_skip};
+use crate::agent::tools::{
+    Args, Risk, Tool, ToolOutcome, cap, glob_dir, is_inside, object_schema, resolve, should_skip,
+};
 
 const MAX_MATCHES: usize = 500;
 
@@ -27,7 +29,7 @@ impl Tool for Glob {
             json!({
                 "pattern": {
                     "type": "string",
-                    "description": "Glob pattern. ** matches across directories, * within one."
+                    "description": "Glob pattern relative to the workspace. ** matches across directories, * within one. Absolute patterns are accepted only when they stay inside the workspace."
                 }
             }),
             &["pattern"],
@@ -51,18 +53,28 @@ impl Tool for Glob {
             Err(error) => return error,
         };
 
-        // Make the pattern absolute so it walks the workspace rather than the
-        // process's working directory.
-        let absolute = if Path::new(pattern).is_absolute() {
-            pattern.to_string()
-        } else {
-            format!("{}/{}", workspace.display(), pattern)
+        let absolute = match confined_pattern(workspace, pattern) {
+            Ok(absolute) => absolute,
+            Err(error) => return error,
         };
 
         let paths = match glob::glob(&absolute) {
             Ok(paths) => paths,
             Err(error) => {
                 return ToolOutcome::error(format!("{pattern:?} is not a valid glob: {error}"));
+            }
+        };
+
+        let workspace_root = match std::fs::canonicalize(workspace) {
+            Ok(root) => root,
+            Err(error) => {
+                return ToolOutcome::io(
+                    format!(
+                        "the workspace {} is not a usable directory",
+                        workspace.display()
+                    ),
+                    &error,
+                );
             }
         };
 
@@ -75,6 +87,14 @@ impl Tool for Glob {
             {
                 skipped += 1;
                 continue;
+            }
+            // A match that resolved outside — a symlink, an absolute pattern that
+            // slipped the prefix check — is dropped rather than shown.
+            if let Ok(canon) = std::fs::canonicalize(&entry) {
+                if !is_inside(&workspace_root, &canon) {
+                    skipped += 1;
+                    continue;
+                }
             }
             matches.push(display_path(workspace, &entry));
         }
@@ -104,6 +124,27 @@ impl Tool for Glob {
 
         ToolOutcome::ok(cap(format!("{total} matches for {pattern:?}\n{out}")))
     }
+}
+
+/// The glob as an absolute pattern that cannot walk out of the workspace.
+fn confined_pattern(workspace: &Path, pattern: &str) -> Result<String, ToolOutcome> {
+    let dir = glob_dir(pattern);
+    let rest = &pattern[dir.len()..];
+    let root = if dir.is_empty() {
+        resolve(workspace, ".")?
+    } else {
+        resolve(workspace, dir)?
+    };
+
+    if rest.is_empty() {
+        return Ok(root.display().to_string());
+    }
+    let slash = if rest.starts_with(['/', '\\']) {
+        ""
+    } else {
+        "/"
+    };
+    Ok(format!("{}{slash}{rest}", root.display()))
 }
 
 fn display_path(workspace: &Path, path: &Path) -> String {
@@ -203,5 +244,17 @@ mod tests {
         let dir = fixture();
         let outcome = Glob.run(&json!({}), dir.path()).await;
         assert!(outcome.is_error);
+    }
+
+    #[tokio::test]
+    async fn an_absolute_pattern_outside_the_workspace_is_refused() {
+        let dir = fixture();
+        let outcome = Glob.run(&json!({"pattern": "/etc/**"}), dir.path()).await;
+        assert!(outcome.is_error);
+        assert!(
+            outcome.content.contains("outside the workspace"),
+            "{}",
+            outcome.content
+        );
     }
 }

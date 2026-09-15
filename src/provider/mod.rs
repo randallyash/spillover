@@ -20,18 +20,6 @@ pub enum StreamEvent {
     /// like a stalled tier.
     Activity,
     /// What the tier says this request has cost so far.
-    ///
-    /// Emitted as soon as a frame carries it, rather than only being read off
-    /// the finished response, because a request that is *abandoned* was still
-    /// billed. A tier that loops and is thrown away has already been charged for
-    /// what it generated, and a stream killed mid-flight never reaches the frame
-    /// that would have reported its total at the end — so whatever arrived
-    /// before the kill is worth keeping.
-    ///
-    /// These restate the same figure rather than accumulating: a Command Code
-    /// run reports one usage on `model_request_end`, again on `turn_end`, and
-    /// again on its result line. A reader therefore takes the latest per
-    /// request and sums across requests.
     Usage(Usage),
 }
 
@@ -42,10 +30,6 @@ pub struct Usage {
     /// Prompt tokens the provider served from its prompt cache. Every provider
     /// with a cache bills these at a discount, so they are the difference
     /// between a cheap turn and an expensive one rather than a curiosity.
-    ///
-    /// Whether these are *part of* `prompt_tokens` or additional to it differs
-    /// by provider — OpenAI counts them in, Anthropic does not — so the two are
-    /// reported as they arrived and never added together here.
     pub cache_read_tokens: u64,
     /// Prompt tokens this request wrote into the cache, billed at a premium by
     /// the providers that charge for the write.
@@ -54,15 +38,6 @@ pub struct Usage {
 
 impl Usage {
     /// Add another request's tokens to this total.
-    ///
-    /// A total here is a sum over *requests*, not over turns: a turn can make
-    /// several requests — one per tool call — and every one of them is billed,
-    /// including the requests behind an answer that was thrown away. Counting
-    /// only the last one understates a turn in proportion to how much work it
-    /// did, which is the worst possible direction for the error.
-    ///
-    /// Saturating, like every other tally in the program, so a provider
-    /// reporting nonsense cannot panic a turn.
     pub fn absorb(&mut self, other: &Usage) {
         self.prompt_tokens = self.prompt_tokens.saturating_add(other.prompt_tokens);
         self.completion_tokens = self
@@ -78,9 +53,6 @@ impl Usage {
 }
 
 /// Fold one request's reported tokens into a running total.
-///
-/// Free rather than a method because a total that has not been reported yet is
-/// absent, which is a fact about the total rather than about any one request.
 pub fn accumulate(total: &mut Option<Usage>, more: Option<Usage>) {
     if let Some(more) = more {
         total.get_or_insert_with(Usage::default).absorb(&more);
@@ -95,10 +67,6 @@ pub struct TurnSummary {
     pub stop_reason: Option<String>,
     pub usage: Option<Usage>,
     /// The session the CLI ran under, when it names one in its own output.
-    ///
-    /// A CLI that mints its own session id (Command Code) reports it here so the
-    /// next turn can continue that session instead of resending the whole
-    /// conversation.
     pub session_id: Option<String>,
 }
 
@@ -110,10 +78,6 @@ pub struct ChatRequest {
 }
 
 /// Why a tier could not answer.
-///
-/// Deliberately transport-neutral: a tier may be an HTTP endpoint or a child
-/// process, and the caller deciding whether to spill over should not have to
-/// care which. Every message is written to be shown to a person.
 #[derive(Debug, Error)]
 pub enum ProviderError {
     #[error("could not reach {target}: {detail}")]
@@ -127,10 +91,6 @@ pub enum ProviderError {
 }
 
 /// A short, human reason for a failed request, without repeating the target.
-///
-/// `reqwest` puts the whole URL in its own message, and every caller here
-/// already names the target, so the raw text reads
-/// "could not reach http://… : error sending request for url (http://…)".
 pub fn transport_reason(error: &reqwest::Error) -> String {
     if error.is_connect() {
         "could not connect".to_string()
@@ -162,24 +122,11 @@ pub trait Provider: Send + Sync {
     ) -> Result<TurnSummary, ProviderError>;
 
     /// Why this tier cannot answer a consult, if it cannot.
-    ///
-    /// A consult is one narrow question whose answer must be prose, and the
-    /// whole mechanic rests on the consultant being *unable* to act on it. An
-    /// `openai` tier is held to that by being sent no tools, so it has nothing
-    /// to call. A `cli` tier runs its own harness and its own tools, which
-    /// spill cannot withhold — the only lever is a flag that makes the run
-    /// read-only. A tier with no such flag is refused here, and the turn
-    /// escalates, rather than being asked politely and trusted to behave.
     fn consult_refusal(&self) -> Option<String> {
         None
     }
 
     /// Ask one narrow question and take only prose back.
-    ///
-    /// The default is the ordinary request, which is already the right shape
-    /// for an HTTP tier: it carries no tools, so there is nothing to call and
-    /// the answer can only be text. A CLI overrides this, because a request it
-    /// cannot see the tools of has to be constrained on the command line.
     async fn consult(
         &self,
         request: ChatRequest,
@@ -189,34 +136,19 @@ pub trait Provider: Send + Sync {
     }
 
     /// The provider-side conversation this tier is following, if any.
-    ///
-    /// Only a delegated CLI has one: an HTTP endpoint is stateless, re-sent the
-    /// whole history every turn, and so has nothing to report. This exists so a
-    /// conversation can be written to disk and picked up again after a restart,
-    /// which is otherwise impossible — the id lives behind a lock inside the
-    /// provider and nothing else can see it.
     fn session_id(&self) -> Option<String> {
         None
     }
 
     /// Adopt the conversation this tier was following before the last restart.
-    ///
-    /// A stateless tier ignores it, which is the correct behaviour rather than a
-    /// shortcut: it has no conversation of its own to restore.
     fn set_session(&self, _id: Option<String>) {}
 
     /// Forget any continued session, because this tier's conversation was
     /// discarded and it must not resume one that holds that output.
-    ///
-    /// A stateless provider has nothing to forget, which is why this does
-    /// nothing by default.
     fn forget_session(&self) {}
 }
 
 /// Read token counts from either the Chat Completions or the Messages naming.
-///
-/// Tiers report usage in whichever shape their backend uses, and a missing or
-/// differently-named field is not worth failing a turn over.
 pub fn read_usage(value: &serde_json::Value) -> Option<Usage> {
     let read = |names: &[&str]| {
         names

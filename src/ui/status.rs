@@ -21,10 +21,6 @@ use crate::ui::{short_label, spinner};
 const BADGE_MIN_WIDTH: usize = 56;
 
 /// The cells a rate needs, held back on any rail wide enough for the badge.
-///
-/// Sized for a four-digit figure because a fast hosted stream reaches those, and
-/// a reserve that only fitted three digits would put the vanishing act back at
-/// the moment the model sped up.
 const RATE_RESERVE: usize = " ~0000 tok/s".len();
 
 pub fn render(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
@@ -33,10 +29,6 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 }
 
 /// The rail, in whichever form fits the width.
-///
-/// The width decides, by measurement, rather than the caller's idea of whether
-/// the terminal is "compact" — the rail is the only thing that knows how long
-/// its own labels are.
 pub fn rail(app: &App, theme: &Theme, width: u16) -> Line<'static> {
     let budget = width as usize;
     let badge = badge(app, theme);
@@ -123,9 +115,6 @@ pub fn rail(app: &App, theme: &Theme, width: u16) -> Line<'static> {
 }
 
 /// The streaming rate, when there is one and the padding can hold it.
-///
-/// `slack` is what the chain and the state word have left over, so a rail with no
-/// room to spare shows no rate rather than a shorter chain.
 fn rate_spans(app: &App, theme: &Theme, slack: usize) -> Option<Vec<Span<'static>>> {
     let value = app.stream_rate()?;
     let span = Span::styled(format!(" {}", rate(value)), theme.faint);
@@ -136,10 +125,6 @@ fn rate_spans(app: &App, theme: &Theme, slack: usize) -> Option<Vec<Span<'static
 /// A rate, to the precision it has earned: whole tokens once there are ten of
 /// them, and a tenth below that, where the difference between 2 and 2.5 is the
 /// difference between usable and not.
-///
-/// The tilde is not decoration. This figure is inferred from characters rather
-/// than counted, and the rail is the only place it appears, so it is marked rather
-/// than left to read as something a tier reported.
 fn rate(value: f64) -> String {
     if value >= 10.0 {
         format!("~{value:.0} tok/s")
@@ -167,10 +152,6 @@ fn badge(app: &App, theme: &Theme) -> Vec<Span<'static>> {
 }
 
 /// Cut spans down to a width, so the rail can never draw over its neighbour.
-///
-/// The last resort above is built from a name whose length is not known until it
-/// is measured, and a name is not a fixed size. Rather than trust the arithmetic
-/// to have got it right, the result is trimmed to fit.
 fn clamp(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
     let mut out: Vec<Span<'static>> = Vec::new();
     let mut used = 0usize;

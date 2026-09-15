@@ -21,12 +21,6 @@ use crate::session::{ChatMessage, Role};
 const MAX_STDERR: usize = 1_500;
 
 /// The hard instruction that leads a consult's prompt.
-///
-/// A CLI is launched read-only for a consult, and this is the other half of
-/// that: the flags are what the CLI enforces, and this says so plainly, so the
-/// model answers instead of trying to work around tools it has been told to
-/// use. It goes first, ahead of the evidence, because a CLI's own harness
-/// prompt is long and a request buried under it is a request it can ignore.
 const CONSULT_GUARD: &str = "You are being consulted, not asked to do the work. This run is \
      read-only: your tools are disabled, so do not read, write, edit, search, or run anything, \
      and do not ask to. Answer the question below in prose, in a single reply, using only what \
@@ -53,10 +47,6 @@ pub struct CliSpec {
     pub session_args: Vec<String>,
     /// Flags that continue the session spill is following, with `{session}`
     /// substituted.
-    ///
-    /// Empty means "this tier cannot continue a session", which switches the
-    /// whole mechanism off: the CLI is then handed the full transcript on every
-    /// turn, exactly as before.
     pub resume_args: Vec<String>,
     pub approve_all: bool,
     pub model: Option<String>,
@@ -71,9 +61,6 @@ impl CliSpec {
 
     /// Whether the CLI picks its own session id and reports it, rather than
     /// taking one from us.
-    ///
-    /// A CLI we can continue but cannot name must be the one choosing the id,
-    /// so there is nothing to configure: it follows from the flags.
     pub fn captures_session(&self) -> bool {
         self.continues_sessions() && self.session_args.is_empty()
     }
@@ -95,10 +82,6 @@ pub struct CliProvider {
     spec: CliSpec,
     workspace: PathBuf,
     /// The session this tier is following, once it has one.
-    ///
-    /// Behind a lock because `Provider::stream` takes `&self` and a tier is
-    /// shared. It is only ever held for a read or a write, never across an
-    /// await.
     session: Mutex<Option<String>>,
 }
 
@@ -154,9 +137,6 @@ impl CliProvider {
     }
 
     /// Substitute the placeholders an argument template may carry.
-    ///
-    /// Borrowed rather than owned so it can be reused across the several lists
-    /// that make up an invocation, and so the prompt is not copied per argument.
     fn substituter<'a>(
         &'a self,
         prompt: &'a str,
@@ -201,14 +181,6 @@ impl CliProvider {
     }
 
     /// The argument vector for a consult.
-    ///
-    /// Deliberately *not* `build_args` with a session of its own. A consult is
-    /// one stateless reply, so it carries no session flags — there is no
-    /// conversation to continue and no id worth recording. And it must never
-    /// carry the unattended flags: `--yolo` would hand back precisely the
-    /// power the read-only flags exist to remove, so a tier that normally runs
-    /// unattended is held to reading for this one call. What it does carry is
-    /// the tier's own invocation plus those read-only flags.
     fn build_consult_args(&self, prompt: &str) -> Vec<String> {
         let substitute = self.substituter(prompt, "");
 
@@ -255,12 +227,6 @@ impl Provider for CliProvider {
     }
 
     /// One consult: the question led by the guard, and the run held read-only.
-    ///
-    /// `try_consult` refuses a consultant whose `consult_refusal` is set, so by
-    /// the time this runs there are read-only flags to add. Nothing here
-    /// touches this tier's session: a consult is a fresh, stateless reply, and
-    /// it must not leave the CLI holding a conversation that a later
-    /// escalation would resume as if it were the driver's.
     async fn consult(
         &self,
         request: ChatRequest,
@@ -304,9 +270,6 @@ impl Provider for CliProvider {
 
 impl CliProvider {
     /// Spawn the CLI with these arguments and collect its answer.
-    ///
-    /// Shared by the ordinary path and the consult path, which differ only in
-    /// their arguments and in whether the run belongs to a session.
     async fn run(
         &self,
         args: Vec<String>,
@@ -403,10 +366,6 @@ impl CliProvider {
 
 /// A command that exists on every platform, with the flag it takes for a
 /// command line. For tests that need *some* installed CLI.
-///
-/// `sh` is not present on Windows, so a test naming it passes or fails by
-/// accident depending on whether Git Bash happens to be on `PATH`. This names
-/// what is actually there.
 #[cfg(test)]
 pub fn portable_shell() -> (&'static str, &'static str) {
     #[cfg(unix)]
@@ -420,11 +379,6 @@ pub fn portable_shell() -> (&'static str, &'static str) {
 }
 
 /// Where a command would be found, if it is on PATH at all.
-///
-/// The path rather than the answer, because the path is the diagnostic: "grok
-/// is installed" cannot say *which* grok, and a second copy earlier on PATH is
-/// the usual reason a tier behaves differently here than in the shell the CLI
-/// was tested in. `on_path` is this with the answer thrown away.
 pub fn which(bin: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
 
@@ -447,21 +401,11 @@ pub fn which(bin: &str) -> Option<PathBuf> {
 }
 
 /// Whether a command can be found on PATH.
-///
-/// Used to report a missing agent CLI when a tier is set up or checked, rather
-/// than at the moment it is first needed.
 pub fn on_path(bin: &str) -> bool {
     which(bin).is_some()
 }
 
 /// The newest user turn, which is all a continued session needs.
-///
-/// Everything before it is already in the CLI's own history, so sending it
-/// again would duplicate the conversation rather than extend it.
-///
-/// This is sound because a CLI tier answers in a single call: it runs its own
-/// tool loop and hands no tool calls back, so a turn never makes a second
-/// request that would need the same user message sent again.
 fn last_user_turn(messages: &[ChatMessage]) -> Option<String> {
     messages
         .iter()
@@ -472,9 +416,6 @@ fn last_user_turn(messages: &[ChatMessage]) -> Option<String> {
 }
 
 /// A CLI takes one prompt, so the conversation is flattened into it.
-///
-/// These tiers run their own agent loop and their own tools, so what they need
-/// is the transcript, not our tool protocol.
 fn render_prompt(messages: &[ChatMessage]) -> String {
     let mut out = String::new();
 
@@ -542,11 +483,6 @@ mod tests {
 
     /// A tier whose "CLI" is a shell running `body`, with the prompt passed on
     /// as the next argument (so it arrives as `$0`).
-    ///
-    /// Deliberately not an executable script written to disk: a file that is
-    /// written and then exec'd races with any other thread forking, whose child
-    /// inherits the still-open write handle and makes the exec fail with
-    /// ETXTBSY. Running `sh -c` creates no file at all.
     fn spec(body: &str, dialect: Dialect) -> CliSpec {
         CliSpec {
             bin: "sh".to_string(),

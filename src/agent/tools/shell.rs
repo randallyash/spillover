@@ -8,18 +8,28 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use crate::agent::tools::{Args, Risk, Tool, ToolOutcome, cap, object_schema};
+use crate::config::{DEFAULT_SHELL_TIMEOUT_SECS, MAX_SHELL_TIMEOUT_SECS};
 
 /// The tool's name, as the model sees it.
-///
-/// Public because the shell rules are keyed on it: a rule is only ever consulted
-/// for this tool, so both places read the same string rather than agreeing by
-/// coincidence.
 pub const NAME: &str = "run_shell";
 
-/// Commands that never finish would otherwise wedge the session.
-const TIMEOUT: Duration = Duration::from_secs(120);
+pub struct RunShell {
+    /// How long a command may run when the call does not name a timeout of its
+    /// own. Comes from `[general] shell_timeout_secs`.
+    timeout: Duration,
+}
 
-pub struct RunShell;
+impl RunShell {
+    pub fn new(timeout: Duration) -> Self {
+        Self { timeout }
+    }
+}
+
+impl Default for RunShell {
+    fn default() -> Self {
+        Self::new(Duration::from_secs(DEFAULT_SHELL_TIMEOUT_SECS))
+    }
+}
 
 #[async_trait]
 impl Tool for RunShell {
@@ -30,7 +40,9 @@ impl Tool for RunShell {
     fn description(&self) -> &'static str {
         "Run a shell command in the workspace directory and return its output and exit status. \
          Use this to build, test, and inspect the project. Long-running or interactive commands \
-         will be killed when they time out."
+         are killed when they hit the configured timeout (300 seconds unless \
+         [general] shell_timeout_secs says otherwise). Pass timeout_secs to allow a longer run \
+         of this one command, up to 1800 seconds."
     }
 
     fn parameters(&self) -> Value {
@@ -39,6 +51,11 @@ impl Tool for RunShell {
                 "command": {
                     "type": "string",
                     "description": "The command line to run."
+                },
+                "timeout_secs": {
+                    "type": "integer",
+                    "description": "How many seconds this command may run before it is killed. \
+                                    Defaults to the configured shell timeout. Maximum 1800."
                 }
             }),
             &["command"],
@@ -50,17 +67,33 @@ impl Tool for RunShell {
     }
 
     async fn preview(&self, arguments: &Value, workspace: &Path) -> String {
-        match Args::new(arguments).required_str("command") {
-            Ok(command) => format!("run in {}:\n  {command}", workspace.display()),
+        let args = Args::new(arguments);
+        match args.required_str("command") {
+            Ok(command) => match timeout_secs(args, self.timeout) {
+                Ok(seconds) => {
+                    let mut preview = format!("run in {}:\n  {command}", workspace.display());
+                    if seconds != self.timeout.as_secs() {
+                        preview.push_str(&format!("\n  (timeout {seconds}s)"));
+                    }
+                    preview
+                }
+                Err(error) => error.content,
+            },
             Err(error) => error.content,
         }
     }
 
     async fn run(&self, arguments: &Value, workspace: &Path) -> ToolOutcome {
-        let command = match Args::new(arguments).required_str("command") {
+        let args = Args::new(arguments);
+        let command = match args.required_str("command") {
             Ok(command) => command,
             Err(error) => return error,
         };
+        let seconds = match timeout_secs(args, self.timeout) {
+            Ok(seconds) => seconds,
+            Err(error) => return error,
+        };
+        let timeout = Duration::from_secs(seconds);
 
         let mut process = platform_shell(command);
         process
@@ -72,15 +105,14 @@ impl Tool for RunShell {
             // leaving it running detached.
             .kill_on_drop(true);
 
-        let output = match tokio::time::timeout(TIMEOUT, process.output()).await {
+        let output = match tokio::time::timeout(timeout, process.output()).await {
             Ok(Ok(output)) => output,
             Ok(Err(error)) => {
-                return ToolOutcome::error(format!("could not run {command:?}: {error}"));
+                return ToolOutcome::io(format!("could not run {command:?}"), &error);
             }
             Err(_) => {
                 return ToolOutcome::error(format!(
-                    "{command:?} did not finish within {}s and was killed",
-                    TIMEOUT.as_secs()
+                    "{command:?} did not finish within {seconds}s and was killed"
                 ));
             }
         };
@@ -115,6 +147,19 @@ impl Tool for RunShell {
         } else {
             ToolOutcome::ok(report)
         }
+    }
+}
+
+fn timeout_secs(args: Args<'_>, fallback: Duration) -> Result<u64, ToolOutcome> {
+    match args.optional_usize("timeout_secs") {
+        None => Ok(fallback.as_secs()),
+        Some(0) => Err(ToolOutcome::error(
+            "timeout_secs must be at least 1; omit it to use the configured default",
+        )),
+        Some(seconds) if seconds as u64 > MAX_SHELL_TIMEOUT_SECS => Err(ToolOutcome::error(
+            format!("timeout_secs is capped at {MAX_SHELL_TIMEOUT_SECS}s; pass a smaller value"),
+        )),
+        Some(seconds) => Ok(seconds as u64),
     }
 }
 
@@ -160,7 +205,7 @@ mod tests {
     #[tokio::test]
     async fn runs_a_command_and_returns_its_output() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let outcome = RunShell
+        let outcome = RunShell::default()
             .run(&json!({"command": "echo hello"}), dir.path())
             .await;
         assert!(!outcome.is_error, "{}", outcome.content);
@@ -176,7 +221,9 @@ mod tests {
     async fn runs_in_the_workspace_directory() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("marker.txt"), "x").expect("write");
-        let outcome = RunShell.run(&json!({"command": LIST}), dir.path()).await;
+        let outcome = RunShell::default()
+            .run(&json!({"command": LIST}), dir.path())
+            .await;
         assert!(
             outcome.content.contains("marker.txt"),
             "{}",
@@ -187,7 +234,7 @@ mod tests {
     #[tokio::test]
     async fn a_failing_command_is_a_tool_error_with_its_stderr() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let outcome = RunShell
+        let outcome = RunShell::default()
             .run(&json!({"command": FAIL_WITH_MESSAGE}), dir.path())
             .await;
         assert!(outcome.is_error, "{}", outcome.content);
@@ -202,7 +249,7 @@ mod tests {
     #[tokio::test]
     async fn an_unknown_command_does_not_panic() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let outcome = RunShell
+        let outcome = RunShell::default()
             .run(
                 &json!({"command": "definitely-not-a-real-command-xyz"}),
                 dir.path(),
@@ -214,7 +261,7 @@ mod tests {
     #[tokio::test]
     async fn a_command_with_no_output_says_so() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let outcome = RunShell
+        let outcome = RunShell::default()
             .run(&json!({"command": QUIET_SUCCESS}), dir.path())
             .await;
         assert!(!outcome.is_error);
@@ -228,7 +275,7 @@ mod tests {
     #[tokio::test]
     async fn a_missing_command_argument_is_reported() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let outcome = RunShell.run(&json!({}), dir.path()).await;
+        let outcome = RunShell::default().run(&json!({}), dir.path()).await;
         assert!(outcome.is_error);
         assert!(outcome.content.contains("command"), "{}", outcome.content);
     }
@@ -236,7 +283,7 @@ mod tests {
     #[tokio::test]
     async fn the_preview_shows_the_command_and_directory() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let preview = RunShell
+        let preview = RunShell::default()
             .preview(&json!({"command": "cargo test"}), dir.path())
             .await;
         assert!(preview.contains("cargo test"), "{preview}");
@@ -258,7 +305,7 @@ mod tests {
         // `'echo hello'` in front of `cmd`, whose single quotes are not quoting
         // at all, so the command failed and the test proved the opposite of its
         // point.
-        let outcome = RunShell
+        let outcome = RunShell::default()
             .run(&json!({"command": "echo hello"}), dir.path())
             .await;
 
@@ -268,5 +315,65 @@ mod tests {
             outcome.undo.is_none(),
             "a shell command must never claim to be reversible"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_command_that_overruns_its_timeout_is_killed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outcome = RunShell::default()
+            .run(
+                &json!({"command": "sleep 5", "timeout_secs": 1}),
+                dir.path(),
+            )
+            .await;
+        assert!(outcome.is_error, "{}", outcome.content);
+        assert!(
+            outcome.content.contains("did not finish within 1s"),
+            "{}",
+            outcome.content
+        );
+    }
+
+    #[tokio::test]
+    async fn a_zero_timeout_is_refused_rather_than_killing_immediately() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outcome = RunShell::default()
+            .run(
+                &json!({"command": "echo hi", "timeout_secs": 0}),
+                dir.path(),
+            )
+            .await;
+        assert!(outcome.is_error);
+        assert!(
+            outcome.content.contains("at least 1"),
+            "{}",
+            outcome.content
+        );
+    }
+
+    #[tokio::test]
+    async fn a_timeout_above_the_cap_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outcome = RunShell::default()
+            .run(
+                &json!({"command": "echo hi", "timeout_secs": 10_000}),
+                dir.path(),
+            )
+            .await;
+        assert!(outcome.is_error);
+        assert!(outcome.content.contains("capped"), "{}", outcome.content);
+    }
+
+    #[tokio::test]
+    async fn the_preview_names_a_timeout_the_call_chose() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let preview = RunShell::default()
+            .preview(
+                &json!({"command": "cargo test", "timeout_secs": 600}),
+                dir.path(),
+            )
+            .await;
+        assert!(preview.contains("timeout 600s"), "{preview}");
     }
 }

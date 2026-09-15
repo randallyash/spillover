@@ -62,9 +62,6 @@ impl Parser for PlainParser {
 
 /// Command Code prints `{"type":"event",…}` frames as it works and one
 /// `{"type":"result",…}` line carrying `finalText` at the end.
-///
-/// It mints its own session id and names it in the `run_start` event and again
-/// on the result line, so it is picked up here for the next turn to resume.
 #[derive(Default)]
 pub struct CommandCodeParser {
     text: String,
@@ -183,11 +180,6 @@ impl Parser for CommandCodeParser {
 }
 
 /// Usage from a Command Code event frame, wherever it sits.
-///
-/// `model_request_end` and `turn_end` carry it at the top level; `run_end` nests
-/// it under `result`. All three arrive *before* the run is over, which is the
-/// reason to look for them at all: a run that is killed or cancelled mid-flight
-/// never reaches its final `result` line, and its bills are still owed.
 fn command_code_usage(inner: &Value) -> Option<Usage> {
     let direct = inner.get("usage").filter(|usage| !usage.is_null());
     let nested = inner

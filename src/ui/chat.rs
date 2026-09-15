@@ -84,9 +84,6 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
 }
 
 /// The whole transcript as styled lines.
-///
-/// Separated from the frame so the shaping — gutters, spacing, the caret, where
-/// a line breaks — is testable without a terminal.
 pub fn lines(app: &App, theme: &Theme, width: usize) -> Vec<Line<'static>> {
     let text_width = width.saturating_sub(GUTTER).max(1);
     let mut out: Vec<Line<'static>> = Vec::new();
@@ -135,10 +132,6 @@ pub fn lines(app: &App, theme: &Theme, width: usize) -> Vec<Line<'static>> {
 }
 
 /// A user turn or an app notice: wrapped as it was written, with no markdown.
-///
-/// The user's own words are not reinterpreted, and a notice is generated here
-/// with a leading glyph the transcript colors by — so neither is a candidate for
-/// parsing.
 fn plain(
     text: &str,
     width: usize,
@@ -192,12 +185,6 @@ fn gutter_span(role: Role, theme: &Theme) -> Span<'static> {
 }
 
 /// How a message is drawn.
-///
-/// A system notice leads with the glyph that says what happened — `→` while a
-/// tool runs, `✓` when it worked, `✗` when it did not, `!` for something worth
-/// noticing — so its color is a second reading of the same signal rather than
-/// the only one. That is what keeps the transcript legible in monochrome and to
-/// a reader who cannot tell the hues apart.
 fn style_for(role: Role, text: &str, theme: &Theme) -> ratatui::style::Style {
     match role {
         Role::User => theme.user,

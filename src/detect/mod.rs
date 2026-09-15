@@ -8,22 +8,13 @@ pub mod progress;
 pub mod repetition;
 
 use std::fmt;
+use std::io;
 use std::time::{Duration, Instant};
 
 use crate::config::Limits;
 use crate::detect::repetition::RepetitionDetector;
 
 /// What kind of failure a tool reported.
-///
-/// The point of this is to tell a model that is stuck against one wall from a
-/// model having an unlucky run. Three different reads that *succeed* are work;
-/// three reads of a path that does not exist are the model guessing. Counting the
-/// kind is what separates them.
-///
-/// Classification reads the tool's own message, which this project writes: the
-/// file tools wrap `std::io::Error`, and the argument checks are ours. An
-/// unrecognised message is `Other` rather than a guess at a neighbouring class,
-/// because a wrong class would tighten a budget that has no business being tight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorClass {
     /// The file or directory is not there.
@@ -40,13 +31,19 @@ pub enum ErrorClass {
 }
 
 impl ErrorClass {
+    /// Classify a filesystem or process error from its kind, not from the
+    /// words it happens to print.
+    pub fn from_io(err: &io::Error) -> Self {
+        match err.kind() {
+            io::ErrorKind::NotFound => Self::NotFound,
+            io::ErrorKind::PermissionDenied => Self::PermissionDenied,
+            io::ErrorKind::TimedOut | io::ErrorKind::Interrupted => Self::Timeout,
+            io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => Self::InvalidArguments,
+            _ => Self::Other,
+        }
+    }
+
     /// Classify a failed tool's message.
-    ///
-    /// Ordered most specific first, and the needles are deliberately narrow: a
-    /// bare "not found" would also match "old_string was not found", which is the
-    /// model's argument being wrong rather than the file being absent. A needle
-    /// that is a substring of another class's message is a needle that will
-    /// eventually misfile one.
     pub fn classify(message: &str) -> Self {
         let text = message.to_lowercase();
         let has = |needles: &[&str]| needles.iter().any(|needle| text.contains(needle));
@@ -80,6 +77,7 @@ impl ErrorClass {
             "old_string was not found",
             "there is no tool called",
             "was not valid json",
+            "outside the workspace",
         ]) {
             return Self::InvalidArguments;
         }
@@ -101,33 +99,12 @@ impl ErrorClass {
     }
 
     /// Whether a repeat of this failure only counts when it is the *same* call.
-    ///
-    /// True for the classes that report on the world: three missing files at
-    /// three different paths are three different obstacles — which is exactly
-    /// what looking for a `.env`, a `Makefile` and a `pyproject.toml` looks like
-    /// — where three at the same path is one obstacle the model keeps walking
-    /// into.
-    ///
-    /// False for a malformed call, which is the model's own output being wrong
-    /// wherever it was aimed: a fourth bad argument is the same wall as the first
-    /// three, and the target says nothing about it.
     pub fn needs_the_same_target(self) -> bool {
         !matches!(self, Self::InvalidArguments)
     }
 
     /// How many times this class may repeat before it is a stall, when repeating
     /// it is evidence of anything at all.
-    ///
-    /// `None` for the classes where it is not: a timeout may well work on the
-    /// next try, and an unrecognised failure is not known to mean anything.
-    /// Those are left entirely to the tier's own `max_repeat_run`, and a genuine
-    /// run of them is reported by the general failure rule rather than as one
-    /// wall.
-    ///
-    /// `Some` is never larger than the configured allowance, so this can only
-    /// make detection tighter and can never loosen a tier that configured itself
-    /// strictly. Three is the floor for the classes where repetition means the
-    /// model is not adapting: it has been shown the same thing three times.
     pub fn repeat_budget(self, configured: usize) -> Option<usize> {
         match self {
             Self::NotFound | Self::PermissionDenied | Self::InvalidArguments => {
@@ -153,10 +130,6 @@ pub enum StuckReason {
     /// Consecutive tool calls all failed, so it is not learning from them.
     RepeatedToolFailure { tool: String, times: usize },
     /// The same kind of failure, from the same tool, over and over.
-    ///
-    /// Stronger evidence than `RepeatedToolFailure`: a general run of failures
-    /// can be bad luck, where the *same* failure repeating says the model has
-    /// been shown the same wall and is not adapting to it.
     RepeatedToolError {
         tool: String,
         class: ErrorClass,
@@ -169,11 +142,6 @@ pub enum StuckReason {
     /// The tier failed at the transport, protocol or HTTP level.
     Failed { detail: String },
     /// The user stopped the turn.
-    ///
-    /// Not really "stuck", but it ends an attempt the same way, and giving it a
-    /// home here is what lets the turn loop stop through the one path it already
-    /// has. `run_turn` treats it separately: a cancelled turn is not spilled to
-    /// the next tier, because nobody asked for a different model.
     Cancelled,
 }
 
@@ -210,10 +178,6 @@ impl fmt::Display for StuckReason {
 }
 
 /// Which of the two allowances was in force at the end of an attempt.
-///
-/// Worth naming, because the same silence means opposite things either side of
-/// the first frame: before it, a model may still be loading its weights; after
-/// it, a stream that has stopped has stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
     /// Nothing had arrived yet.
@@ -243,19 +207,11 @@ pub struct Timing {
     pub first_token_ms: u64,
     pub idle_ms: u64,
     /// The budget the worst gap was measured against.
-    ///
-    /// The phase that applied *to that wait*, not the one in force when the
-    /// attempt ended: those are different, and pairing a gap with the other
-    /// budget's name is how a report ends up calling a ten-second first-token
-    /// allowance an idle one.
     pub worst_phase: Phase,
 }
 
 impl Timing {
     /// How much of its own allowance the worst wait used.
-    ///
-    /// `None` when nothing was ever waited on, which is not the same as a wait of
-    /// zero and must not read as a near miss.
     pub fn worst_fraction(&self) -> Option<f64> {
         (self.worst_allowance_ms > 0)
             .then(|| self.worst_gap_ms as f64 / self.worst_allowance_ms as f64)
@@ -263,10 +219,6 @@ impl Timing {
 }
 
 /// Watches one streaming attempt for signs that it has gone wrong.
-///
-/// Two different allowances matter: before anything has arrived, a slow start is
-/// normal (a local model may still be loading weights), so it gets the longer
-/// first-token budget. Afterwards, silence means the stream has stopped.
 pub struct Watchdog {
     repetition: RepetitionDetector,
     first_token: Duration,
@@ -275,11 +227,6 @@ pub struct Watchdog {
     /// When the current request began, for measuring the wait for its first frame.
     started: Instant,
     /// When the last frame of this request arrived, or `None` before any has.
-    ///
-    /// Cleared per request rather than carried across: the gap between one
-    /// request's last frame and the next one's first would otherwise include the
-    /// tool call that ran in between, which can be minutes long and has nothing
-    /// to do with how the model is behaving.
     last_frame: Option<Instant>,
     /// The gap that came closest to its own allowance, that allowance, and the
     /// budget the two of them belong to.
@@ -300,11 +247,6 @@ impl Watchdog {
     }
 
     /// Start timing one request, keeping what is already known about the tier.
-    ///
-    /// `alive` deliberately survives: a server that answered once is warm, so
-    /// the next request gets the shorter idle budget rather than the generous
-    /// first-token one again. The worst wait survives too — it is the attempt's
-    /// figure, and an attempt is several requests.
     pub fn begin_request(&mut self) {
         self.started = Instant::now();
         self.last_frame = None;
@@ -325,11 +267,6 @@ impl Watchdog {
     }
 
     /// Any frame at all, which is what keeps a request from being a stall.
-    ///
-    /// The gap is measured here rather than by a timer because this is the only
-    /// moment the figure is knowable: how long the silence lasted is the time
-    /// since the last frame, or since the request began when there has not been
-    /// one yet.
     fn touch(&mut self) {
         let now = Instant::now();
         let since = self.last_frame.unwrap_or(self.started);
@@ -555,6 +492,23 @@ mod tests {
     // ---- classifying a failure --------------------------------------------
 
     #[test]
+    fn an_io_error_is_classified_from_its_kind_not_its_text() {
+        // The words can be in any language; the kind is the fact.
+        let missing = io::Error::new(io::ErrorKind::NotFound, "Datei nicht gefunden");
+        assert_eq!(ErrorClass::from_io(&missing), ErrorClass::NotFound);
+        let denied = io::Error::new(io::ErrorKind::PermissionDenied, "Zugriff verweigert");
+        assert_eq!(ErrorClass::from_io(&denied), ErrorClass::PermissionDenied);
+        let timed = io::Error::new(io::ErrorKind::TimedOut, "whatever");
+        assert_eq!(ErrorClass::from_io(&timed), ErrorClass::Timeout);
+        let other = io::Error::new(io::ErrorKind::BrokenPipe, "No such file or directory");
+        assert_eq!(
+            ErrorClass::from_io(&other),
+            ErrorClass::Other,
+            "the kind wins even when the text would have said otherwise"
+        );
+    }
+
+    #[test]
     fn a_wrapped_io_error_is_classified_by_the_error_underneath() {
         // The exact shape read_file produces: our own wrapper, then the OS error
         // that says which kind of failure this actually is.
@@ -605,6 +559,7 @@ mod tests {
             "\"src/*.rs\" is not a valid glob: unexpected end of input",
             "old_string was not found in /x/a.rs; read the file and match its text exactly",
             "there is no tool called \"read\"",
+            "src/secret.rs is outside the workspace (/work); file tools only read and write inside it",
         ] {
             assert_eq!(
                 ErrorClass::classify(message),

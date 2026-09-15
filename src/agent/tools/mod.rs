@@ -12,12 +12,13 @@ pub mod read;
 pub mod shell;
 pub mod write;
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use crate::agent::undo::Undo;
+use crate::detect::ErrorClass;
 
 use crate::session::ToolSpec;
 
@@ -35,10 +36,6 @@ pub enum Risk {
 
 impl Risk {
     /// Whether tools up to this level may be used.
-    ///
-    /// This is the ceiling a run is held to, not the risk of one tool: a run
-    /// allowed `Read` may only use tools that read, which is how a read-only
-    /// mode is enforced rather than merely requested.
     pub fn permits(self, needed: Risk) -> bool {
         match self {
             Risk::Write => true,
@@ -52,17 +49,9 @@ pub struct ToolOutcome {
     pub content: String,
     pub is_error: bool,
     /// How to put back what this changed.
-    ///
-    /// `None` for a tool that changes nothing, and for one whose change cannot be
-    /// reversed at all — a shell command can do anything, so claiming it could be
-    /// undone would be worse than offering nothing. Only a *successful* write
-    /// carries one: a write that failed changed nothing to put back.
-    ///
-    /// Boxed because a `ToolOutcome` is also the error half of argument
-    /// validation, where it is returned by value on every call; holding the
-    /// snapshot inline made every one of those returns a hundred-odd bytes of
-    /// stack. The allocation happens once per write, which is nothing.
     pub undo: Option<Box<Undo>>,
+    /// What kind of failure this is, when it is one.
+    pub class: Option<ErrorClass>,
 }
 
 impl ToolOutcome {
@@ -71,21 +60,32 @@ impl ToolOutcome {
             content: content.into(),
             is_error: false,
             undo: None,
+            class: None,
         }
     }
 
     pub fn error(message: impl Into<String>) -> Self {
+        let content = message.into();
+        let class = ErrorClass::classify(&content);
         Self {
-            content: message.into(),
+            content,
             is_error: true,
             undo: None,
+            class: Some(class),
+        }
+    }
+
+    /// A filesystem or process failure, classified from the error's kind.
+    pub fn io(context: impl std::fmt::Display, err: &std::io::Error) -> Self {
+        Self {
+            content: format!("{context}: {err}"),
+            is_error: true,
+            undo: None,
+            class: Some(ErrorClass::from_io(err)),
         }
     }
 
     /// Attach the means to reverse this change.
-    ///
-    /// A builder rather than a constructor argument, so the two constructors
-    /// above stay as they are and no existing call site has to know about undo.
     pub fn undoing(mut self, undo: Undo) -> Self {
         self.undo = Some(Box::new(undo));
         self
@@ -101,9 +101,6 @@ pub trait Tool: Send + Sync {
     fn risk(&self) -> Risk;
 
     /// What this specific call is about to do, shown before a risky tool runs.
-    ///
-    /// Async because the useful answer sometimes requires reading: `edit_file`
-    /// shows the actual diff rather than just the path.
     async fn preview(&self, arguments: &Value, workspace: &Path) -> String;
 
     async fn run(&self, arguments: &Value, workspace: &Path) -> ToolOutcome;
@@ -124,13 +121,16 @@ pub struct Registry {
 
 impl Registry {
     /// The whole agent. Seven tools, and that is the budget for 0.1.x.
-    ///
-    /// Every tool is another way for a local model to loop and another way for
-    /// spill to drift into being a worse copy of a harness it is not trying to
-    /// be, so the set is closed on purpose: no MCP, no browser, no image tools.
-    /// `the_tool_set_is_closed` fails if an eighth appears, which is the point —
-    /// a new tool should have to be argued for rather than added.
+    #[cfg(test)]
     pub fn with_default_tools() -> Self {
+        Self::with_shell_timeout(std::time::Duration::from_secs(
+            crate::config::DEFAULT_SHELL_TIMEOUT_SECS,
+        ))
+    }
+
+    /// The same seven tools, with `run_shell` held to this timeout unless a
+    /// call names a shorter or longer one of its own.
+    pub fn with_shell_timeout(timeout: std::time::Duration) -> Self {
         let mut registry = Self::default();
         registry.add(read::ReadFile);
         registry.add(list::ListDir);
@@ -138,7 +138,7 @@ impl Registry {
         registry.add(grep::Grep);
         registry.add(write::WriteFile);
         registry.add(edit::EditFile);
-        registry.add(shell::RunShell);
+        registry.add(shell::RunShell::new(timeout));
         registry
     }
 
@@ -154,15 +154,6 @@ impl Registry {
     }
 
     /// The specs for a run held to `ceiling`.
-    ///
-    /// There is deliberately no accessor that ignores the ceiling: listing
-    /// tools is only ever done to offer them to a model, and which tools may be
-    /// offered is exactly what the ceiling decides.
-    ///
-    /// A read-only run is never offered a write tool, so the model does not
-    /// spend turns reaching for one and being refused. That refusal still
-    /// happens — see the check in the agent loop — because withholding the
-    /// offer is a courtesy to a well-behaved model, not a guarantee.
     pub fn specs_permitting(&self, ceiling: Risk) -> Vec<ToolSpec> {
         self.tools
             .iter()
@@ -242,10 +233,33 @@ pub fn should_skip(name: &str) -> bool {
     SKIPPED_DIRS.contains(&name)
 }
 
-/// Resolve a model-supplied path against the workspace, expanding `~`.
-pub fn resolve(workspace: &Path, raw: &str) -> PathBuf {
+/// Resolve a model-supplied path against the workspace, expanding `~`, and
+/// refuse it if the result would land outside.
+pub fn resolve(workspace: &Path, raw: &str) -> Result<PathBuf, ToolOutcome> {
+    confine(workspace, &expand(raw), raw.trim())
+}
+
+/// The directory part of a glob, up to the first `*`, `?` or `[`, so the
+/// pattern can be confined before it is walked.
+pub fn glob_dir(pattern: &str) -> &str {
+    let literal = match pattern.find(['*', '?', '[']) {
+        Some(index) => &pattern[..index],
+        None => pattern,
+    };
+    match literal.rfind(['/', '\\']) {
+        Some(index) => &pattern[..=index],
+        None => "",
+    }
+}
+
+/// Whether `candidate` is the workspace or a path inside it.
+pub fn is_inside(workspace: &Path, candidate: &Path) -> bool {
+    candidate.starts_with(workspace)
+}
+
+fn expand(raw: &str) -> PathBuf {
     let raw = raw.trim();
-    let expanded = if raw == "~" {
+    if raw == "~" {
         home().unwrap_or_else(|| PathBuf::from(raw))
     } else if let Some(rest) = raw.strip_prefix("~/") {
         home()
@@ -253,13 +267,97 @@ pub fn resolve(workspace: &Path, raw: &str) -> PathBuf {
             .unwrap_or_else(|| PathBuf::from(raw))
     } else {
         PathBuf::from(raw)
-    };
-
-    if expanded.is_absolute() {
-        expanded
-    } else {
-        workspace.join(expanded)
     }
+}
+
+fn confine(workspace: &Path, requested: &Path, named: &str) -> Result<PathBuf, ToolOutcome> {
+    let workspace = std::fs::canonicalize(workspace).map_err(|error| {
+        ToolOutcome::io(
+            format!(
+                "the workspace {} is not a usable directory",
+                workspace.display()
+            ),
+            &error,
+        )
+    })?;
+
+    let requested = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        workspace.join(requested)
+    };
+    let lexical = lexical_normalise(&requested);
+
+    match std::fs::canonicalize(&lexical) {
+        Ok(canon) => require_inside(&workspace, &canon, named),
+        Err(_) => {
+            let (ancestor, missing) = split_missing(&lexical);
+            let base = std::fs::canonicalize(&ancestor).unwrap_or(ancestor);
+            require_inside(&workspace, &base, named)?;
+            let mut out = base;
+            for part in missing {
+                out.push(part);
+            }
+            require_inside(&workspace, &out, named)
+        }
+    }
+}
+
+fn require_inside(workspace: &Path, candidate: &Path, named: &str) -> Result<PathBuf, ToolOutcome> {
+    if is_inside(workspace, candidate) {
+        Ok(candidate.to_path_buf())
+    } else {
+        Err(outside(named, workspace))
+    }
+}
+
+fn outside(named: &str, workspace: &Path) -> ToolOutcome {
+    ToolOutcome::error(format!(
+        "{named} is outside the workspace ({}); file tools only read and write inside it",
+        workspace.display()
+    ))
+}
+
+/// Drop `.` and apply `..` without touching the filesystem, so a walk out of
+/// the workspace is visible before we try to open anything.
+fn lexical_normalise(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => out.push(component),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                }
+            }
+            Component::Normal(_) => out.push(component),
+        }
+    }
+    out
+}
+
+/// Split a path that does not exist yet into the longest ancestor that does,
+/// and the components still to be created.
+fn split_missing(path: &Path) -> (PathBuf, Vec<std::ffi::OsString>) {
+    let mut ancestor = path.to_path_buf();
+    let mut missing = Vec::new();
+    while !ancestor.exists() {
+        match ancestor.file_name() {
+            Some(name) => {
+                missing.push(name.to_os_string());
+                match ancestor.parent() {
+                    Some(parent) if !parent.as_os_str().is_empty() => {
+                        ancestor = parent.to_path_buf();
+                    }
+                    _ => break,
+                }
+            }
+            None => break,
+        }
+    }
+    missing.reverse();
+    (ancestor, missing)
 }
 
 fn home() -> Option<PathBuf> {
@@ -403,38 +501,110 @@ mod tests {
         assert!(Risk::Write.permits(Risk::Write));
     }
 
+    fn workspace() -> tempfile::TempDir {
+        tempfile::tempdir().expect("tempdir")
+    }
+
     #[test]
     fn relative_paths_are_resolved_against_the_workspace() {
-        let workspace = Path::new("/work");
+        let dir = workspace();
+        std::fs::create_dir(dir.path().join("src")).expect("mkdir");
+        std::fs::write(dir.path().join("src/main.rs"), "").expect("write");
+        let got = resolve(dir.path(), "src/main.rs").expect("inside");
         assert_eq!(
-            resolve(workspace, "src/main.rs"),
-            PathBuf::from("/work/src/main.rs")
-        );
-        assert_eq!(
-            resolve(workspace, "./a.txt"),
-            PathBuf::from("/work/./a.txt")
-        );
-    }
-
-    #[test]
-    fn absolute_paths_are_left_alone() {
-        let workspace = Path::new("/work");
-        assert_eq!(
-            resolve(workspace, "/etc/hosts"),
-            PathBuf::from("/etc/hosts")
+            got,
+            std::fs::canonicalize(dir.path().join("src/main.rs")).expect("canon")
         );
     }
 
     #[test]
-    fn a_leading_tilde_expands_to_the_home_directory() {
+    fn a_path_that_does_not_exist_yet_is_still_confined() {
+        let dir = workspace();
+        let got = resolve(dir.path(), "a/b/new.txt").expect("inside");
+        let root = std::fs::canonicalize(dir.path()).expect("canon");
+        assert!(
+            is_inside(&root, &got),
+            "{} should be under {}",
+            got.display(),
+            root.display()
+        );
+        assert_eq!(got.file_name().and_then(|n| n.to_str()), Some("new.txt"));
+    }
+
+    #[test]
+    fn an_absolute_path_inside_the_workspace_is_accepted() {
+        let dir = workspace();
+        std::fs::write(dir.path().join("a.txt"), "x").expect("write");
+        let absolute = std::fs::canonicalize(dir.path().join("a.txt")).expect("canon");
+        let got = resolve(dir.path(), &absolute.to_string_lossy()).expect("inside");
+        assert_eq!(got, absolute);
+    }
+
+    #[test]
+    fn an_absolute_path_outside_the_workspace_is_refused() {
+        let dir = workspace();
+        let error = resolve(dir.path(), "/etc/hosts").expect_err("must refuse");
+        assert!(error.is_error);
+        assert!(
+            error.content.contains("outside the workspace"),
+            "{}",
+            error.content
+        );
+    }
+
+    #[test]
+    fn a_parent_walk_out_of_the_workspace_is_refused() {
+        let dir = workspace();
+        let error = resolve(dir.path(), "../secret").expect_err("must refuse");
+        assert!(
+            error.content.contains("outside the workspace"),
+            "{}",
+            error.content
+        );
+    }
+
+    #[test]
+    fn a_leading_tilde_is_refused_when_home_is_not_the_workspace() {
+        let dir = workspace();
         let Some(home) = home() else {
             return;
         };
-        assert_eq!(
-            resolve(Path::new("/work"), "~/notes.txt"),
-            home.join("notes.txt")
+        if is_inside(
+            &std::fs::canonicalize(dir.path()).unwrap_or_else(|_| dir.path().to_path_buf()),
+            &home,
+        ) {
+            return;
+        }
+        let error = resolve(dir.path(), "~/notes.txt").expect_err("must refuse");
+        assert!(
+            error.content.contains("outside the workspace"),
+            "{}",
+            error.content
         );
-        assert_eq!(resolve(Path::new("/work"), "~"), home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_that_leaves_the_workspace_is_refused() {
+        let dir = workspace();
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(outside.path().join("secret"), "nope").expect("write");
+        std::os::unix::fs::symlink(outside.path().join("secret"), dir.path().join("link"))
+            .expect("symlink");
+        let error = resolve(dir.path(), "link").expect_err("must refuse");
+        assert!(
+            error.content.contains("outside the workspace"),
+            "{}",
+            error.content
+        );
+    }
+
+    #[test]
+    fn glob_dir_is_the_literal_prefix_before_the_first_wildcard() {
+        assert_eq!(glob_dir("src/*.rs"), "src/");
+        assert_eq!(glob_dir("**/*.toml"), "");
+        assert_eq!(glob_dir("main.rs"), "");
+        assert_eq!(glob_dir("/etc/**"), "/etc/");
     }
 
     #[test]

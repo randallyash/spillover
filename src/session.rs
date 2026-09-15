@@ -27,10 +27,6 @@ impl Role {
 }
 
 /// A tool the model asked to call, with its arguments still as raw JSON text.
-///
-/// Arguments are kept as a string rather than parsed so a malformed or empty
-/// argument blob is reported to the model as a tool error instead of being
-/// silently dropped here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolCall {
@@ -113,12 +109,6 @@ impl Session {
 
     /// Rebuild a session from a previous run: a fresh system prompt, then the
     /// conversation that was saved under the old one.
-    ///
-    /// The prompt is passed in rather than restored because it is derived from
-    /// the mode and the workspace, and both of those are known at startup. A
-    /// saved prompt would be a stale copy of a decision already made elsewhere,
-    /// and resuming into plan mode's instructions while in build mode is a bug
-    /// waiting to happen.
     pub fn restore(prompt: impl Into<String>, messages: Vec<ChatMessage>) -> Self {
         let mut session = Self::with_system_prompt(prompt);
         // Anything that claims to be a system message is dropped: there is
@@ -139,9 +129,6 @@ impl Session {
     }
 
     /// The conversation, without the system prompt.
-    ///
-    /// This is what gets persisted: the prompt is reconstructed on the next
-    /// start, and storing it would only create a second copy to keep in step.
     pub fn conversation(&self) -> Vec<ChatMessage> {
         self.messages
             .iter()
@@ -151,10 +138,6 @@ impl Session {
     }
 
     /// Drop everything after `len` messages.
-    ///
-    /// Used to discard a failed attempt before retrying the same turn on
-    /// another tier: the next model must not inherit a half-finished answer
-    /// from a model that was looping.
     pub fn truncate(&mut self, len: usize) {
         self.messages.truncate(len);
     }
@@ -165,11 +148,6 @@ impl Session {
     }
 
     /// Swap the system prompt for a new one, in place.
-    ///
-    /// The prompt is the first message of the conversation, so a mode that
-    /// changes what a turn may do changes it here. A session that somehow has no
-    /// system prompt gets the new one prepended rather than being left without
-    /// instructions.
     pub fn replace_system_prompt(&mut self, prompt: impl Into<String>) {
         let prompt = ChatMessage::system(prompt);
         match self.messages.first_mut() {
@@ -180,16 +158,6 @@ impl Session {
 
     /// Replace the older half of the conversation with a short ledger of what
     /// happened in it.
-    ///
-    /// This is the deterministic kind of compaction: no model is asked to
-    /// summarize, so it costs nothing, works while the active tier is
-    /// misbehaving, and cannot degrade into the weak model paraphrasing the
-    /// evidence it was too weak to use. What it replaces is decided by turn
-    /// boundaries and what it keeps is a record of *actions* — which tools ran
-    /// and how they went — because the README promises that a tier's side
-    /// effects survive even when its conversation does not.
-    ///
-    /// Returns what it did, so the user can be told.
     pub fn compact(&mut self, keep_turns: usize) -> Compaction {
         let before_messages = self.messages.len();
         let chars_before: usize = self.messages.iter().map(|m| m.content.len()).sum();
@@ -293,12 +261,6 @@ impl Compaction {
 }
 
 /// A short record of what happened in the messages being dropped.
-///
-/// Deliberately about actions rather than prose: the point of compaction is to
-/// stop paying for text, but a tool that ran has already changed the world and
-/// the next tier must not be told it never happened. Assistant text is kept to
-/// one clipped line, because a conclusion the model reached is worth something
-/// and the whole paragraph is not.
 fn ledger_for(dropped: &[ChatMessage]) -> String {
     const MAX_LINE: usize = 100;
     const MAX_ENTRIES: usize = 40;
@@ -464,11 +426,6 @@ mod tests {
     // ---- compaction -------------------------------------------------------
 
     /// A session of `turns` exchanges with realistically-sized messages.
-    ///
-    /// The sizes matter: the ledger keeps one clipped line per message, so
-    /// compaction only wins when what it drops is bigger than that — which is
-    /// true of a real tool result or a paragraph of prose, and not true of a
-    /// three-word test string.
     fn conversation(turns: usize) -> Session {
         let mut session = Session::with_system_prompt("be brief");
         for turn in 0..turns {

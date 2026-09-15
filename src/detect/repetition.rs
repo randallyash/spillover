@@ -14,13 +14,15 @@ const NGRAM: usize = 12;
 const MAX_TRACKED: usize = 4_096;
 /// Repeats below this are not a loop, whatever the configuration says.
 const MIN_THRESHOLD: usize = 2;
+/// Consecutive identical lines shorter than this are punctuation — a closing
+/// brace, a lone `end` — rather than a loop. They still feed the span detector.
+const MIN_LINE_TOKENS: usize = 2;
+/// A recurring span only counts as a loop when it makes up this much of what
+/// has been written. Otherwise a file that happens to repeat a 12-token
+/// signature a few times looks like collapse.
+const MIN_SPAN_FRACTION: f64 = 0.25;
 
 /// What the detector has seen so far.
-///
-/// The counts are kept rather than only the verdict, because "it looped" and
-/// "how close did it come" are different questions and only the second one can
-/// be tuned. A verdict thrown away at the threshold leaves nothing to read after
-/// the fact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RepetitionCounters {
     /// The run of identical consecutive lines currently standing.
@@ -39,6 +41,9 @@ pub struct RepetitionDetector {
     consecutive: usize,
     recent_tokens: VecDeque<String>,
     span_counts: HashMap<Vec<String>, usize>,
+    /// Tokens fed so far, so a repeating span can be judged as a fraction of
+    /// the answer rather than in isolation.
+    tokens_seen: usize,
 }
 
 impl RepetitionDetector {
@@ -50,14 +55,11 @@ impl RepetitionDetector {
             consecutive: 0,
             recent_tokens: VecDeque::new(),
             span_counts: HashMap::new(),
+            tokens_seen: 0,
         }
     }
 
     /// How close it came, for a turn that ended without looping.
-    ///
-    /// `span_repeats` is the worst any one span reached rather than the count for
-    /// the span that happens to be current, because that is the figure that says
-    /// how near a loop the answer wandered.
     pub fn counters(&self) -> RepetitionCounters {
         RepetitionCounters {
             consecutive: self.consecutive,
@@ -91,14 +93,24 @@ impl RepetitionDetector {
             return None;
         }
 
-        if line == self.last_line {
-            self.consecutive += 1;
+        let token_count = line.split_whitespace().count();
+        // A run of `}` or `end` is what a real file looks like, not a loop.
+        // Short lines still break a consecutive run of a longer one, and they
+        // still feed the span detector.
+        if token_count >= MIN_LINE_TOKENS {
+            if line == self.last_line {
+                self.consecutive += 1;
+            } else {
+                self.last_line = line.clone();
+                self.consecutive = 1;
+            }
         } else {
-            self.last_line = line.clone();
-            self.consecutive = 1;
+            self.last_line.clear();
+            self.consecutive = 0;
         }
 
         for token in line.split_whitespace() {
+            self.tokens_seen += 1;
             self.recent_tokens.push_back(token.to_string());
             if self.recent_tokens.len() > NGRAM {
                 self.recent_tokens.pop_front();
@@ -128,24 +140,39 @@ impl RepetitionDetector {
         }
 
         let span: Vec<String> = self.recent_tokens.iter().cloned().collect();
+        if span_is_structural(&span) {
+            return None;
+        }
+
         let count = self.span_counts.entry(span).or_insert(0);
         *count += 1;
 
         if *count >= self.threshold {
-            return Some(StuckReason::Repetition {
-                sample: shorten(
-                    &self
-                        .recent_tokens
-                        .iter()
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                ),
-                repeats: *count,
-            });
+            let covered = NGRAM * *count;
+            let fraction = covered as f64 / self.tokens_seen.max(1) as f64;
+            if fraction >= MIN_SPAN_FRACTION {
+                return Some(StuckReason::Repetition {
+                    sample: shorten(
+                        &self
+                            .recent_tokens
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    ),
+                    repeats: *count,
+                });
+            }
         }
         None
     }
+}
+
+/// Braces, brackets and punctuation with no words: what a source file is full
+/// of, and never a loop by itself.
+fn span_is_structural(span: &[String]) -> bool {
+    span.iter()
+        .all(|token| token.chars().all(|c| !c.is_alphanumeric()))
 }
 
 fn normalise(line: &str) -> String {
@@ -235,9 +262,9 @@ mod tests {
         let mut detector = RepetitionDetector::new(2);
         assert!(detector.feed("repea").is_none());
         // Completes the first line; not yet a repeat.
-        assert!(detector.feed("ted\n").is_none());
+        assert!(detector.feed("ted text\n").is_none());
         let reason = detector
-            .feed("repeated\n")
+            .feed("repeated text\n")
             .expect("the second line repeats");
         assert!(matches!(reason, StuckReason::Repetition { repeats: 2, .. }));
     }
@@ -251,9 +278,9 @@ mod tests {
     #[test]
     fn trailing_whitespace_differences_still_count_as_the_same_line() {
         let mut detector = RepetitionDetector::new(2);
-        assert!(detector.feed("same\n").is_none());
+        assert!(detector.feed("same line\n").is_none());
         let reason = detector
-            .feed("   same   \n")
+            .feed("   same line   \n")
             .expect("whitespace should not hide a repeat");
         assert!(matches!(reason, StuckReason::Repetition { repeats: 2, .. }));
     }
@@ -261,7 +288,7 @@ mod tests {
     #[test]
     fn a_single_very_long_line_is_shortened_for_the_message() {
         let mut detector = RepetitionDetector::new(2);
-        let long = "x".repeat(500);
+        let long = format!("{} extra", "x".repeat(500));
         assert!(detector.feed(&format!("{long}\n")).is_none());
         match detector.feed(&format!("{long}\n")) {
             Some(StuckReason::Repetition { sample, .. }) => {
@@ -289,5 +316,43 @@ mod tests {
         let mut detector = RepetitionDetector::new(0);
         assert!(detector.feed("first\n").is_none());
         assert!(detector.feed("second\n").is_none());
+    }
+
+    #[test]
+    fn a_run_of_closing_braces_is_not_a_loop() {
+        // What a real Rust file looks like at the end of a block. Four identical
+        // one-token lines used to trip the consecutive-line check.
+        let mut detector = RepetitionDetector::new(3);
+        let reason = feed_all(&mut detector, &["}\n", "}\n", "}\n", "}\n", "}\n"]);
+        assert!(
+            reason.is_none(),
+            "closing braces looked like a loop: {reason:?}"
+        );
+    }
+
+    #[test]
+    fn a_repeated_signature_inside_a_long_file_is_not_a_loop() {
+        // Twelve-token spans show up in ordinary code (a trait method, a
+        // generated field). Repeating one a few times in a large answer is
+        // not collapse; repeating one *as* the answer is.
+        let mut detector = RepetitionDetector::new(3);
+        let signature = "fn name(&self) -> &'static str { \"tool\" } extra padding tokens here";
+        let mut chunks = Vec::new();
+        for i in 0..40 {
+            chunks.push(format!(
+                "line {i} discusses topic {i} with payload {i} and checksum {i} uniquely\n"
+            ));
+        }
+        // Different wrappers so the consecutive-line check cannot fire; only
+        // the interior twelve-token span repeats.
+        chunks.push(format!("alpha {signature}\n"));
+        chunks.push(format!("bravo {signature}\n"));
+        chunks.push(format!("charlie {signature}\n"));
+        let borrowed: Vec<&str> = chunks.iter().map(String::as_str).collect();
+        let reason = feed_all(&mut detector, &borrowed);
+        assert!(
+            reason.is_none(),
+            "a repeated signature in a long file tripped: {reason:?}"
+        );
     }
 }

@@ -23,11 +23,6 @@ use tokio::process::Command;
 use std::ffi::OsStr;
 
 /// Model credentials that would redirect a delegated CLI's billing.
-///
-/// Kept to the providers the shipped CLI presets actually use, so the list is
-/// auditable against `presets.toml` rather than being a guess at every variable
-/// in the ecosystem. A harness with no login of its own will say so plainly
-/// ("not logged in"), and `spill doctor` explains the removal.
 pub const MODEL_CREDENTIALS: &[&str] = &[
     // `claude`
     "ANTHROPIC_API_KEY",
@@ -48,9 +43,6 @@ pub const MODEL_CREDENTIALS: &[&str] = &[
 
 /// A command for a delegated CLI: the binary, with the model credentials taken
 /// out of the environment it will inherit.
-///
-/// Only those variables are touched; everything else reaches the child as it
-/// would from a shell.
 pub fn delegated_cli(bin: &str) -> Command {
     let mut command = Command::new(bin);
     for name in MODEL_CREDENTIALS {
@@ -60,10 +52,6 @@ pub fn delegated_cli(bin: &str) -> Command {
 }
 
 /// Which model credentials are set in this process's environment.
-///
-/// Read, never written: spill does not change its own environment, only what a
-/// child inherits. Used to say so at startup rather than letting the removal be
-/// invisible.
 pub fn inherited_credentials() -> Vec<&'static str> {
     MODEL_CREDENTIALS
         .iter()
@@ -73,8 +61,6 @@ pub fn inherited_credentials() -> Vec<&'static str> {
 }
 
 /// Whether a name is one this module removes.
-///
-/// Only the tests need to ask; reporting works from the list itself.
 #[cfg(test)]
 pub fn is_credential(name: impl AsRef<OsStr>) -> bool {
     let name = name.as_ref();

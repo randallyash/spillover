@@ -23,23 +23,12 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
 /// How many writes an undo can reach.
-///
-/// Ten, though the byte budget below is usually what decides.
 const UNDO_DEPTH: usize = 10;
 
 /// The most file contents the history may hold at once.
-///
-/// The reason this was a single entry to begin with. One snapshot is capped at
-/// `MAX_SNAPSHOT`, but ten of them are not, so the budget is what actually bounds
-/// the memory a session can spend on being able to undo.
 const UNDO_BUDGET: usize = 8 * 1024 * 1024;
 
 /// How large a file may be and still have a copy kept for an undo.
-///
-/// A snapshot is *retained* for the session, unlike the transient reads the file
-/// tools already do, so it is capped. Past this the write is remembered as
-/// unreversible rather than not remembered at all — otherwise `/undo` would
-/// quietly offer to put back the write *before* it.
 const MAX_SNAPSHOT: u64 = 2 * 1024 * 1024;
 
 /// What was at the path before the write.
@@ -71,9 +60,6 @@ pub struct Undo {
 
 impl Undo {
     /// How many bytes of file contents this entry is holding on to.
-    ///
-    /// What the budget counts. An entry that kept no copy — a file that was
-    /// created, or one too large to snapshot — is holding nothing.
     pub fn held_bytes(&self) -> usize {
         match &self.before {
             Before::Bytes(bytes) => bytes.len(),
@@ -82,9 +68,6 @@ impl Undo {
     }
 
     /// Record what is at `path` now, for a write that is about to replace it.
-    ///
-    /// Read before the write rather than after: afterwards the old bytes are gone,
-    /// and this is the only moment they exist.
     pub async fn capture(tool: impl Into<String>, path: PathBuf, updated: &[u8]) -> Self {
         let before = match tokio::fs::metadata(&path).await {
             Ok(metadata) if metadata.len() > MAX_SNAPSHOT => Before::Unavailable(format!(
@@ -110,9 +93,6 @@ impl Undo {
     }
 
     /// Record a change whose before and after bytes are both already known.
-    ///
-    /// For a tool that had to read the file to do its job — `edit_file` reads it
-    /// to find the text it replaces — so capturing costs no extra IO at all.
     pub fn from_previous(
         tool: impl Into<String>,
         path: PathBuf,
@@ -131,10 +111,6 @@ impl Undo {
     }
 
     /// Put it back, or say why it cannot be.
-    ///
-    /// The `Err` is a sentence for the transcript, not a bug report: every way
-    /// this can refuse is a normal thing that happened, and each says what and
-    /// what to do instead.
     pub async fn restore(&self) -> Result<String, String> {
         let path = self.path.display();
 
@@ -200,10 +176,6 @@ fn changed(path: impl std::fmt::Display) -> String {
 }
 
 /// The directories on the way to `path` that do not exist yet, deepest first.
-///
-/// Deepest first is the order they were created, and so the order they can be
-/// removed. Stops at the first one that is already there: everything above it
-/// existed before this write and is not ours to touch.
 async fn missing_ancestors(path: &Path) -> Vec<PathBuf> {
     let mut missing = Vec::new();
     let mut current = path.parent();
@@ -218,9 +190,6 @@ async fn missing_ancestors(path: &Path) -> Vec<PathBuf> {
 }
 
 /// Remove the directories a write created, while they are still empty.
-///
-/// Only while empty: a directory that acquired something else in the meantime is
-/// somebody's, and deleting it would be the opposite of tidying up.
 async fn remove_created_dirs(dirs: &[PathBuf]) -> usize {
     let mut removed = 0;
     for dir in dirs {
@@ -239,11 +208,6 @@ async fn remove_created_dirs(dirs: &[PathBuf]) -> usize {
 
 /// A cheap fingerprint of some bytes, for telling one version of a file from
 /// another.
-///
-/// FNV-1a. Deliberately not shared with the identical loop in `session_store`:
-/// that one names a file on disk and so must be stable across releases, where
-/// this one only has to be self-consistent for the life of a process. Coupling
-/// them would buy nothing and tie two unrelated things together.
 fn fingerprint(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in bytes {
@@ -254,15 +218,6 @@ fn fingerprint(bytes: &[u8]) -> u64 {
 }
 
 /// The writes an undo can still reach, newest first.
-///
-/// A stack rather than a single slot, so `/undo` reaches back past the mistake you
-/// just made to the one before it. Bounded twice — by a count and by the bytes it
-/// holds — and whichever bound is reached first drops the *oldest* entry, because
-/// the newest writes are the ones anybody wants to reach for.
-///
-/// Every entry carries its own path and its own fingerprint of what the write left
-/// behind, so the rule that an entry may only be put back while its file is
-/// untouched holds per entry, exactly as it did when there was one of them.
 #[derive(Debug, Default)]
 pub struct UndoStack {
     entries: VecDeque<Box<Undo>>,
@@ -285,10 +240,6 @@ impl UndoStack {
     }
 
     /// Put an entry back at the front.
-    ///
-    /// For a refusal, which changes nothing: the entry is still the newest write
-    /// that could be put back, so it belongs where it was rather than at the
-    /// bottom of the stack.
     pub fn restore(&mut self, undo: Box<Undo>) {
         self.held += undo.held_bytes();
         self.entries.push_front(undo);

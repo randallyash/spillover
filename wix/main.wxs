@@ -62,7 +62,7 @@
         Id='*'
         Name='spill'
         UpgradeCode='6E777CD6-7037-45CB-98CC-E610C996A5A3'
-        Manufacturer='randallyash'
+        Manufacturer='Randall Yash'
         Language='1033'
         Codepage='1252'
         Version='$(var.Version)'>
@@ -70,7 +70,7 @@
         <Package Id='*'
             Keywords='Installer'
             Description='Agentic AI TUI that spills over across local and hosted models when a tier stalls'
-            Manufacturer='randallyash'
+            Manufacturer='Randall Yash'
             InstallerVersion='450'
             Languages='1033'
             Compressed='yes'

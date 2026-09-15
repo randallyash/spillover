@@ -38,7 +38,7 @@ impl Tool for Grep {
                 },
                 "path": {
                     "type": "string",
-                    "description": "File or directory to search. Defaults to the workspace root."
+                    "description": "File or directory to search, relative to the workspace. An absolute path is accepted only when it stays inside the workspace. Defaults to the workspace root."
                 },
                 "glob": {
                     "type": "string",
@@ -70,7 +70,10 @@ impl Tool for Grep {
             Ok(pattern) => pattern.to_string(),
             Err(error) => return error,
         };
-        let root = resolve(workspace, args.optional_str("path").unwrap_or("."));
+        let root = match resolve(workspace, args.optional_str("path").unwrap_or(".")) {
+            Ok(path) => path,
+            Err(error) => return error,
+        };
         let file_glob = args.optional_str("glob").map(str::to_string);
         let workspace = workspace.to_path_buf();
 
@@ -327,6 +330,20 @@ mod tests {
             .await;
         assert!(outcome.is_error);
         assert!(outcome.content.contains("file glob"), "{}", outcome.content);
+    }
+
+    #[tokio::test]
+    async fn a_path_outside_the_workspace_is_refused() {
+        let dir = fixture();
+        let outcome = Grep
+            .run(&json!({"pattern": "root", "path": "/etc"}), dir.path())
+            .await;
+        assert!(outcome.is_error);
+        assert!(
+            outcome.content.contains("outside the workspace"),
+            "{}",
+            outcome.content
+        );
     }
 
     #[tokio::test]

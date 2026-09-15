@@ -20,16 +20,9 @@ use crate::detect::{Phase, StuckReason, Timing};
 
 /// How much of its own allowance a wait may use before it counts as nearly
 /// having run out.
-///
-/// Four fifths rather than one short, because waiting is continuous where the
-/// other signals are counted: there is no "one more" for a gap, and the useful
-/// question is whether the budget is close to being wrong.
 const ALMOST_WAIT: f64 = 0.8;
 
 /// Everything the detectors saw, at the moment the attempt ended.
-///
-/// Held as the detectors' own counts rather than as a summary of the verdict,
-/// because the interesting number is usually the one that did *not* fire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Counters {
     pub steps_used: usize,
@@ -127,10 +120,6 @@ impl fmt::Display for Miss {
 
 impl Counters {
     /// The closest any signal came to tripping, for a turn that stayed.
-    ///
-    /// Only signals that were actually exercised count: a run of zero is not
-    /// "one short of one", it is a thing that never happened, and reporting it
-    /// would put a warning on every clean turn.
     pub fn closest_miss(&self) -> Option<Miss> {
         // The class budget can be tighter than the tier's own, so the failure
         // streak is judged against whichever would have fired.
@@ -226,10 +215,6 @@ pub struct Verdict {
 
 impl Verdict {
     /// The machine-readable name of what tripped.
-    ///
-    /// A stable token rather than the prose summary: this is what a log is
-    /// grouped and counted by, and wording that reads well in a transcript is
-    /// the wrong thing to match on.
     pub fn trigger(&self) -> &'static str {
         trigger_of(&self.reason)
     }
@@ -324,11 +309,6 @@ pub enum Policy {
     /// The tier below was asked one question instead.
     Consult,
     /// Neither: there was no tier below, so the turn ended here.
-    ///
-    /// Worth logging rather than discarding, because this is the *only* outcome
-    /// a single-tier setup can ever have. A log that recorded only handovers
-    /// would be empty for exactly the user the local-first promise is for, and
-    /// the thresholds for a local tier are the ones most worth tuning.
     Ended,
 }
 
@@ -361,11 +341,6 @@ pub struct SpillEntry {
     pub to: Option<String>,
     pub policy: Policy,
     /// The machine-readable token for what tripped.
-    ///
-    /// Carried as its own field rather than derived from the prose at write
-    /// time: a log is grouped and counted by this, and matching on wording that
-    /// exists to read well in a transcript is how a log quietly stops working
-    /// the first time a message is reworded.
     pub trigger: &'static str,
     pub reason: String,
     pub counters: Counters,
@@ -373,9 +348,6 @@ pub struct SpillEntry {
 
 impl SpillEntry {
     /// The record for one verdict.
-    ///
-    /// The only way an entry is built, so the trigger cannot drift from the
-    /// reason it describes and the tier that stalled cannot be misnamed.
     pub fn from_verdict(
         verdict: &Verdict,
         at: String,
@@ -432,11 +404,6 @@ impl SpillEntry {
 }
 
 /// Where spills are written.
-///
-/// Beside the sessions, under the platform's state directory — on Linux,
-/// `~/.local/state/spill/spills.jsonl`. State rather than config or cache: this
-/// is a record of what happened, which is neither something the user edits nor
-/// something safe to throw away.
 #[derive(Debug, Clone)]
 pub struct SpillLog {
     path: PathBuf,
@@ -482,10 +449,6 @@ impl SpillLog {
 }
 
 /// The current time as RFC3339 in UTC.
-///
-/// Hand-rolled rather than pulled in: the tree has no date library, and a
-/// timestamp is not worth one. Sorts lexicographically, which is why the log is
-/// readable in order without parsing.
 pub fn timestamp(at: SystemTime) -> String {
     let seconds = at
         .duration_since(UNIX_EPOCH)
@@ -503,10 +466,6 @@ pub fn timestamp(at: SystemTime) -> String {
 }
 
 /// The civil date for a count of days since 1970-01-01.
-///
-/// Howard Hinnant's `civil_from_days`, which is the standard way to do this
-/// without a library: it shifts the year to start in March so the leap day lands
-/// at the end, where it cannot disturb the month arithmetic.
 fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let shifted = days + 719_468;
     let era = shifted.div_euclid(146_097);
@@ -526,12 +485,6 @@ mod tests {
     use crate::detect::{ErrorClass, Phase};
 
     /// The README with its line endings normalised.
-    ///
-    /// Git checks the file out with CRLF on Windows, and `include_str!` embeds
-    /// the bytes as they are — so a sample copied out of it has `\r\n` where the
-    /// program's own output has `\n`, and the same content compares unequal on
-    /// one platform and not another. The invariant is about what the text says,
-    /// never about how the file happens to be stored.
     fn readme() -> String {
         include_str!("../README.md").replace("\r\n", "\n")
     }

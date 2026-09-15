@@ -21,25 +21,11 @@ use crate::detect::{ErrorClass, StuckReason};
 const MIN_THRESHOLD: usize = 2;
 
 /// The arguments of a call, as two calls can be compared.
-///
-/// Two calls that mean the same thing are the same call. Sampling the same JSON
-/// twice can put the space on the other side of the colon, or name the keys in the
-/// other order, and neither makes it a different request — comparing the raw text,
-/// which is what this did first, lets a model rewrite its way out of the detector
-/// one character at a time. That is precisely the loop this exists to catch, so
-/// the comparison is on meaning and the spelling is dropped.
-///
-/// Arguments that are not JSON at all are kept as they arrived: every tool refuses
-/// them, and until then the text is the only thing there is to compare.
 fn comparable(arguments: &str) -> Value {
     serde_json::from_str(arguments).unwrap_or_else(|_| Value::String(arguments.to_string()))
 }
 
 /// What the detector has seen so far.
-///
-/// As with repetition: the counters are the tuning material, and they only exist
-/// while the attempt does. A verdict on its own says what tripped, never what
-/// nearly did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProgressCounters {
     /// Identical calls — same tool, same arguments — currently in a row.
@@ -62,16 +48,6 @@ pub struct ProgressDetector {
     failure_run: usize,
     last_failed_tool: String,
     /// The failure currently repeating, and how many times in a row.
-    ///
-    /// The key is the tool and the class, plus the call's own arguments when the
-    /// class reports on the world rather than on the model — so a different tool,
-    /// a different error, or a different *file* all break the run. That last one
-    /// is the difference between probing and grinding: looking for three files
-    /// that turn out not to exist is three obstacles, not one.
-    ///
-    /// The target is compared as meaning for the same reason the call is: one
-    /// missing file is one obstacle whether or not the model spelled the path the
-    /// same way twice.
     error_streak: Option<(String, ErrorClass, Option<Value>)>,
     error_run: usize,
 }
@@ -102,9 +78,6 @@ impl ProgressDetector {
 
     /// Record one tool call and how it went. Returns a reason once the sequence
     /// looks like a loop rather than work.
-    ///
-    /// `failure` is `None` when the call succeeded, and the kind of failure when
-    /// it did not.
     pub fn record(
         &mut self,
         tool: &str,

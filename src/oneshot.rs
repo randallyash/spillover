@@ -29,11 +29,6 @@ pub struct Options {
     /// Let the model write files and run commands without asking.
     pub yolo: bool,
     /// Where spills are recorded, or `None` for the platform's state directory.
-    ///
-    /// Injectable because the alternative was found the hard way: a test that
-    /// runs this path wrote to the real spill log of whoever ran the suite, from
-    /// several threads at once. Anything that reaches the filesystem needs a way
-    /// to be pointed somewhere disposable.
     pub log: Option<SpillLog>,
 }
 
@@ -47,10 +42,6 @@ pub struct Outcome {
     pub answered_by: Option<String>,
     pub escalations: Vec<String>,
     /// Tiers that came within one step of being abandoned and were not.
-    ///
-    /// Reported to a script for the same reason it is shown in the interface: a
-    /// near miss is the evidence that a threshold is either about to cost
-    /// somebody a turn or is set too loosely to ever catch anything.
     pub near_misses: Vec<String>,
     pub failure: Option<String>,
 }
@@ -120,7 +111,7 @@ pub async fn run(library: &Library, config: &Config, options: &Options) -> Outco
     let (commands, mut events) = crate::agent::spawn(
         AgentConfig {
             workspace,
-            max_steps: crate::agent::DEFAULT_MAX_STEPS,
+            max_steps: config.general.max_steps,
             // A one-shot run has nobody to press escape, so nothing cancels it.
             cancel: crate::agent::Canceller::default(),
             // No session is written and none is resumed: `-p` is for scripts,
@@ -138,7 +129,9 @@ pub async fn run(library: &Library, config: &Config, options: &Options) -> Outco
             origin: config.origin.clone(),
         },
         chain,
-        Arc::new(Registry::with_default_tools()),
+        Arc::new(Registry::with_shell_timeout(
+            std::time::Duration::from_secs(config.general.shell_timeout_secs),
+        )),
         approver,
     );
 
@@ -291,10 +284,6 @@ mod tests {
     }
 
     /// Options whose spill log goes to a temporary directory.
-    ///
-    /// Never the platform default: these tests run the real one-shot path, and
-    /// writing to the state directory of whoever is running the suite means a
-    /// test run silently fills their log — which is what happened.
     fn options(prompt: &str) -> Options {
         static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
         let dir = DIR.get_or_init(|| tempfile::tempdir().expect("tempdir"));

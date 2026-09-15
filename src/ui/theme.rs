@@ -97,11 +97,6 @@ pub struct Theme {
 
 impl Theme {
     /// The theme for this terminal.
-    ///
-    /// `NO_COLOR` is honored per its specification: set to anything that is not
-    /// an empty string, it turns color off entirely. The monochrome theme is not
-    /// a degraded fallback — everything it needs to say is carried by a glyph, a
-    /// border, or a weight, so nothing is lost but the hue.
     pub fn detect() -> Self {
         match std::env::var_os("NO_COLOR") {
             Some(value) if !value.is_empty() => Self::monochrome(),
@@ -110,11 +105,6 @@ impl Theme {
     }
 
     /// No color anywhere. For `NO_COLOR` and for terminals that cannot show it.
-    ///
-    /// Each role is given the weight or attribute that carries its meaning
-    /// without hue: `error` is reversed so it outranks everything, a failed tier
-    /// is struck through so it reads as spent, and code is italicized so it is
-    /// still distinct from the prose around it.
     pub fn monochrome() -> Self {
         Self {
             brand: Style::default().add_modifier(Modifier::BOLD),

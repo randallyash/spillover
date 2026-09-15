@@ -100,10 +100,6 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 }
 
 /// The per-turn token spend, drawn as block glyphs.
-///
-/// A total tells you what a session cost; the shape tells you when it got
-/// expensive, which is the thing a fallback actually changes. The graph is the
-/// only place that distinction is visible.
 fn draw_sparkline(frame: &mut Frame, area: Rect, app: &App, theme: &Theme, width: usize) {
     if area.height < 2 {
         return;
@@ -247,16 +243,6 @@ fn pair_styled(
 }
 
 /// What a stuck tier does, which is the policy worth watching in a session.
-///
-/// Named `on stuck` rather than folded into `fallback`, because the two are
-/// different questions: `fallback` is whether a spill keeps the lower tier, this
-/// is whether there is a spill at all.
-///
-/// Escalating is drawn in the warning colour, because it is the departure from
-/// the default and the expensive one: a stalled turn goes to the tier below
-/// whole, and with `sticky_fallback` the cheap model that was doing the work is
-/// gone for the rest of the session. The word alone says which is live without
-/// relying on the colour.
 fn policy_row(app: &App, theme: &Theme, width: usize) -> Vec<Line<'static>> {
     let policy = app.on_stuck();
     let value = match policy {

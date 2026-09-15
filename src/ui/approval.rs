@@ -121,9 +121,6 @@ pub fn action(tool: &str) -> String {
 }
 
 /// The preview on its own, wrapped ready to be windowed.
-///
-/// Kept apart from the keys so the keys can be pinned below the window rather
-/// than scrolling away with the content.
 pub fn preview_lines(
     approval: &PendingApproval,
     theme: &Theme,
@@ -149,11 +146,6 @@ pub fn preview_lines(
 }
 
 /// The modal's content: the preview, then the keys.
-///
-/// The whole preview regardless of fit; `render` shows a window of it. Only the
-/// tests use this now — `render` works from `preview_lines` so it can pin the
-/// keys below the window — but it stays as the plain "what would this look
-/// like" view of a preview.
 #[cfg(test)]
 pub fn body(approval: &PendingApproval, theme: &Theme, width: usize) -> Vec<Line<'static>> {
     let mut lines = preview_lines(approval, theme, width);
@@ -163,10 +155,6 @@ pub fn body(approval: &PendingApproval, theme: &Theme, width: usize) -> Vec<Line
 }
 
 /// How one line of a preview is styled.
-///
-/// The classification is by shape, because that is what the tools emit: `+` and
-/// `-` from an edit, an indented line from a shell command, and a leading
-/// sentence that describes the whole thing.
 fn line_style(index: usize, line: &str, theme: &Theme) -> ratatui::style::Style {
     if line.starts_with("+ ") {
         theme.diff_add
@@ -495,10 +483,6 @@ mod tests {
     }
 
     /// Print the modal, to look at it without running spill.
-    ///
-    /// ```text
-    /// cargo test print_the_modal -- --ignored --nocapture
-    /// ```
     #[test]
     #[ignore = "prints the modal to look at; asserts nothing"]
     fn print_the_modal() {

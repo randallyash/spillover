@@ -8,11 +8,6 @@ use crate::provider::Provider;
 pub struct Tier {
     /// The id this tier was configured under, which is what a saved session
     /// refers to it by.
-    ///
-    /// The label is for people and is derived from the provider (a display name
-    /// plus an address), so it is neither unique nor stable; an index is stable
-    /// only until somebody reorders their config. The configured id is the one
-    /// durable name a tier has.
     pub id: String,
     /// Shown to the user, e.g. "Mock Local (http://127.0.0.1:8731/v1)".
     pub label: String,
@@ -30,14 +25,6 @@ pub struct Tier {
 impl Tier {
     /// A tier that carries the configured default policy — consult, unless the
     /// configuration says otherwise.
-    ///
-    /// Most construction — the app, `doctor`, and tests — does not care about the
-    /// stuck policy, so this keeps it out of the way of what they do care about.
-    /// A test that does care sets the two fields afterwards, which reads better
-    /// than threading them through every call site.
-    ///
-    /// The id defaults to the label, which is enough for a tier that is never
-    /// written to a session file. Tiers built from configuration use `with_id`.
     pub fn new(
         label: impl Into<String>,
         model: impl Into<String>,
@@ -73,12 +60,6 @@ impl Tier {
 }
 
 /// The parts of a chain that outlive the process.
-///
-/// Tiers are named by configured id rather than by position so that reordering
-/// `config.toml` between runs does not quietly move the user to a different
-/// model. A name that no longer resolves is dropped on restore rather than
-/// treated as an error: a tier being removed from the config is an ordinary
-/// thing to have happened.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ChainState {
     /// The tier that was answering.
@@ -93,9 +74,6 @@ pub struct ChainState {
 
 /// A tier label without its parenthetical detail: "Local (http://…)" becomes
 /// "Local".
-///
-/// The address belongs in the session panel, not in a one-line rail, and the
-/// short form is also what a user types to name a tier.
 pub fn tier_name(label: &str) -> &str {
     match label.find(" (") {
         Some(cut) => &label[..cut],
@@ -109,22 +87,10 @@ pub struct FallbackChain {
     active: usize,
     sticky: bool,
     /// A tier the user chose by hand, which outranks the fallback policy.
-    ///
-    /// Without this, naming a tier would only last until the next turn on a
-    /// non-sticky chain, and `/tier` would look broken.
     pinned: Option<usize>,
     /// A stuck policy chosen for this session, outranking each tier's own.
-    ///
-    /// Tiers carry their own from configuration, because the right answer
-    /// depends on the model: consulting a hesitant local one is the point, while
-    /// a frontier tier has nothing better to ask. That makes the choice worth
-    /// trying without editing a file, which is what `/on-stuck` is for.
     on_stuck: Option<OnStuck>,
     /// Whether the next stall should consult whatever the policy says.
-    ///
-    /// One-shot, and separate from the policy above: this is "try it once, here"
-    /// rather than "do this from now on". Consumed when a stall is handled, so a
-    /// single request cannot quietly change how the rest of the session behaves.
     consult_next: bool,
 }
 
@@ -150,11 +116,6 @@ impl FallbackChain {
     }
 
     /// The tier to ask when the active one is stuck and consults.
-    ///
-    /// The next tier in the chain, which is the more capable one by the chain's
-    /// own ordering — so consult needs no separate setting for who to ask. The
-    /// active tier itself, which is what `active()` returns, is the last resort:
-    /// with nothing below, there is nobody to consult.
     pub fn consultant(&self) -> Option<&Tier> {
         self.tiers.get(self.active + 1)
     }
@@ -202,11 +163,6 @@ impl FallbackChain {
     }
 
     /// Put a chain back the way a saved session left it.
-    ///
-    /// Names that no longer resolve are dropped rather than treated as an error:
-    /// a tier having been removed from the configuration is an ordinary thing to
-    /// have happened, and refusing to start over it would be worse than
-    /// forgetting which one was answering.
     pub fn restore_state(&mut self, state: &ChainState) {
         self.active = state
             .active
@@ -235,12 +191,6 @@ impl FallbackChain {
 
     /// Choose the stuck policy for the rest of the session, or hand the choice
     /// back to each tier's own.
-    ///
-    /// `None` is not a third policy: it is the absence of one, which is the only
-    /// way to get back to a chain where two tiers differ. Every concrete policy
-    /// flattens the whole chain to one answer, so without this a session that
-    /// tried one could never return to the arrangement its configuration
-    /// described.
     pub fn set_on_stuck(&mut self, policy: Option<OnStuck>) {
         self.on_stuck = policy;
     }
@@ -266,9 +216,6 @@ impl FallbackChain {
     }
 
     /// Whether such a request is outstanding, and taken rather than read.
-    ///
-    /// Taking it is what makes it one-shot: a stall either uses it or spends it,
-    /// and either way the request does not survive to change the next one.
     pub fn take_consult_request(&mut self) -> bool {
         std::mem::take(&mut self.consult_next)
     }
@@ -294,9 +241,6 @@ impl FallbackChain {
     }
 
     /// Resolve what a user typed into a position in the chain.
-    ///
-    /// Accepts the 1-based number the rail shows, or a tier's name, matched
-    /// case-insensitively and by prefix so "deepseek" finds "DeepSeek V4 Flash".
     pub fn resolve(&self, query: &str) -> Option<usize> {
         let query = query.trim();
         if query.is_empty() {
@@ -327,10 +271,6 @@ impl FallbackChain {
     }
 
     /// Start a new user turn.
-    ///
-    /// A tier the user asked for by name is used until they say otherwise; then
-    /// a sticky chain stays where it fell to, and a per-turn one gives the top
-    /// tier another chance.
     pub fn begin_turn(&mut self) {
         match self.pinned {
             Some(index) => self.active = index,
@@ -340,9 +280,6 @@ impl FallbackChain {
     }
 
     /// Move one tier down. `None` means every tier has been tried.
-    ///
-    /// This is the automatic path, so it releases a hand-picked tier: it has
-    /// just failed, and continuing to insist on it would defeat the fallback.
     pub fn escalate(&mut self) -> Option<&Tier> {
         if self.active + 1 >= self.tiers.len() {
             return None;
@@ -353,10 +290,6 @@ impl FallbackChain {
     }
 
     /// Forget every tier's continued session.
-    ///
-    /// Used when the conversation itself is replaced — cleared or compacted —
-    /// because a CLI tier resuming a session would otherwise continue a
-    /// conversation that no longer exists in that form.
     pub fn forget_sessions(&self) {
         for tier in &self.tiers {
             tier.provider.forget_session();

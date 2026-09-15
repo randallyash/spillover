@@ -15,27 +15,15 @@ use crate::provider::cli::{CliProvider, on_path};
 use crate::provider::openai::OpenAiProvider;
 
 /// What to say when spill cannot start a session at all.
-///
-/// Two commands, because there are two different problems: `spill presets`
-/// answers "what could I even name in a config", and `spill setup` answers "write
-/// me one". A refusal that does not name the next command is where a first run
-/// turns into an uninstall.
 pub const NEXT_STEPS: &str = "Run `spill presets` to see what a tier can be, or `spill setup` \
                               to choose tiers and write a config.";
 
 /// The same, for a chain that was built and then answered nothing.
-///
-/// A different next step, because the problem is different: the tiers exist and
-/// are configured, so `spill doctor` is the command that says which of them are
-/// actually reachable and why the others are not.
 pub const UNREACHABLE_NEXT_STEPS: &str = "Run `spill doctor` to see which tiers are reachable, \
                                            or `spill setup` to change them.";
 
 /// Anything the user should be told before it bites them: a key variable that
 /// is not set, a CLI that is not installed, a tier that runs unattended.
-///
-/// Pure apart from reading the environment, so it can be reported without
-/// building providers or making a request.
 pub fn notes(library: &Library, config: &Config) -> Vec<String> {
     let mut notes = Vec::new();
 
@@ -108,12 +96,6 @@ pub fn notes(library: &Library, config: &Config) -> Vec<String> {
 }
 
 /// Which class a configured tier belongs to.
-///
-/// One definition, shared with `doctor`, so the timeouts a report shows are the
-/// timeouts the agent will actually apply rather than a second guess at them.
-/// An endpoint whose URL cannot be resolved falls back to the hosted numbers,
-/// which is the conservative direction: it cannot accidentally grant the local
-/// grace period to something reached over the network.
 pub fn class_of(library: &Library, tier: &crate::config::Tier) -> TierClass {
     match tier.kind {
         TierKind::OpenAi => openai_settings(library, tier)
@@ -127,22 +109,6 @@ pub fn class_of(library: &Library, tier: &crate::config::Tier) -> TierClass {
 }
 
 /// Build a provider for each configured tier, in order.
-///
-/// A tier that cannot answer is left out rather than carried, and if that leaves
-/// nothing the whole thing is refused. The distinction is which failures are
-/// *knowable without asking the model anything*:
-///
-/// - A `cli` tier whose binary is not installed cannot answer, ever. Carrying it
-///   would put a fallback in the rail that never happens, which is the thing
-///   worth refusing to pretend about — so it is left out, and `notes` says so in
-///   as many words at startup.
-/// - Everything else stays in the chain and is tried when a turn runs. An
-///   endpoint that is merely down must not be dropped here: pre-flighting the
-///   local tier would mean silently starting on the paid one, which is the exact
-///   opposite of what this program is for.
-///
-/// So this fails only when there is genuinely nothing left to try, and the
-/// message says which tier went and what to do about it.
 pub async fn build(
     library: &Library,
     config: &Config,

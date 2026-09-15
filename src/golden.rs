@@ -49,9 +49,6 @@ use crate::provider::openai::OpenAiProvider;
 use crate::provider::{Provider, Usage};
 
 /// The line the local tier cannot stop repeating.
-///
-/// Four is not arbitrary: it is `Limits::default()`'s `max_repeat_run`, so this
-/// fixture is exercising the shipped threshold rather than a test-only one.
 const LOOPED_LINE: &str = "the same line";
 const REPEATS: usize = 4;
 
@@ -159,10 +156,6 @@ fn sse(frames: &[String]) -> Vec<u8> {
 // ------------------------------------------------------------- the fake tier
 
 /// Request bodies a tier was sent, in order.
-///
-/// The transcript on the wire is the thing worth asserting on: it is what the
-/// model actually saw, which is the only definition of "the turn was handed
-/// over" that means anything.
 #[derive(Clone, Default)]
 struct Seen(Arc<Mutex<Vec<String>>>);
 
@@ -212,10 +205,6 @@ impl Seen {
 }
 
 /// A tier whose replies are scripted per call, recording what it was asked.
-///
-/// The script is indexed by how many times the tier has been called, so one tier
-/// can loop first and answer afterwards — which is what a driver needs to do
-/// after it has been helped.
 struct FakeTier {
     calls: Arc<AtomicUsize>,
     seen: Seen,
@@ -232,11 +221,6 @@ impl FakeTier {
     }
 
     /// The responder for `with_body_from_request`.
-    ///
-    /// Returns the scripted frames for this call and records the request. The
-    /// last entry in the script is reused if the tier is somehow called more
-    /// times than it was scripted for, so a fixture cannot fail with an
-    /// unhelpful 501 from the mock server instead of a real assertion.
     fn responder(&self) -> impl Fn(&mockito::Request) -> Vec<u8> + Send + Sync + 'static {
         let calls = Arc::clone(&self.calls);
         let seen = self.seen.clone();
@@ -275,10 +259,6 @@ impl FakeTier {
     }
 
     /// Mount the responder on a mock server, expecting exactly `hits` calls.
-    ///
-    /// The count is asserted rather than merely recorded, so the fixture is
-    /// checked from the server's side too: a turn that quietly stopped calling a
-    /// tier would fail here instead of passing on a stale recording.
     async fn mount(&self, server: &mut mockito::Server, hits: usize) -> mockito::Mock {
         server
             .mock("POST", "/v1/chat/completions")
@@ -393,12 +373,6 @@ fn spend_for<'a>(spent: &'a [(String, Usage)], prefix: &str) -> Option<&'a Usage
 // ------------------------------------------------------------------ fixtures
 
 /// The local tier: writes a file, then loops over the same line.
-///
-/// Two calls, and the order is the point. The first proves the tool path works
-/// end to end — the file really is written, the result really is recorded, and
-/// the model really is shown it — and the second is the failure the detector
-/// exists to catch, arriving *after* a successful tool round trip rather than
-/// instead of one.
 fn local_tier() -> FakeTier {
     let writes_note = vec![
         tool_call(
@@ -412,10 +386,6 @@ fn local_tier() -> FakeTier {
 }
 
 /// A tier configured to hand the turn over rather than ask a question first.
-///
-/// Named rather than inlined because escalating is no longer the default: a
-/// scenario that wants the hand-over has to say so, and saying it here keeps the
-/// intent visible at the point where the chain is built.
 fn escalating(mut tier: Tier) -> Tier {
     tier.on_stuck = OnStuck::Escalate;
     tier
@@ -424,11 +394,6 @@ fn escalating(mut tier: Tier) -> Tier {
 // -------------------------------------------------------------------- tests
 
 /// The golden loop, end to end.
-///
-/// A local endpoint repeats one line until the detector fires; the turn is
-/// handed to the frontier, which sees the original question and nothing of the
-/// loop; the tool the local tier ran has already changed the disk; and the
-/// abandoned attempt is still on the bill.
 #[tokio::test]
 async fn the_golden_loop() {
     let workspace = tempfile::tempdir().expect("tempdir");
@@ -552,9 +517,6 @@ async fn the_golden_loop() {
 }
 
 /// A stall where the frontier is asked instead of handed the turn.
-///
-/// The consultant gets one narrow question and one message; the driver keeps the
-/// turn and finishes it with the answer in hand.
 #[tokio::test]
 async fn a_consult_keeps_the_driver_and_feeds_it_the_answer() {
     let workspace = tempfile::tempdir().expect("tempdir");
@@ -650,11 +612,6 @@ async fn a_consult_keeps_the_driver_and_feeds_it_the_answer() {
 }
 
 /// A consult that cannot complete escalates.
-///
-/// This is the promise the whole fallback rests on: consulting may be the better
-/// move, but it must never be the move that strands a turn. The consultant here
-/// is down (a 500), so the turn is handed over — and the tier that failed as a
-/// consultant then answers as the active tier.
 #[tokio::test]
 async fn a_consult_that_fails_escalates_rather_than_stranding_the_turn() {
     let workspace = tempfile::tempdir().expect("tempdir");
@@ -743,12 +700,6 @@ async fn a_consult_that_fails_escalates_rather_than_stranding_the_turn() {
 }
 
 /// A model stuck against the same wall, spilled on the tighter error budget.
-///
-/// This is the half a unit test cannot prove: the classifier has to recognise the
-/// failure from the message a *real* tool produced out of a *real* `std::io::Error`
-/// for a path that really is not there. It is the *same* path each time, so the
-/// model is walking into one obstacle rather than discovering several, and the
-/// class rule spills at three where the tier's own allowance is four.
 #[tokio::test]
 async fn a_model_stuck_on_a_missing_file_is_spilled() {
     let workspace = tempfile::tempdir().expect("tempdir");
@@ -815,11 +766,6 @@ async fn a_model_stuck_on_a_missing_file_is_spilled() {
 }
 
 /// Probing for files that are not there is work, not a stall.
-///
-/// The counterpart to the fixture above, and the reason it is a separate test:
-/// three *different* absent paths are three facts about the filesystem, which is
-/// what looking for a `.env` and a `Makefile` looks like. Nothing should spill,
-/// and the model should be free to answer.
 #[tokio::test]
 async fn looking_for_files_that_are_not_there_is_not_a_stall() {
     let workspace = tempfile::tempdir().expect("tempdir");
@@ -882,10 +828,6 @@ async fn looking_for_files_that_are_not_there_is_not_a_stall() {
 }
 
 /// The class reaches the tier the agent actually runs.
-///
-/// A unit test can prove the classifier and the resolver agree; only building a
-/// real tier proves the two are wired together. `mockito` listens on `127.0.0.1`,
-/// so this is the local case by construction.
 #[tokio::test]
 async fn a_local_endpoint_is_judged_by_the_local_timeouts() {
     let server = mockito::Server::new_async().await;
@@ -939,9 +881,6 @@ async fn a_local_endpoint_is_judged_by_the_local_timeouts() {
 }
 
 /// A tier that sets one timeout keeps its class's other defaults.
-///
-/// The case the `Option`-per-field config exists for, proved end to end rather
-/// than only in the resolver.
 #[tokio::test]
 async fn a_local_tier_that_sets_only_one_timeout_keeps_the_rest() {
     let server = mockito::Server::new_async().await;
@@ -981,17 +920,6 @@ async fn a_local_tier_that_sets_only_one_timeout_keeps_the_rest() {
 }
 
 /// A local model losing the plot, in the frames a server actually sends.
-///
-/// Not a captured recording — the shape is constructed, because what is worth
-/// pinning is not one model's wording but how a collapse arrives over the wire.
-/// Three things about it are the point, and none of them happen in a fixture whose
-/// frames each hold one whole line:
-///
-/// - a sentence split across frames *inside a word*;
-/// - one frame holding two complete lines at once, which a detector that judged
-///   each chunk as a line would count as one;
-/// - exactly four repeats and no more, so a detector that undercounts them does
-///   not trip at all rather than tripping late.
 const DEGENERATE: &str = include_str!("provider/fixtures/openai-degenerate-loop.jsonl");
 
 /// The sentence that stream collapses into.
@@ -1049,11 +977,6 @@ async fn a_collapse_arriving_over_the_wire_is_caught_frame_by_frame() {
 }
 
 /// The whole claim, end to end: the real tool wrote it, the real undo put it back.
-///
-/// A unit test can prove the tool returns the previous bytes and that the undo
-/// restores them. Only this proves the two are wired together — that the bytes
-/// travelled out of a real tool call made by a real streamed turn, through the
-/// real loop, into the state `/undo` reads.
 #[tokio::test]
 async fn a_write_made_through_the_loop_can_be_put_back() {
     let workspace = tempfile::tempdir().expect("tempdir");

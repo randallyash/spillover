@@ -135,14 +135,6 @@ impl Input {
 }
 
 /// Whether a line is a command, cheaply enough to ask while rendering.
-///
-/// The footer changes its hints on this, so it is called every frame and
-/// deliberately does no allocating.
-///
-/// This is deliberately looser than [`parse`]: a prefix counts, so the hints
-/// change the moment a command starts being typed. Only the display depends on
-/// it, and `parse` still insists on an exact name, so a path like `/cl` cannot
-/// be run as a command just because it looks like the start of one.
 pub fn looks_like_command(input: &str) -> bool {
     let Some(rest) = input.trim_start().strip_prefix('/') else {
         return false;
@@ -157,11 +149,6 @@ pub fn looks_like_command(input: &str) -> bool {
 }
 
 /// Read a line the way the user meant it.
-///
-/// A slash only means a command at the very start of the line, and only when the
-/// word after it is one we know. So "what does /usr/local hold" is a question,
-/// and a path is never mistaken for an instruction. `//` at the start forces a
-/// literal slash, for the rare message that has to begin with one.
 pub fn parse(input: &str) -> Input {
     let trimmed = input.trim();
 
@@ -192,9 +179,6 @@ pub fn find(name: &str) -> Option<&'static Spec> {
 }
 
 /// Commands whose name begins with what has been typed so far.
-///
-/// An empty prefix matches everything, which is what makes typing a lone `/`
-/// open the whole menu.
 pub fn matching(prefix: &str) -> Vec<&'static Spec> {
     let wanted = prefix.trim_start_matches('/').to_lowercase();
     CATALOGUE
@@ -205,10 +189,6 @@ pub fn matching(prefix: &str) -> Vec<&'static Spec> {
 
 /// The word being typed after the slash, if the line is still a command name
 /// rather than a command's argument.
-///
-/// `Some("")` for a lone `/`. This is what decides whether the menu should be
-/// open: once there is a space, the user is typing an argument and the menu
-/// would only be in the way.
 pub fn completion_prefix(input: &str) -> Option<&str> {
     let rest = input.strip_prefix('/')?;
     if rest.contains(char::is_whitespace) {

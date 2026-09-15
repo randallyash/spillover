@@ -8,6 +8,54 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **File tools cannot leave the workspace.** `read_file`, `write_file`, `edit_file`,
+  `list_dir`, `grep` and `glob` refuse a path whose canonical location is outside it —
+  a `..` walk, an absolute path, a `~/…` that is not the workspace, a symlink that
+  points elsewhere — and tell the model so, rather than quietly reading `~/.ssh`.
+  Absolute paths that actually land inside the workspace are still accepted.
+
+- **A turn may take 32 tool steps, not 12, and the number is in the config.** Twelve
+  was enough to make a modest refactor look like a stall. `max_steps` lives under
+  `[general]`; omit it for 32. Zero is refused.
+
+- **`run_shell` waits five minutes, not two, and a call can ask for longer.** 120s
+  was enough to kill `cargo test` on this repo. `[general] shell_timeout_secs`
+  defaults to 300; a call may pass `timeout_secs` of its own, capped at 1800, and a
+  zero or a number above the cap is refused rather than killing immediately.
+
+- **OpenAI-compatible streams are asked for usage.** The request now sends
+  `stream_options.include_usage`. Several providers only attach token counts if asked,
+  so the sidebar could sit at zero and look like a bug.
+
+- **IO failures are classified from `ErrorKind`, not from the English in the
+  message.** A missing file in German, or a permission error wrapped in extra
+  words, still counts as the same wall. The message is still what the model sees;
+  the kind is what the stall detector counts. Argument checks this crate writes
+  are still matched on the text, because that text is ours.
+
+- **The repetition detector no longer treats real code as a loop.** A run of
+  closing braces is not collapse, and a twelve-token signature that happens to
+  appear a few times in a long file is not either. A span only trips when it
+  makes up a quarter of what has been written, and spans with no words in them
+  are ignored.
+
+- **The Windows installer publishes as Randall Yash.** That string is the MSI
+  manufacturer, taken from `Cargo.toml` authors and the WiX definition.
+
+- **The shipped example is DeepSeek first, Grok when it stalls.** Command Code's
+  DeepSeek V4 Flash is the cheap tier; Grok is the expensive spillover. A first
+  run that can pick a CLI now prefers `command-code` over `grok` for the same
+  reason.
+
+- **The README is a product page, not a design diary.** Setup, uniqueness, and
+  the DeepSeek→Grok pictures lead. `/why`, the spill log and `doctor` moved into
+  a reference fold so the front of the page can be scanned. The screenshots are
+  the real interface again, now with Grok as the tier that answers.
+
+- **Per-function doc essays were cut.** Module docs stay; a function keeps its
+  first paragraph and loses the rest. The thinking is still in the module, the
+  source is shorter to read.
+
 - **The AUR recipe names 0.2.0, with that release's checksums.** The recipe and the
   crate have to agree on the version or `cargo test` fails, but the checksums cannot
   exist until the artifacts are published — so the two are done in the order the
