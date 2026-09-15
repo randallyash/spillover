@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **The AUR recipe names 0.4.0, with that release's checksums.** Same two-step
+  as before: the version pin and the sums cannot land in one commit.
+
 ## [0.4.0] - 2026-09-15
 
 ### Added
