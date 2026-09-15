@@ -438,6 +438,17 @@ impl App {
             return;
         }
 
+        // Ctrl-N starts a new session from anywhere except an approval, where
+        // y/n still belong to the write that is waiting.
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('n') | KeyCode::Char('N'))
+            && self.approval.is_none()
+        {
+            self.help = false;
+            self.run_command("new", "");
+            return;
+        }
+
         // While the agent is asking, the keys belong to the modal: the answer
         // keys answer it, and the arrows read a preview that does not fit.
         if self.approval.is_some() {
@@ -936,6 +947,25 @@ impl App {
 
     /// Drop the assistant message being streamed, if it is still the last thing
     /// in the transcript.
+    fn wipe_transcript(&mut self) {
+        self.messages.clear();
+        self.running = None;
+        self.streaming = None;
+        self.usage_by_tier.clear();
+        self.turns = 0;
+        self.usage_history.clear();
+        self.tokens_in = 0;
+        self.tokens_out = 0;
+        self.cache_read = 0;
+        self.cache_write = 0;
+        self.turn_usage = None;
+        self.tool_ran_this_turn = false;
+        self.stream_chars = 0;
+        self.stream_started = None;
+        self.scroll_back = 0;
+        self.last_stall = None;
+    }
+
     fn discard_streaming_message(&mut self) {
         if let Some(index) = self.streaming.take() {
             if index + 1 == self.messages.len() {
@@ -1124,21 +1154,15 @@ impl App {
                 // nothing had been cleared, leaving a blank screen and no reason
                 // for it.
                 if send(self, Command::Clear) {
-                    self.messages.clear();
-                    self.running = None;
-                    self.streaming = None;
-                    self.usage_by_tier.clear();
-                    self.turns = 0;
-                    self.usage_history.clear();
-                    self.tokens_in = 0;
-                    self.tokens_out = 0;
-                    self.cache_read = 0;
-                    self.cache_write = 0;
-                    self.turn_usage = None;
-                    self.tool_ran_this_turn = false;
-                    self.stream_chars = 0;
-                    self.stream_started = None;
-                    self.scroll_back = 0;
+                    self.wipe_transcript();
+                }
+            }
+            "new" => {
+                if send(self, Command::New) {
+                    self.wipe_transcript();
+                    self.active_tier = 0;
+                    self.tier_failed = vec![false; self.tier_labels.len()];
+                    self.on_stuck = None;
                 }
             }
             "context" => {
@@ -2583,6 +2607,7 @@ mod tests {
             ("/compact", Command::Compact),
             ("/context", Command::Context),
             ("/clear", Command::Clear),
+            ("/new", Command::New),
             ("/retry", Command::Retry { tier: None }),
             (
                 "/retry 2",
@@ -2732,6 +2757,49 @@ mod tests {
         app.handle_agent_event(AgentEvent::Notice("conversation cleared".to_string()));
         assert_eq!(app.messages.len(), 1);
         assert!(last_message(&app).contains("cleared"));
+    }
+
+    #[test]
+    fn new_resets_the_transcript_and_the_rail() {
+        let (tx, mut commands) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = new_app();
+        app.attach(
+            tx,
+            Canceller::default(),
+            &["Local".to_string(), "Grok".to_string()],
+            None,
+        );
+        app.active_tier = 1;
+        app.tier_failed = vec![true, false];
+        app.messages.push(Message::assistant("old answer"));
+        app.turns = 3;
+
+        type_and_send(&mut app, "/new");
+
+        assert_eq!(
+            commands.try_recv().ok(),
+            Some(Command::New),
+            "the agent has to forget the CLI sessions too"
+        );
+        assert!(app.messages.is_empty());
+        assert_eq!(app.active_tier, 0);
+        assert_eq!(app.tier_failed, vec![false, false]);
+        assert_eq!(app.turns, 0);
+    }
+
+    #[test]
+    fn ctrl_n_starts_a_new_session() {
+        let (tx, mut commands) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = new_app();
+        app.attach(tx, Canceller::default(), &["Local".to_string()], None);
+        app.messages.push(Message::assistant("old"));
+
+        let mut key = press(KeyCode::Char('n'));
+        key.modifiers = KeyModifiers::CONTROL;
+        app.handle_key(key);
+
+        assert_eq!(commands.try_recv().ok(), Some(Command::New));
+        assert!(app.messages.is_empty());
     }
 
     #[test]

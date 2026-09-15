@@ -163,6 +163,8 @@ pub enum Command {
     Compact,
     /// Start the conversation over.
     Clear,
+    /// Start a new session: empty transcript, first tier, no CLI resume.
+    New,
     /// Report what is being sent each turn.
     Context,
     /// Put back an approved write.
@@ -676,6 +678,17 @@ async fn handle_command(
             let _ = events.send(AgentEvent::Notice(
                 "conversation cleared; the tiers are unchanged".to_string(),
             ));
+        }
+
+        Command::New => {
+            state.session.reset();
+            state.last = None;
+            state.chain.forget_sessions();
+            state.chain.return_to_top();
+            state.chain.set_on_stuck(None);
+            let to = state.chain.active().label.clone();
+            let _ = events.send(AgentEvent::Switched { to: to.clone() });
+            let _ = events.send(AgentEvent::Notice(format!("new session — {to} answers")));
         }
 
         Command::Context => {
@@ -3877,6 +3890,32 @@ mod tests {
             said.contains("conversation: 1 message"),
             "only the system prompt should remain: {said}"
         );
+    }
+
+    #[tokio::test]
+    async fn new_returns_to_the_first_tier_and_forgets_cli_sessions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (tiers, first, second) = two_tiers();
+        let chain = FallbackChain::new(tiers, true).expect("a chain");
+        let (tx, mut rx) = loop_over(dir.path(), chain);
+
+        tx.send(Command::Escalate).expect("send");
+        let _ = collect(&mut rx).await;
+
+        tx.send(Command::New).expect("send");
+        let events = collect(&mut rx).await;
+        assert!(
+            notices(&events).iter().any(|n| n.contains("new session")),
+            "{:?}",
+            notices(&events)
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Switched { to } if to.starts_with("Local"))),
+            "the rail has to go back to the first tier: {events:?}"
+        );
+        assert!(first.forgotten() >= 1 || second.forgotten() >= 1);
     }
 
     // ---- modes ------------------------------------------------------------

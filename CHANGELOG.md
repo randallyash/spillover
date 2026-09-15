@@ -30,6 +30,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   answer, the way the Grok TUI does. They are not kept as the answer and are
   not sent back to a model.
 
+- **`/new` (and Ctrl-N) starts a new session.** One session per workspace is
+  still resumed on launch. `/clear` wipes the transcript and keeps the current
+  tier; `/new` also returns to the first tier and drops CLI session ids so the
+  next turn is actually fresh.
+
 ## [0.3.0] - 2026-09-15
 
 ### Changed

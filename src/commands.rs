@@ -91,9 +91,14 @@ pub const CATALOGUE: &[Spec] = &[
         summary: "Fold earlier turns into a short ledger to shrink what is sent",
     },
     Spec {
+        name: "new",
+        arg: Arg::None,
+        summary: "Start a new session: empty transcript, first tier",
+    },
+    Spec {
         name: "clear",
         arg: Arg::None,
-        summary: "Start a new conversation, keeping the tiers as they are",
+        summary: "Wipe the transcript, keeping the current tier",
     },
     Spec {
         name: "allow",
