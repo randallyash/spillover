@@ -216,6 +216,7 @@ pub async fn run(library: &Library, config: &Config, options: &Options) -> Outco
             AgentEvent::ToolStarted { .. }
             | AgentEvent::ToolFinished { .. }
             | AgentEvent::Notice(_)
+            | AgentEvent::Switched { .. }
             // The announcement of a move that `Escalated` will report anyway; a
             // one-shot run has no interface to narrate it to, and recording both
             // would list every spill twice.

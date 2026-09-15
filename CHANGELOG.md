@@ -19,6 +19,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   like a stuck model, so Grok was asked about a flag. Spill now drops the id
   and resends the conversation it already holds.
 
+- **`/escalate` moves the rail, and `/deescalate` exists.** The command used to
+  change the chain without telling the header, so the chip stayed on the cheap
+  tier. `/tier auto` also ignored sticky and would not climb back. `/deescalate`
+  (or `/tier auto`, or `/tier 1`) returns to the first tier and clears its spent
+  mark.
+
 ## [0.3.0] - 2026-09-15
 
 ### Changed

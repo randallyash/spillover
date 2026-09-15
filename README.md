@@ -128,7 +128,7 @@ Type `/` for the menu. The ones a single-model agent cannot offer:
 
 | | |
 | --- | --- |
-| `/escalate` `/consult` `/on-stuck` | Force a spill, ask for one consult, or set the policy |
+| `/escalate` `/deescalate` `/consult` `/on-stuck` | Force a spill, go back to the first tier, ask for one consult, or set the policy |
 | `/why` | Every counter behind the last stall |
 | `/tier` `/retry` `/drop` | Pin a model, replay a turn, forget that CLI's session |
 | `/undo` | Put back the last approved write (ten deep; refuses if the file moved on) |

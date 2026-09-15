@@ -213,6 +213,11 @@ pub enum AgentEvent {
         to: String,
         reason: String,
     },
+    /// The user picked a tier, or went back to the top of the chain.
+    ///
+    /// Distinct from `Escalated`: that marks the previous tier as spent. This
+    /// just moves the rail, including back up.
+    Switched { to: String },
     /// Tokens a tier spent on this turn.
     Spent { tier: String, usage: Usage },
     /// The turn ended normally.
@@ -452,9 +457,10 @@ async fn handle_command(
         Command::Escalate => {
             // Escalating from the last tier has nowhere to go, which is worth
             // saying rather than silently doing nothing.
+            let from = state.chain.active().label.clone();
             let stepped = state.chain.escalate().map(|tier| tier.label.clone());
             match stepped {
-                Some(label) => {
+                Some(to) => {
                     let index = state.chain.active_index();
                     let total = state.chain.len();
                     // A hand-issued escalation is a choice, not a fallback, so
@@ -462,8 +468,15 @@ async fn handle_command(
                     // to the top on the next message and the command would look
                     // broken.
                     state.chain.pin(index);
+                    // The rail only moves on this event. A Notice alone left it
+                    // looking like the old tier was still answering.
+                    let _ = events.send(AgentEvent::Escalated {
+                        from,
+                        to: to.clone(),
+                        reason: "you asked".to_string(),
+                    });
                     let _ = events.send(AgentEvent::Notice(format!(
-                        "moving to {label} ({} of {total}) — it will answer from here",
+                        "moving to {to} ({} of {total}) — /deescalate or /tier auto goes back",
                         index + 1
                     )));
                 }
@@ -551,7 +564,10 @@ async fn handle_command(
             if let Some(query) = tier {
                 match state.chain.resolve(&query) {
                     Some(index) => {
-                        state.chain.pin(index);
+                        let to = state.chain.pin(index).map(|tier| tier.label.clone());
+                        if let Some(to) = to {
+                            let _ = events.send(AgentEvent::Switched { to });
+                        }
                     }
                     None => {
                         let _ = events.send(AgentEvent::Notice(format!(
@@ -600,20 +616,22 @@ async fn handle_command(
 
         Command::SetTier(tier) => match tier {
             None => {
-                state.chain.unpin();
-                state.chain.begin_turn();
+                state.chain.return_to_top();
+                let to = state.chain.active().label.clone();
+                let _ = events.send(AgentEvent::Switched { to: to.clone() });
                 let _ = events.send(AgentEvent::Notice(format!(
-                    "back to the configured order — {} answers next",
-                    state.chain.active().label
+                    "back to the configured order — {to} answers next"
                 )));
             }
             Some(query) => match state.chain.resolve(&query) {
                 Some(index) => {
                     let label = state.chain.pin(index).map(|tier| tier.label.clone());
-                    let _ = events.send(AgentEvent::Notice(format!(
-                        "{} will answer from here, until you say /tier auto",
-                        label.unwrap_or_default()
-                    )));
+                    if let Some(to) = label {
+                        let _ = events.send(AgentEvent::Switched { to: to.clone() });
+                        let _ = events.send(AgentEvent::Notice(format!(
+                            "{to} will answer from here, until you say /tier auto"
+                        )));
+                    }
                 }
                 None => {
                     let _ = events.send(AgentEvent::Notice(format!(
@@ -3034,6 +3052,10 @@ mod tests {
             "{:?}",
             notices(&events)
         );
+        let (from, to, reason) = escalation(&events).expect("/escalate must move the rail");
+        assert!(from.starts_with("Local"), "{from}");
+        assert!(to.starts_with("DeepSeek"), "{to}");
+        assert_eq!(reason, "you asked");
 
         tx.send(Command::Prompt("hello".to_string())).expect("send");
         let events = collect(&mut rx).await;

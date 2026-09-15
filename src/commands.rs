@@ -41,6 +41,11 @@ pub const CATALOGUE: &[Spec] = &[
         summary: "Spill to the next tier now, without waiting for it to stall",
     },
     Spec {
+        name: "deescalate",
+        arg: Arg::None,
+        summary: "Go back to the first tier, as if nothing had spilled",
+    },
+    Spec {
         name: "consult",
         arg: Arg::None,
         summary: "Ask the tier below one question, and keep driving",

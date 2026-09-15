@@ -240,6 +240,15 @@ impl FallbackChain {
         self.pinned = None;
     }
 
+    /// Go back to the first tier, even if sticky would have kept the spill.
+    ///
+    /// `/tier auto` and `/deescalate` are an explicit "start over at the cheap
+    /// model". Sticky still applies to the *next* automatic spill.
+    pub fn return_to_top(&mut self) {
+        self.unpin();
+        self.active = 0;
+    }
+
     /// Resolve what a user typed into a position in the chain.
     pub fn resolve(&self, query: &str) -> Option<usize> {
         let query = query.trim();
@@ -377,6 +386,30 @@ mod tests {
             chain.active().label,
             "deepseek (stub)",
             "it must not move past the end"
+        );
+    }
+
+    #[test]
+    fn returning_to_the_top_ignores_sticky() {
+        let mut chain = chain(&["local", "deepseek"], true);
+        chain.escalate().expect("one step down");
+        assert_eq!(chain.active().label, "deepseek (stub)");
+
+        chain.unpin();
+        chain.begin_turn();
+        assert_eq!(
+            chain.active().label,
+            "deepseek (stub)",
+            "sticky keeps a spill without an explicit return"
+        );
+
+        chain.return_to_top();
+        assert_eq!(chain.active().label, "local (stub)");
+        chain.begin_turn();
+        assert_eq!(
+            chain.active().label,
+            "local (stub)",
+            "after returning, the next turn still starts at the top"
         );
     }
 

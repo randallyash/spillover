@@ -300,6 +300,11 @@ impl App {
     pub fn activate_tier(&mut self, label: &str) {
         if let Some(index) = self.tier_index(label) {
             self.active_tier = index;
+            // Choosing a tier, or landing on it, means it is answering — not
+            // spent. Otherwise /tier 1 after a spill left the chip on ✗.
+            if let Some(failed) = self.tier_failed.get_mut(index) {
+                *failed = false;
+            }
         }
     }
 
@@ -804,7 +809,12 @@ impl App {
             AgentEvent::Escalated { from, to, .. } => {
                 // The narration and the flash were started by `Spilling`, which
                 // always precedes this. All that is left is to record the move.
+                // `/escalate` sends this without `Spilling`, so the rail still
+                // has to move.
                 self.fail_tier(&from);
+                self.activate_tier(&to);
+            }
+            AgentEvent::Switched { to } => {
                 self.activate_tier(&to);
             }
             AgentEvent::Cancelled { tier } => {
@@ -1006,6 +1016,10 @@ impl App {
                 send(self, Command::Escalate);
             }
 
+            "deescalate" => {
+                send(self, Command::SetTier(None));
+            }
+
             "consult" => {
                 send(self, Command::Consult);
             }
@@ -1138,7 +1152,7 @@ impl App {
             ));
         }
         out.push_str(
-            "\n/tier <name|number> chooses one, /tier auto returns to the configured order.",
+            "\n/tier <name|number> chooses one. /tier auto or /deescalate returns to the first.",
         );
         out
     }
@@ -2120,6 +2134,34 @@ mod tests {
     }
 
     #[test]
+    fn switching_back_clears_the_failed_mark_and_moves_the_rail() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = new_app();
+        app.attach(
+            tx,
+            Canceller::default(),
+            &["Local".to_string(), "Grok".to_string()],
+            None,
+        );
+        app.handle_agent_event(AgentEvent::Escalated {
+            from: "Local".to_string(),
+            to: "Grok".to_string(),
+            reason: "you asked".to_string(),
+        });
+        assert_eq!(app.active_tier, 1);
+        assert!(app.tier_failed[0]);
+
+        app.handle_agent_event(AgentEvent::Switched {
+            to: "Local".to_string(),
+        });
+        assert_eq!(app.active_tier, 0);
+        assert!(
+            !app.tier_failed[0],
+            "the tier that is answering is not spent"
+        );
+    }
+
+    #[test]
     fn a_label_the_chain_does_not_know_does_not_move_the_rail() {
         // Labels come from the same source as the chain, so this should not
         // happen; if it ever does, the rail holds rather than pointing at the
@@ -2475,6 +2517,7 @@ mod tests {
     fn the_commands_with_nowhere_else_to_live_are_forwarded() {
         let cases: &[(&str, Command)] = &[
             ("/escalate", Command::Escalate),
+            ("/deescalate", Command::SetTier(None)),
             ("/drop", Command::Drop),
             ("/compact", Command::Compact),
             ("/context", Command::Context),
