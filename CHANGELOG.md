@@ -12,6 +12,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   as 0.2.0: the version pin and the sums cannot land in one commit, because the
   sums do not exist until the tag is pushed.
 
+### Fixed
+
+- **A dead CLI session is retried fresh, not consulted about.** Command Code
+  rejects `--session` when its on-disk transcript is empty. That used to look
+  like a stuck model, so Grok was asked about a flag. Spill now drops the id
+  and resends the conversation it already holds.
+
 ## [0.3.0] - 2026-09-15
 
 ### Changed

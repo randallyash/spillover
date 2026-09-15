@@ -90,6 +90,30 @@ pub enum ProviderError {
     Broken { target: String, detail: String },
 }
 
+impl ProviderError {
+    /// A CLI that was asked to resume a session it no longer has.
+    ///
+    /// That is plumbing, not a stuck model: the next move is to start a fresh
+    /// run with the transcript spill already holds, not to consult the frontier
+    /// about a `--session` flag.
+    pub fn looks_like_dead_session(&self) -> bool {
+        let Self::Rejected { detail, .. } = self else {
+            return false;
+        };
+        let detail = detail.to_ascii_lowercase();
+        let about_session = detail.contains("session")
+            || detail.contains("transcript")
+            || detail.contains("resume");
+        let missing = detail.contains("neither")
+            || detail.contains("not found")
+            || detail.contains("unknown")
+            || detail.contains("no such")
+            || detail.contains("does not exist")
+            || detail.contains("invalid");
+        about_session && missing
+    }
+}
+
 /// A short, human reason for a failed request, without repeating the target.
 pub fn transport_reason(error: &reqwest::Error) -> String {
     if error.is_connect() {

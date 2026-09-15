@@ -217,7 +217,23 @@ impl Provider for CliProvider {
         };
         let args = self.build_args(&prompt, &session);
 
-        let summary = self.run(args, events).await?;
+        let summary = match self.run(args, events.clone()).await {
+            Ok(summary) => summary,
+            Err(error)
+                if matches!(session, SessionCall::Continue(_))
+                    && error.looks_like_dead_session() =>
+            {
+                // Command Code (and similar) will reject `--session` when the
+                // on-disk transcript is empty or gone. Spill still has the
+                // conversation, so start over with it rather than treating a
+                // dead file as a stall that consults the frontier.
+                self.forget_session();
+                let prompt = render_prompt(&request.messages);
+                let args = self.build_args(&prompt, &SessionCall::Fresh);
+                self.run(args, events).await?
+            }
+            Err(error) => return Err(error),
+        };
 
         if self.spec.captures_session() {
             self.note_session(&summary);
@@ -822,6 +838,36 @@ mod tests {
         assert_eq!(
             second.text, "session=sess-123 prompt=second question",
             "the captured id should be resumed, with only the new turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dead_session_is_dropped_and_the_turn_runs_fresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // First call has no `--session` and succeeds. The second is asked to
+        // resume, refuses the way Command Code does for an empty transcript,
+        // and the retry must then succeed without that flag.
+        let body = r#"
+            if [ "$1" = "--session" ]; then
+              echo 'Error: --session "'"$2"'" is neither an existing .jsonl transcript nor a known session-id prefix.' >&2
+              exit 1
+            fi
+            printf '%s\n' '{"type":"event","event":{"type":"run_start","sessionId":"sess-dead"}}' '{"type":"result","subtype":"success","stopReason":"end_turn","finalText":"recovered"}'
+        "#;
+        let mut spec = spec(body, Dialect::CommandCode);
+        spec.resume_args = vec!["--session".to_string(), "{session}".to_string()];
+        let provider = provider(spec, dir.path());
+
+        let first = turn(&provider, conversation("first question")).await;
+        assert_eq!(first.text, "recovered");
+        assert_eq!(provider.session_id().as_deref(), Some("sess-dead"));
+
+        let second = turn(&provider, follow_up("second question")).await;
+        assert_eq!(second.text, "recovered");
+        assert_eq!(
+            provider.session_id().as_deref(),
+            Some("sess-dead"),
+            "the fresh run may mint a session again"
         );
     }
 
