@@ -96,7 +96,7 @@ impl Tool for Glob {
                     continue;
                 }
             }
-            matches.push(display_path(workspace, &entry));
+            matches.push(display_path(&workspace_root, &entry));
         }
 
         if matches.is_empty() {
@@ -148,8 +148,12 @@ fn confined_pattern(workspace: &Path, pattern: &str) -> Result<String, ToolOutco
 }
 
 fn display_path(workspace: &Path, path: &Path) -> String {
+    // Both sides canonical: on macOS the workspace is often `/var/...` while
+    // the match is `/private/var/...`, and a prefix check against the alias
+    // would print an absolute path.
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     path.strip_prefix(workspace)
-        .unwrap_or(path)
+        .unwrap_or(&path)
         .display()
         .to_string()
 }

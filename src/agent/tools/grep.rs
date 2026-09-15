@@ -75,7 +75,8 @@ impl Tool for Grep {
             Err(error) => return error,
         };
         let file_glob = args.optional_str("glob").map(str::to_string);
-        let workspace = workspace.to_path_buf();
+        let workspace =
+            std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
 
         // Walking a tree is blocking work; keeping it off the runtime thread
         // means the UI keeps redrawing while a big search runs.
