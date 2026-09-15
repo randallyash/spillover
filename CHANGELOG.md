@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] - 2026-09-15
 
 ### Changed
 
@@ -56,11 +56,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   first paragraph and loses the rest. The thinking is still in the module, the
   source is shorter to read.
 
-- **The AUR recipe names 0.2.0, with that release's checksums.** The recipe and the
-  crate have to agree on the version or `cargo test` fails, but the checksums cannot
-  exist until the artifacts are published — so the two are done in the order the
-  release flow allows, and the sums here come from the release's own `.sha256` files
-  rather than from a build made locally.
+### Fixed
+
+- **Glob (and grep) results stay relative on macOS.** Canonicalising the workspace
+  for the confine check made matches print as `/private/var/...`, because `/tmp`
+  is a symlink there.
 
 ## [0.2.0] - 2026-09-13
 
@@ -895,6 +895,7 @@ First release. Everything below is new.
   [`randallyash/spillover`](https://github.com/randallyash/homebrew-spillover)
   tap, so `brew install randallyash/spillover/spill` works.
 
+[0.3.0]: https://github.com/randallyash/spillover/releases/tag/v0.3.0
 [0.1.2]: https://github.com/randallyash/spillover/releases/tag/v0.1.2
 [0.1.1]: https://github.com/randallyash/spillover/releases/tag/v0.1.1
 [0.1.0]: https://github.com/randallyash/spillover/releases/tag/v0.1.0

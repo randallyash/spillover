@@ -190,7 +190,7 @@ jq -r '"\(.at) \(.from) -> \(.to // "nowhere") [\(.policy)] \(.trigger): \(.reas
 variable names:
 
 ```
-spill 0.2.0 — doctor
+spill 0.3.0 — doctor
 
 config    /home/you/.config/spill/config.toml
           found at the default path · workspace ~ · sticky fallback on · 32 steps · shell 300s
