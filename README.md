@@ -124,7 +124,7 @@ for a box on your LAN than for a hosted CLI.
 
 ## Keys and commands
 
-`Enter` send · `Shift+Tab` plan mode · `Esc` stop (or quit) · `Ctrl-N` new session · `Ctrl-C` quit · `?` help
+`Enter` send · `Shift+Tab` plan mode · `Esc` stop (or quit) · `Ctrl-N` new session · `Ctrl-P` sessions · `Ctrl-C` quit · `?` help
 
 Type `/` for the menu. The ones a single-model agent cannot offer:
 
@@ -134,7 +134,9 @@ Type `/` for the menu. The ones a single-model agent cannot offer:
 | `/why` | Every counter behind the last stall |
 | `/tier` `/retry` `/drop` | Pin a model, replay a turn, forget that CLI's session |
 | `/undo` | Put back the last approved write (ten deep; refuses if the file moved on) |
-| `/new` | New session: empty transcript, first tier (also `Ctrl-N`) |
+| `/new` `Ctrl-N` | New session: empty transcript, first tier |
+| `/sessions` `Ctrl-P` | Named history for this workspace; enter to open, `n` new, `d` delete, `r` rename |
+| `/session rename <name>` | Name the current session |
 | `/allow` `/cost` `/compact` | Skip a prompt, see spend, fold old turns into a ledger |
 
 Writes always ask (`y` / `n`). Read-only shell (`ls`, `git status`, …) does not.

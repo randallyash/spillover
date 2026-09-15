@@ -45,6 +45,9 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::styled("session", theme.title));
+    if !app.session_title.is_empty() {
+        lines.extend(pair("name", &app.session_title, theme, value_width));
+    }
     lines.push(Line::raw(""));
 
     if app.tier_labels.is_empty() {

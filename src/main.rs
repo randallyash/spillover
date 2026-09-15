@@ -284,7 +284,7 @@ async fn run(mut config: Config) -> io::Result<()> {
     let workspace = config.general.workspace_path();
     let saved = crate::session_store::SessionStore::for_workspace(&workspace)
         .ok()
-        .and_then(|store| store.load());
+        .and_then(|store| store.load().filter(|file| !file.is_empty()));
 
     let mut app = App::new(config.clone());
     for note in first_run {
@@ -317,6 +317,12 @@ async fn run(mut config: Config) -> io::Result<()> {
     // After `attach`, which seeds the tier mirror from the live chain: restoring
     // first would be overwritten by it.
     if let Some(saved) = &saved {
+        app.session_title = if saved.title.is_empty() {
+            "untitled".to_string()
+        } else {
+            saved.title.clone()
+        };
+        app.session_current = saved.id.clone();
         app.restore(saved, restored_tier);
     }
 
@@ -459,6 +465,9 @@ async fn start_agent(config: &Config, resume: Option<&SessionFile>) -> AgentStar
     let seed = resume.map(|saved| Seed {
         messages: saved.messages.clone(),
         mode: saved.mode,
+        id: saved.id.clone(),
+        title: saved.title.clone(),
+        named: saved.named,
     });
 
     // Where this session will be written. A failure to find a state directory

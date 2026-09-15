@@ -139,6 +139,7 @@ pub fn render_help(frame: &mut Frame, area: Rect, theme: &Theme) {
         ("esc", "quit, or cancel a half-typed command"),
         ("ctrl-c", "quit from anywhere"),
         ("ctrl-n", "start a new session"),
+        ("ctrl-p", "session picker"),
         ("pgup / pgdn", "scroll the conversation"),
         ("↑ / ↓", "choose in the command menu"),
         ("?", "this"),
@@ -321,7 +322,15 @@ mod tests {
         for spec in commands::CATALOGUE {
             assert!(out.contains(spec.name), "{} is missing:\n{out}", spec.name);
         }
-        for key in ["enter", "esc", "ctrl-c", "ctrl-n", "tab", "shift+tab"] {
+        for key in [
+            "enter",
+            "esc",
+            "ctrl-c",
+            "ctrl-n",
+            "ctrl-p",
+            "tab",
+            "shift+tab",
+        ] {
             assert!(out.contains(key), "{key} is missing:\n{out}");
         }
     }

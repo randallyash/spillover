@@ -206,6 +206,13 @@ pub struct App {
     pub turns: u32,
     /// The most recent stall and everything the verdict was made from.
     pub last_stall: Option<Verdict>,
+    pub session_picker: bool,
+    pub session_entries: Vec<crate::session_store::SessionEntry>,
+    pub session_cursor: usize,
+    pub session_current: String,
+    pub session_title: String,
+    /// When set, the picker is capturing a new title.
+    pub session_rename: Option<String>,
 }
 
 impl App {
@@ -249,6 +256,12 @@ impl App {
             turn_usage: None,
             turns: 0,
             last_stall: None,
+            session_picker: false,
+            session_entries: Vec::new(),
+            session_cursor: 0,
+            session_current: String::new(),
+            session_title: "untitled".to_string(),
+            session_rename: None,
         }
     }
 
@@ -445,7 +458,17 @@ impl App {
             && self.approval.is_none()
         {
             self.help = false;
+            self.session_picker = false;
             self.run_command("new", "");
+            return;
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P'))
+            && self.approval.is_none()
+        {
+            self.help = false;
+            self.run_command("sessions", "");
             return;
         }
 
@@ -470,6 +493,11 @@ impl App {
 
         // The help overlay is dismissed by anything, so it can never trap
         // someone who opened it by accident.
+        if self.session_picker {
+            self.handle_session_picker(key);
+            return;
+        }
+
         if self.help {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Enter => {
@@ -941,6 +969,39 @@ impl App {
                     self.messages.push(Message::system(line));
                 }
             }
+            AgentEvent::SessionList { current, entries } => {
+                self.session_picker = true;
+                self.help = false;
+                self.session_current = current.clone();
+                self.session_entries = entries;
+                self.session_cursor = self
+                    .session_entries
+                    .iter()
+                    .position(|entry| entry.id == current)
+                    .unwrap_or(0);
+                self.session_rename = None;
+            }
+            AgentEvent::SessionLoaded {
+                id,
+                title,
+                messages,
+                active_label,
+                sticky,
+                on_stuck,
+                mode,
+            } => {
+                self.wipe_transcript();
+                self.messages.extend(render_session(&messages));
+                self.session_current = id;
+                self.session_title = title.clone();
+                self.sticky = sticky;
+                self.on_stuck = on_stuck;
+                self.mode = mode;
+                self.activate_tier(&active_label);
+                self.tier_failed = vec![false; self.tier_labels.len()];
+                self.messages
+                    .push(Message::system(format!("opened {title}")));
+            }
         }
         self.scroll_back = 0;
     }
@@ -1026,6 +1087,77 @@ impl App {
         self.turns = self.turns.saturating_add(1);
         self.messages.push(Message::user(text));
         self.scroll_back = 0;
+    }
+
+    fn handle_session_picker(&mut self, key: KeyEvent) {
+        if let Some(buffer) = &mut self.session_rename {
+            match key.code {
+                KeyCode::Esc => self.session_rename = None,
+                KeyCode::Enter => {
+                    let title = buffer.trim().to_string();
+                    self.session_rename = None;
+                    if !title.is_empty() {
+                        let _ = self
+                            .commands
+                            .as_ref()
+                            .map(|tx| tx.send(Command::RenameSession(title)));
+                    }
+                }
+                KeyCode::Backspace => {
+                    buffer.pop();
+                }
+                KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    buffer.push(ch);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.session_picker = false;
+            }
+            KeyCode::Up => {
+                self.session_cursor = self.session_cursor.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                let last = self.session_entries.len().saturating_sub(1);
+                self.session_cursor = (self.session_cursor + 1).min(last);
+            }
+            KeyCode::Enter => {
+                if let Some(entry) = self.session_entries.get(self.session_cursor) {
+                    let id = entry.id.clone();
+                    self.session_picker = false;
+                    let _ = self
+                        .commands
+                        .as_ref()
+                        .map(|tx| tx.send(Command::OpenSession(id)));
+                }
+            }
+            KeyCode::Char('n') => {
+                self.session_picker = false;
+                self.run_command("new", "");
+            }
+            KeyCode::Char('d') => {
+                if let Some(entry) = self.session_entries.get(self.session_cursor) {
+                    let id = entry.id.clone();
+                    let _ = self
+                        .commands
+                        .as_ref()
+                        .map(|tx| tx.send(Command::DeleteSession(id)));
+                }
+            }
+            KeyCode::Char('r') => {
+                let title = self
+                    .session_entries
+                    .get(self.session_cursor)
+                    .map(|entry| entry.title.clone())
+                    .unwrap_or_default();
+                self.session_rename = Some(title);
+            }
+            _ => {}
+        }
     }
 
     /// Act on a slash command.
@@ -1163,6 +1295,23 @@ impl App {
                     self.active_tier = 0;
                     self.tier_failed = vec![false; self.tier_labels.len()];
                     self.on_stuck = None;
+                    self.session_title = "untitled".to_string();
+                    self.session_picker = false;
+                }
+            }
+            "sessions" => {
+                send(self, Command::ListSessions);
+            }
+            "session" => {
+                let argument = argument.trim();
+                if let Some(name) = argument.strip_prefix("rename ") {
+                    send(self, Command::RenameSession(name.trim().to_string()));
+                } else if argument.is_empty() {
+                    send(self, Command::ListSessions);
+                } else {
+                    self.messages.push(Message::system(
+                        "usage: /sessions, or /session rename <name>".to_string(),
+                    ));
                 }
             }
             "context" => {
@@ -1382,7 +1531,7 @@ fn render_session(messages: &[crate::session::ChatMessage]) -> Vec<Message> {
 }
 
 /// How long ago something happened, in the few words a one-line notice wants.
-fn ago(saved_at: u64) -> String {
+pub(crate) fn ago(saved_at: u64) -> String {
     let seconds = crate::session_store::now_epoch().saturating_sub(saved_at);
     match seconds {
         0..=59 => "just now".to_string(),
@@ -2608,6 +2757,11 @@ mod tests {
             ("/context", Command::Context),
             ("/clear", Command::Clear),
             ("/new", Command::New),
+            ("/sessions", Command::ListSessions),
+            (
+                "/session rename parser",
+                Command::RenameSession("parser".to_string()),
+            ),
             ("/retry", Command::Retry { tier: None }),
             (
                 "/retry 2",

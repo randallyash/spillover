@@ -96,6 +96,16 @@ pub const CATALOGUE: &[Spec] = &[
         summary: "Start a new session: empty transcript, first tier",
     },
     Spec {
+        name: "sessions",
+        arg: Arg::None,
+        summary: "Pick a saved conversation in this workspace",
+    },
+    Spec {
+        name: "session",
+        arg: Arg::Optional("rename <name>"),
+        summary: "Name the current session",
+    },
+    Spec {
         name: "clear",
         arg: Arg::None,
         summary: "Wipe the transcript, keeping the current tier",

@@ -165,6 +165,14 @@ pub enum Command {
     Clear,
     /// Start a new session: empty transcript, first tier, no CLI resume.
     New,
+    /// Open the session picker.
+    ListSessions,
+    /// Resume a saved conversation by id.
+    OpenSession(String),
+    /// Name the current session.
+    RenameSession(String),
+    /// Forget a saved conversation.
+    DeleteSession(String),
     /// Report what is being sent each turn.
     Context,
     /// Put back an approved write.
@@ -246,6 +254,21 @@ pub enum AgentEvent {
     Stalled { verdict: Box<Verdict> },
     /// A turn that finished, having come within one step of being abandoned.
     AlmostStalled { tier: String, miss: Miss },
+    /// The named history for this workspace, for the picker.
+    SessionList {
+        current: String,
+        entries: Vec<crate::session_store::SessionEntry>,
+    },
+    /// A saved conversation was opened; the interface replaces what it shows.
+    SessionLoaded {
+        id: String,
+        title: String,
+        messages: Vec<ChatMessage>,
+        active_label: String,
+        sticky: bool,
+        on_stuck: Option<OnStuck>,
+        mode: Mode,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -271,6 +294,9 @@ pub struct Seed {
     /// restored mode.
     pub messages: Vec<ChatMessage>,
     pub mode: Mode,
+    pub id: String,
+    pub title: String,
+    pub named: bool,
 }
 
 /// The conversation and the chain, plus what it takes to run the last turn
@@ -290,6 +316,9 @@ struct Loop {
     allow: AllowRules,
     /// Whether the spill log has already been reported as unwritable.
     log_warned: bool,
+    session_id: String,
+    session_title: String,
+    session_named: bool,
 }
 
 #[derive(Clone)]
@@ -344,6 +373,9 @@ pub fn spawn_seeded(
                 undo: UndoStack::default(),
                 allow: rules,
                 log_warned: false,
+                session_id: seed.id,
+                session_title: seed.title,
+                session_named: seed.named,
             },
             None => Loop {
                 session: Session::with_system_prompt(
@@ -355,6 +387,9 @@ pub fn spawn_seeded(
                 undo: UndoStack::default(),
                 allow: rules,
                 log_warned: false,
+                session_id: uuid::Uuid::new_v4().to_string(),
+                session_title: "untitled".to_string(),
+                session_named: false,
             },
         };
 
@@ -375,6 +410,9 @@ fn snapshot(config: &AgentConfig, state: &Loop) -> SessionFile {
     let chain = state.chain.state();
 
     let mut file = SessionFile::new(config.workspace.clone());
+    file.id = state.session_id.clone();
+    file.title = state.session_title.clone();
+    file.named = state.session_named;
     file.active_tier = chain.active;
     file.pinned_tier = chain.pinned;
     file.sticky = chain.sticky;
@@ -388,15 +426,49 @@ fn snapshot(config: &AgentConfig, state: &Loop) -> SessionFile {
             file.cli_sessions.insert(tier.id.clone(), id);
         }
     }
+    file.refresh_title();
     file
 }
 
+fn adopt_session(state: &mut Loop, config: &AgentConfig, file: &SessionFile) {
+    state.session = Session::restore(
+        file.mode.system_prompt(&config.workspace),
+        file.messages.clone(),
+    );
+    state.last = None;
+    state.undo = UndoStack::default();
+    state.mode = file.mode;
+    state.chain.restore_state(&file.chain_state());
+    for tier in state.chain.tiers() {
+        tier.provider
+            .set_session(file.cli_sessions.get(&tier.id).cloned());
+    }
+    state.session_id = file.id.clone();
+    state.session_title = file.title.clone();
+    state.session_named = file.named;
+}
+
+fn session_loaded(state: &Loop) -> AgentEvent {
+    AgentEvent::SessionLoaded {
+        id: state.session_id.clone(),
+        title: state.session_title.clone(),
+        messages: state.session.conversation(),
+        active_label: state.chain.active().label.clone(),
+        sticky: state.chain.state().sticky,
+        on_stuck: state.chain.state().on_stuck,
+        mode: state.mode,
+    }
+}
+
 /// Write the session out, reporting a failure rather than interrupting anything.
-fn persist(config: &AgentConfig, state: &Loop, events: &UnboundedSender<AgentEvent>) {
+fn persist(config: &AgentConfig, state: &mut Loop, events: &UnboundedSender<AgentEvent>) {
     let Some(store) = &config.store else {
         return;
     };
-    if let Err(error) = store.save(&snapshot(config, state)) {
+    let file = snapshot(config, state);
+    state.session_id = file.id.clone();
+    state.session_title = file.title.clone();
+    if let Err(error) = store.save(&file) {
         let _ = events.send(AgentEvent::Notice(format!(
             "this session could not be saved to {} ({error}), so it will not be resumed next time",
             store.path().display()
@@ -681,14 +753,97 @@ async fn handle_command(
         }
 
         Command::New => {
-            state.session.reset();
-            state.last = None;
-            state.chain.forget_sessions();
-            state.chain.return_to_top();
-            state.chain.set_on_stuck(None);
+            if let Some(store) = &config.store {
+                let _ = store.save(&snapshot(config, state));
+                let file = store.start_new();
+                adopt_session(state, config, &file);
+            } else {
+                state.session.reset();
+                state.last = None;
+                state.chain.forget_sessions();
+                state.chain.return_to_top();
+                state.chain.set_on_stuck(None);
+                state.session_id = uuid::Uuid::new_v4().to_string();
+                state.session_title = "untitled".to_string();
+                state.session_named = false;
+            }
             let to = state.chain.active().label.clone();
             let _ = events.send(AgentEvent::Switched { to: to.clone() });
             let _ = events.send(AgentEvent::Notice(format!("new session — {to} answers")));
+        }
+
+        Command::ListSessions => {
+            let Some(store) = &config.store else {
+                let _ = events.send(AgentEvent::Notice(
+                    "sessions are not being saved, so there is nothing to pick from".to_string(),
+                ));
+                return;
+            };
+            let _ = store.save(&snapshot(config, state));
+            let _ = events.send(AgentEvent::SessionList {
+                current: store.current_id().unwrap_or_default(),
+                entries: store.list(),
+            });
+        }
+
+        Command::OpenSession(id) => {
+            let Some(store) = &config.store else {
+                return;
+            };
+            let _ = store.save(&snapshot(config, state));
+            let Some(file) = store.open(&id) else {
+                let _ = events.send(AgentEvent::Notice(format!("no session matches {id:?}")));
+                return;
+            };
+            adopt_session(state, config, &file);
+            let _ = events.send(session_loaded(state));
+        }
+
+        Command::RenameSession(title) => {
+            let Some(store) = &config.store else {
+                return;
+            };
+            match store.rename(&title) {
+                Some(title) => {
+                    state.session_title = title.clone();
+                    state.session_named = true;
+                    let _ = events.send(AgentEvent::Notice(format!("session named {title:?}")));
+                }
+                None => {
+                    let _ = events.send(AgentEvent::Notice(
+                        "usage: /session rename <name>".to_string(),
+                    ));
+                }
+            }
+        }
+
+        Command::DeleteSession(id) => {
+            let Some(store) = &config.store else {
+                return;
+            };
+            match store.delete(&id) {
+                Ok(Some(file)) => {
+                    if file.id != state.session_id {
+                        adopt_session(state, config, &file);
+                        let _ = events.send(session_loaded(state));
+                    }
+                    let _ = events.send(AgentEvent::Notice("session deleted".to_string()));
+                    let _ = events.send(AgentEvent::SessionList {
+                        current: store.current_id().unwrap_or_default(),
+                        entries: store.list(),
+                    });
+                }
+                Ok(None) => {
+                    let _ = events.send(AgentEvent::Notice(
+                        "that session was already gone".to_string(),
+                    ));
+                }
+                Err(error) => {
+                    let _ = events.send(AgentEvent::Notice(format!(
+                        "could not delete the session: {error}"
+                    )));
+                }
+            }
         }
 
         Command::Context => {
@@ -5119,7 +5274,7 @@ mod tests {
 
     /// A store with nowhere to write, for checking the failure path.
     fn store_in(dir: &std::path::Path) -> SessionStore {
-        SessionStore::at(dir.join("session.json"), dir.to_path_buf())
+        SessionStore::at(dir.to_path_buf(), dir.to_path_buf())
     }
 
     /// Run one prompt through a chain that has somewhere to save.
@@ -5170,6 +5325,9 @@ mod tests {
             undo: UndoStack::default(),
             allow: AllowRules::default(),
             log_warned: false,
+            session_id: "snap".to_string(),
+            session_title: "hello".to_string(),
+            session_named: false,
         };
 
         let agent_config = AgentConfig {
@@ -5266,9 +5424,10 @@ mod tests {
             .expect("an event");
         tokio::task::yield_now().await;
 
+        let saved = store.load().expect("the slot remains in history");
         assert!(
-            store.load().is_none(),
-            "a cleared session should leave nothing to resume"
+            saved.is_empty(),
+            "a cleared session has nothing to resume as a conversation"
         );
     }
 
@@ -5294,10 +5453,7 @@ mod tests {
         let scripted = ScriptedProvider::new(vec![answer("all done")]);
         let mut agent_config = config(dir.path(), DEFAULT_MAX_STEPS);
         // A file where the directory should be, so the write cannot succeed.
-        agent_config.store = Some(SessionStore::at(
-            blocker.join("session.json"),
-            dir.path().to_path_buf(),
-        ));
+        agent_config.store = Some(SessionStore::at(blocker.clone(), dir.path().to_path_buf()));
 
         let (tx, mut rx) = spawn(
             agent_config,
@@ -5331,6 +5487,9 @@ mod tests {
                 ChatMessage::assistant("earlier answer", Vec::new()),
             ],
             mode: Mode::Build,
+            id: "seed-1".to_string(),
+            title: "earlier question".to_string(),
+            named: false,
         };
 
         let (tx, mut rx) = spawn_seeded(
@@ -5366,6 +5525,9 @@ mod tests {
         let seed = Seed {
             messages: vec![ChatMessage::user("earlier")],
             mode: Mode::Plan,
+            id: "seed-2".to_string(),
+            title: "earlier".to_string(),
+            named: false,
         };
         let (tx, mut rx) = spawn_seeded(
             config(dir.path(), DEFAULT_MAX_STEPS),

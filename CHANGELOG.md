@@ -30,10 +30,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   answer, the way the Grok TUI does. They are not kept as the answer and are
   not sent back to a model.
 
-- **`/new` (and Ctrl-N) starts a new session.** One session per workspace is
-  still resumed on launch. `/clear` wipes the transcript and keeps the current
-  tier; `/new` also returns to the first tier and drops CLI session ids so the
-  next turn is actually fresh.
+- **Named session history and a picker.** A workspace keeps every conversation,
+  titled from the first prompt (or `/session rename`). `/sessions` or Ctrl-P
+  opens a picker: enter to switch, `n` new, `d` delete, `r` rename. `/new` still
+  starts a blank session without throwing the last one away. A leftover single
+  `{hash}.json` is migrated on first open.
 
 ## [0.3.0] - 2026-09-15
 

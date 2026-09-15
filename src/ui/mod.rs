@@ -15,6 +15,7 @@ pub mod menu;
 /// Frame inspection, for making the pictures in the README.
 #[cfg(test)]
 pub mod screenshot;
+pub mod sessions;
 pub mod sidebar;
 pub mod status;
 pub mod theme;
@@ -111,6 +112,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // question, which is the one thing that must never be hidden.
     if app.help {
         menu::render_help(frame, area, &theme);
+    }
+
+    if app.session_picker {
+        sessions::render(frame, area, app, &theme);
     }
 
     // Drawn last so it sits above everything, including the prompt.

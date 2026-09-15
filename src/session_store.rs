@@ -1,28 +1,9 @@
-//! The conversation that outlives the process.
+//! Named sessions that outlive the process, one history per workspace.
 //!
-//! A TUI agent that forgets which tier it had settled on, what it had been told
-//! to do when a tier stalled, and what it had already said is a toy: every
-//! restart is a cold start, and the work of the previous session has to be
-//! explained again. This module is the file that prevents that.
-//!
-//! Three things are stored, and each one is here for a reason:
-//!
-//! - **The transcript**, inline rather than behind a pointer. A pointer would be
-//!   smaller, but an `openai` tier has no provider-side conversation to point at
-//!   — chat completions is stateless, so the whole history is re-sent every turn
-//!   — which means a pointer-only design would remember *nothing* for the local
-//!   model this program is built around. The transcript is the only record that
-//!   exists for those tiers, so it is the record we keep.
-//! - **The chain state**: which tier is answering, whether one was pinned, the
-//!   sticky choice, and any session-level stuck policy. This is the part a user
-//!   notices first, because it is what the rail and the session panel draw.
-//! - **The CLI session ids**, keyed by tier id. A resumed id means the CLI
-//!   continues its own conversation and is sent only the new turn, instead of
-//!   the whole transcript being flattened into its prompt again.
-//!
-//! It is written by the agent, which is the only thing that can see all of it,
-//! and read by `main` before the terminal is taken over, so a damaged file is
-//! reported as ordinary output instead of corrupting the interface.
+//! A workspace used to have a single file. That made restart a resume, and made
+//! starting over a wipe. The store is now a directory: each conversation is a
+//! file, an index names the current one, and `/sessions` can pick among them.
+//! A leftover `{hash}.json` from the old layout is migrated on first open.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -35,12 +16,15 @@ use thiserror::Error;
 use crate::agent::Mode;
 use crate::config::OnStuck;
 use crate::fallback::ChainState;
-use crate::session::ChatMessage;
+use crate::session::{ChatMessage, Role};
 
 /// The format this build writes. A file from another version is ignored rather
 /// than guessed at: resuming a conversation under rules it was not recorded
 /// under is worse than starting over.
 pub const SESSION_VERSION: u32 = 1;
+
+/// How long an auto-title may run, in characters.
+const TITLE_MAX: usize = 48;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -76,6 +60,15 @@ pub struct SessionFile {
     /// resumed into a build-mode session.
     #[serde(default)]
     pub messages: Vec<ChatMessage>,
+    /// Stable id of this conversation within the workspace.
+    #[serde(default)]
+    pub id: String,
+    /// What the picker shows. Inferred from the first prompt unless `named`.
+    #[serde(default)]
+    pub title: String,
+    /// The user set the title; do not overwrite it from the transcript.
+    #[serde(default)]
+    pub named: bool,
 }
 
 impl SessionFile {
@@ -92,7 +85,18 @@ impl SessionFile {
             mode: Mode::default(),
             cli_sessions: BTreeMap::new(),
             messages: Vec::new(),
+            id: uuid::Uuid::new_v4().to_string(),
+            title: "untitled".to_string(),
+            named: false,
         }
+    }
+
+    /// Fill in a title from the first user prompt, unless the user named it.
+    pub fn refresh_title(&mut self) {
+        if self.named {
+            return;
+        }
+        self.title = infer_title(&self.messages);
     }
 
     /// Whether there is anything worth remembering.
@@ -111,10 +115,35 @@ impl SessionFile {
     }
 }
 
-/// The one session belonging to one workspace directory.
+/// A row in the picker: enough to choose without opening the transcript.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionEntry {
+    pub id: String,
+    pub title: String,
+    pub saved_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct Index {
+    #[serde(default)]
+    current: String,
+    #[serde(default)]
+    sessions: Vec<IndexEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IndexEntry {
+    id: String,
+    title: String,
+    saved_at: u64,
+}
+
+/// Named sessions for one workspace directory.
 #[derive(Debug, Clone)]
 pub struct SessionStore {
-    path: PathBuf,
+    dir: PathBuf,
     workspace: PathBuf,
 }
 
@@ -122,72 +151,285 @@ impl SessionStore {
     /// The store for a workspace, under the platform's state directory.
     pub fn for_workspace(workspace: &Path) -> Result<Self, StoreError> {
         let dirs = directories::ProjectDirs::from("", "", "spill").ok_or(StoreError::NoStateDir)?;
-        let dir = dirs
+        let root = dirs
             .state_dir()
             .ok_or(StoreError::NoStateDir)?
             .join("sessions");
-        Ok(Self::at(
-            dir.join(format!("{}.json", key_for(workspace))),
-            workspace.to_path_buf(),
-        ))
+        let key = key_for(workspace);
+        let dir = root.join(&key);
+        let legacy = root.join(format!("{key}.json"));
+        if legacy.is_file() {
+            let _ = migrate_legacy(&legacy, &dir, workspace);
+        }
+        Ok(Self::at(dir, workspace.to_path_buf()))
     }
 
-    /// A store at an explicit path, for tests and for a caller that has already
-    /// worked out where the file belongs.
-    pub fn at(path: PathBuf, workspace: PathBuf) -> Self {
-        Self { path, workspace }
+    /// A store in an explicit directory, for tests.
+    pub fn at(dir: PathBuf, workspace: PathBuf) -> Self {
+        Self { dir, workspace }
     }
 
-    /// Where this session is written, for saying so when it cannot be.
-    pub fn path(&self) -> &Path {
-        &self.path
+    /// Where the current session is written, for saying so when it cannot be.
+    pub fn path(&self) -> PathBuf {
+        match self.current_id() {
+            Some(id) => self.file_path(&id),
+            None => self.dir.join("index.json"),
+        }
     }
 
-    /// Read the session, or `None` when there is not a usable one.
+    /// Read the current session, or `None` when there is not a usable one.
     pub fn load(&self) -> Option<SessionFile> {
-        let text = std::fs::read_to_string(&self.path).ok()?;
-        let file: SessionFile = serde_json::from_str(&text).ok()?;
+        let id = self.current_id()?;
+        self.load_id(&id)
+    }
+
+    /// Every saved conversation, newest first, with the current one marked by
+    /// matching `id` against `current_id`.
+    pub fn list(&self) -> Vec<SessionEntry> {
+        let mut entries = self
+            .read_index()
+            .map(|index| {
+                index
+                    .sessions
+                    .into_iter()
+                    .map(|entry| SessionEntry {
+                        id: entry.id,
+                        title: entry.title,
+                        saved_at: entry.saved_at,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if entries.is_empty() {
+            entries = self.scan();
+        }
+        entries.sort_by(|a, b| b.saved_at.cmp(&a.saved_at).then(b.id.cmp(&a.id)));
+        entries
+    }
+
+    pub fn current_id(&self) -> Option<String> {
+        let index = self.read_index()?;
+        if index.current.is_empty() {
+            None
+        } else {
+            Some(index.current)
+        }
+    }
+
+    /// Write the current session, atomically, and keep the index in step.
+    pub fn save(&self, file: &SessionFile) -> io::Result<()> {
+        let mut file = file.clone();
+        if file.id.is_empty() {
+            file.id = self
+                .current_id()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        }
+        file.workspace = self.workspace.clone();
+        file.saved_at = now_epoch();
+        file.refresh_title();
+        self.write_session(&file)?;
+        self.touch_index(&file)?;
+        Ok(())
+    }
+
+    /// Persist the current conversation if it has anything in it, then start a
+    /// blank one. An empty untitled session is reused rather than stacked.
+    pub fn start_new(&self) -> SessionFile {
+        if let Some(current) = self.load() {
+            if current.is_empty() && !current.named {
+                return current;
+            }
+            let _ = self.save(&current);
+        }
+        let file = SessionFile::new(self.workspace.clone());
+        let _ = self.save(&file);
+        file
+    }
+
+    /// Make this id the current session and return it.
+    pub fn open(&self, id: &str) -> Option<SessionFile> {
+        let file = self.load_id(id)?;
+        let mut index = self.read_index().unwrap_or_default();
+        if !index.sessions.iter().any(|entry| entry.id == id) {
+            index.sessions.push(IndexEntry {
+                id: file.id.clone(),
+                title: file.title.clone(),
+                saved_at: file.saved_at,
+            });
+        }
+        index.current = id.to_string();
+        let _ = self.write_index(&index);
+        Some(file)
+    }
+
+    /// Name the current session. Returns the title that stuck.
+    pub fn rename(&self, title: &str) -> Option<String> {
+        let mut file = self.load()?;
+        let title = title.trim();
+        if title.is_empty() {
+            return None;
+        }
+        file.title = title.to_string();
+        file.named = true;
+        let _ = self.save(&file);
+        Some(file.title)
+    }
+
+    /// Forget a session. If it was current, the next most recent becomes current.
+    pub fn delete(&self, id: &str) -> io::Result<Option<SessionFile>> {
+        let path = self.file_path(id);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let mut index = self.read_index().unwrap_or_default();
+        index.sessions.retain(|entry| entry.id != id);
+        let switching = index.current == id;
+        if switching {
+            index.current = index
+                .sessions
+                .iter()
+                .max_by_key(|entry| entry.saved_at)
+                .map(|entry| entry.id.clone())
+                .unwrap_or_default();
+        }
+        self.write_index(&index)?;
+        if switching {
+            if index.current.is_empty() {
+                return Ok(Some(self.start_new()));
+            }
+            return Ok(self.load_id(&index.current));
+        }
+        Ok(self.load())
+    }
+
+    fn load_id(&self, id: &str) -> Option<SessionFile> {
+        let text = std::fs::read_to_string(self.file_path(id)).ok()?;
+        let mut file: SessionFile = serde_json::from_str(&text).ok()?;
         if file.version != SESSION_VERSION {
             return None;
         }
-        // The file name is a hash, so confirm the contents agree with it. A
-        // collision, or a workspace that has since been renamed onto this key,
-        // must not resume somebody else's conversation.
         if normalise(&file.workspace) != normalise(&self.workspace) {
             return None;
+        }
+        if file.id.is_empty() {
+            file.id = id.to_string();
+        }
+        if file.title.is_empty() {
+            file.refresh_title();
         }
         Some(file)
     }
 
-    /// Write the session, atomically.
-    pub fn save(&self, file: &SessionFile) -> io::Result<()> {
-        if file.is_empty() {
-            return self.clear();
-        }
-
-        let Some(parent) = self.path.parent() else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "the session file has no parent directory",
-            ));
-        };
-        std::fs::create_dir_all(parent)?;
-
-        let text = serde_json::to_string_pretty(file).map_err(io::Error::other)?;
-        let temporary = self.path.with_extension("json.tmp");
-        std::fs::write(&temporary, text)?;
-        set_private(&temporary)?;
-        std::fs::rename(&temporary, &self.path)?;
-        Ok(())
+    fn file_path(&self, id: &str) -> PathBuf {
+        self.dir.join(format!("{id}.json"))
     }
 
-    /// Forget this workspace's session. A missing file is not an error.
-    pub fn clear(&self) -> io::Result<()> {
-        match std::fs::remove_file(&self.path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
+    fn index_path(&self) -> PathBuf {
+        self.dir.join("index.json")
+    }
+
+    fn read_index(&self) -> Option<Index> {
+        let text = std::fs::read_to_string(self.index_path()).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+
+    fn write_index(&self, index: &Index) -> io::Result<()> {
+        write_private(&self.index_path(), index)
+    }
+
+    fn write_session(&self, file: &SessionFile) -> io::Result<()> {
+        write_private(&self.file_path(&file.id), file)
+    }
+
+    fn touch_index(&self, file: &SessionFile) -> io::Result<()> {
+        let mut index = self.read_index().unwrap_or_default();
+        index.current = file.id.clone();
+        if let Some(entry) = index.sessions.iter_mut().find(|entry| entry.id == file.id) {
+            entry.title = file.title.clone();
+            entry.saved_at = file.saved_at;
+        } else {
+            index.sessions.push(IndexEntry {
+                id: file.id.clone(),
+                title: file.title.clone(),
+                saved_at: file.saved_at,
+            });
         }
+        self.write_index(&index)
+    }
+
+    fn scan(&self) -> Vec<SessionEntry> {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name();
+                let name = name.to_str()?;
+                if name == "index.json" || !name.ends_with(".json") {
+                    return None;
+                }
+                let id = name.trim_end_matches(".json");
+                let file = self.load_id(id)?;
+                Some(SessionEntry {
+                    id: file.id,
+                    title: file.title,
+                    saved_at: file.saved_at,
+                })
+            })
+            .collect()
+    }
+}
+
+fn write_private<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let text = serde_json::to_string_pretty(value).map_err(io::Error::other)?;
+    let temporary = path.with_extension("tmp");
+    std::fs::write(&temporary, text)?;
+    set_private(&temporary)?;
+    std::fs::rename(&temporary, path)?;
+    Ok(())
+}
+
+fn migrate_legacy(legacy: &Path, dir: &Path, workspace: &Path) -> io::Result<()> {
+    if dir.exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dir)?;
+    let text = std::fs::read_to_string(legacy)?;
+    let mut file: SessionFile = serde_json::from_str(&text).map_err(io::Error::other)?;
+    if file.id.is_empty() {
+        file.id = uuid::Uuid::new_v4().to_string();
+    }
+    file.workspace = workspace.to_path_buf();
+    file.refresh_title();
+    let store = SessionStore::at(dir.to_path_buf(), workspace.to_path_buf());
+    store.write_session(&file)?;
+    store.touch_index(&file)?;
+    let _ = std::fs::remove_file(legacy);
+    Ok(())
+}
+
+/// The picker label for a transcript: first user line, shortened.
+pub fn infer_title(messages: &[ChatMessage]) -> String {
+    let Some(user) = messages.iter().find(|message| message.role == Role::User) else {
+        return "untitled".to_string();
+    };
+    let line = user.content.lines().next().unwrap_or("").trim();
+    let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return "untitled".to_string();
+    }
+    let mut chars = collapsed.chars();
+    let taken: String = chars.by_ref().take(TITLE_MAX).collect();
+    if chars.next().is_some() {
+        format!("{taken}…")
+    } else {
+        taken
     }
 }
 
@@ -238,7 +480,7 @@ mod tests {
     use crate::session::ToolCall;
 
     fn store_in(dir: &Path, workspace: &Path) -> SessionStore {
-        SessionStore::at(dir.join("session.json"), workspace.to_path_buf())
+        SessionStore::at(dir.to_path_buf(), workspace.to_path_buf())
     }
 
     fn sample() -> SessionFile {
@@ -303,7 +545,8 @@ mod tests {
     fn a_corrupt_file_loads_as_no_session_rather_than_failing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = store_in(dir.path(), Path::new("/tmp/example"));
-        std::fs::write(store.path(), "{ this is not json").expect("write");
+        let file = store.start_new();
+        std::fs::write(store.file_path(&file.id), "{ this is not json").expect("write");
 
         assert!(
             store.load().is_none(),
@@ -318,6 +561,7 @@ mod tests {
 
         let mut file = sample();
         file.workspace = Path::new("/tmp/example").to_path_buf();
+        store.save(&file).expect("save");
         let mut value = serde_json::to_value(&file).expect("to value");
         value["version"] = serde_json::json!(SESSION_VERSION + 1);
         std::fs::write(store.path(), value.to_string()).expect("write");
@@ -328,13 +572,28 @@ mod tests {
     #[test]
     fn a_file_that_names_another_workspace_is_refused() {
         // Guards a hash collision, or a workspace renamed onto a key that
-        // already belongs to something else.
+        // already belongs to something else. Written by hand so save() cannot
+        // stamp the store's workspace over the lie.
         let dir = tempfile::tempdir().expect("tempdir");
         let store = store_in(dir.path(), Path::new("/tmp/example"));
-
         let mut file = sample();
         file.workspace = Path::new("/tmp/somewhere-else").to_path_buf();
-        store.save(&file).expect("save");
+        file.id = "foreign".to_string();
+        std::fs::create_dir_all(dir.path()).expect("mkdir");
+        std::fs::write(
+            store.file_path("foreign"),
+            serde_json::to_string(&file).unwrap(),
+        )
+        .expect("write");
+        let index = Index {
+            current: "foreign".to_string(),
+            sessions: vec![IndexEntry {
+                id: "foreign".to_string(),
+                title: "x".to_string(),
+                saved_at: 1,
+            }],
+        };
+        std::fs::write(store.index_path(), serde_json::to_string(&index).unwrap()).expect("index");
 
         assert!(store.load().is_none());
     }
@@ -351,23 +610,18 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_session_removes_the_file_instead_of_writing_one() {
+    fn an_empty_named_session_is_kept_so_history_survives() {
         let dir = tempfile::tempdir().expect("tempdir");
         let workspace = Path::new("/tmp/example");
         let store = store_in(dir.path(), workspace);
 
-        let mut file = sample();
-        file.workspace = workspace.to_path_buf();
-        store.save(&file).expect("save");
-        assert!(store.path().exists());
-
         let mut empty = SessionFile::new(workspace);
         empty.workspace = workspace.to_path_buf();
+        empty.title = "notes".to_string();
+        empty.named = true;
         store.save(&empty).expect("save empty");
-        assert!(
-            !store.path().exists(),
-            "a cleared session should leave nothing to resume"
-        );
+        assert!(store.path().exists(), "the slot stays in the history");
+        assert_eq!(store.list().len(), 1);
     }
 
     #[test]
@@ -380,11 +634,10 @@ mod tests {
         file.workspace = workspace.to_path_buf();
         store.save(&file).expect("save");
 
-        assert!(!store.path().with_extension("json.tmp").exists());
         assert_eq!(
             std::fs::read_dir(dir.path()).expect("read dir").count(),
-            1,
-            "only the session file should be there"
+            2,
+            "the session and the index"
         );
     }
 
@@ -411,10 +664,83 @@ mod tests {
     }
 
     #[test]
-    fn clearing_a_session_that_is_not_there_is_fine() {
+    fn a_second_session_joins_the_history() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = store_in(dir.path(), Path::new("/tmp/example"));
-        store.clear().expect("clearing nothing should succeed");
+        let workspace = Path::new("/tmp/example");
+        let store = store_in(dir.path(), workspace);
+
+        let mut first = sample();
+        first.workspace = workspace.to_path_buf();
+        store.save(&first).expect("save");
+
+        let second = store.start_new();
+        assert_ne!(second.id, first.id);
+        assert_eq!(store.list().len(), 2);
+        assert_eq!(store.current_id().as_deref(), Some(second.id.as_str()));
+    }
+
+    #[test]
+    fn opening_a_session_makes_it_current() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = Path::new("/tmp/example");
+        let store = store_in(dir.path(), workspace);
+
+        let mut first = sample();
+        first.workspace = workspace.to_path_buf();
+        store.save(&first).expect("save");
+        let first_id = store.current_id().expect("id");
+
+        let second = store.start_new();
+        store.open(&first_id).expect("open");
+        assert_eq!(store.current_id().as_deref(), Some(first_id.as_str()));
+        assert_ne!(store.current_id().as_deref(), Some(second.id.as_str()));
+    }
+
+    #[test]
+    fn renaming_sticks_and_is_not_overwritten_by_the_first_prompt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = Path::new("/tmp/example");
+        let store = store_in(dir.path(), workspace);
+
+        let mut file = sample();
+        file.workspace = workspace.to_path_buf();
+        store.save(&file).expect("save");
+        store.rename("the parser").expect("rename");
+
+        let mut loaded = store.load().expect("load");
+        loaded
+            .messages
+            .insert(0, ChatMessage::user("something else"));
+        store.save(&loaded).expect("save");
+        assert_eq!(store.load().expect("load").title, "the parser");
+    }
+
+    #[test]
+    fn infer_title_takes_the_first_user_line() {
+        let messages = vec![
+            ChatMessage::assistant("hi", Vec::new()),
+            ChatMessage::user("make the tests pass\nand then ship"),
+        ];
+        assert_eq!(infer_title(&messages), "make the tests pass");
+    }
+
+    #[test]
+    fn a_legacy_flat_file_is_migrated_into_the_directory() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let workspace = Path::new("/tmp/example");
+        let key = key_for(workspace);
+        let legacy = root.path().join(format!("{key}.json"));
+        let mut file = sample();
+        file.workspace = workspace.to_path_buf();
+        std::fs::write(&legacy, serde_json::to_string(&file).unwrap()).expect("write");
+
+        let dir = root.path().join(&key);
+        migrate_legacy(&legacy, &dir, workspace).expect("migrate");
+        assert!(!legacy.exists());
+        let store = SessionStore::at(dir, workspace.to_path_buf());
+        let loaded = store.load().expect("migrated session");
+        assert_eq!(loaded.messages.len(), 3);
+        assert!(!store.list().is_empty());
     }
 
     #[test]
@@ -436,6 +762,9 @@ mod tests {
             "\"mode\"",
             "\"cliSessions\"",
             "\"messages\"",
+            "\"id\"",
+            "\"title\"",
+            "\"named\"",
         ] {
             assert!(text.contains(key), "{key} missing from {text}");
         }

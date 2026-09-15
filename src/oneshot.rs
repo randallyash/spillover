@@ -218,6 +218,8 @@ pub async fn run(library: &Library, config: &Config, options: &Options) -> Outco
             | AgentEvent::Notice(_)
             | AgentEvent::Thought(_)
             | AgentEvent::Switched { .. }
+            | AgentEvent::SessionList { .. }
+            | AgentEvent::SessionLoaded { .. }
             // The announcement of a move that `Escalated` will report anyway; a
             // one-shot run has no interface to narrate it to, and recording both
             // would list every spill twice.
