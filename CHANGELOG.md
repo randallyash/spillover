@@ -25,6 +25,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (or `/tier auto`, or `/tier 1`) returns to the first tier and clears its spent
   mark.
 
+- **Thinking is visible.** Grok `thought` frames, Command Code `thinking_delta`,
+  and OpenAI `reasoning_content` stream as a dim "thinking" block above the
+  answer, the way the Grok TUI does. They are not kept as the answer and are
+  not sent back to a model.
+
 ## [0.3.0] - 2026-09-15
 
 ### Changed

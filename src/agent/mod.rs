@@ -200,6 +200,8 @@ pub enum AgentEvent {
     Denied { tool: String },
     /// Something the user should see that is not part of the answer.
     Notice(String),
+    /// Internal reasoning, shown while it streams, not kept as the answer.
+    Thought(String),
     /// The active tier stalled, looped, or failed, so the same turn is being
     /// retried on the tier below it.
     Escalated {
@@ -1514,6 +1516,13 @@ fn observe(
     match event {
         StreamEvent::Activity => {
             watchdog.note_activity();
+            None
+        }
+        StreamEvent::Thought(text) => {
+            // Thinking is progress, not the answer: it must not feed the
+            // repetition detector, or a model that reasons in circles looks stuck.
+            watchdog.note_activity();
+            let _ = events.send(AgentEvent::Thought(text));
             None
         }
         StreamEvent::Usage(usage) => {

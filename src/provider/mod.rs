@@ -15,6 +15,8 @@ use crate::session::{ChatMessage, ToolCall, ToolSpec};
 pub enum StreamEvent {
     /// A fragment of assistant text, to be appended to the transcript.
     Text(String),
+    /// Internal reasoning, shown dim while it streams, never part of the answer.
+    Thought(String),
     /// The tier showed real progress without anything printable — a tool call
     /// being built up, say. This is what keeps a long tool call from looking
     /// like a stalled tier.

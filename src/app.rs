@@ -69,6 +69,8 @@ pub enum Role {
     User,
     Assistant,
     System,
+    /// Internal reasoning. Display only; never sent back to a model.
+    Thought,
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +97,13 @@ impl Message {
     pub fn system(text: impl Into<String>) -> Self {
         Self {
             role: Role::System,
+            text: text.into(),
+        }
+    }
+
+    pub fn thought(text: impl Into<String>) -> Self {
+        Self {
+            role: Role::Thought,
             text: text.into(),
         }
     }
@@ -677,10 +686,40 @@ impl App {
 
     pub fn handle_agent_event(&mut self, event: AgentEvent) {
         match event {
+            AgentEvent::Thought(chunk) => {
+                self.running = None;
+                let index = match self.streaming {
+                    Some(index)
+                        if self
+                            .messages
+                            .get(index)
+                            .is_some_and(|message| message.role == Role::Thought) =>
+                    {
+                        index
+                    }
+                    _ => {
+                        self.messages.push(Message::thought(""));
+                        let index = self.messages.len() - 1;
+                        self.streaming = Some(index);
+                        index
+                    }
+                };
+                if let Some(message) = self.messages.get_mut(index) {
+                    message.text.push_str(&chunk);
+                }
+            }
             AgentEvent::Text(chunk) => {
                 // Consecutive chunks belong to the same message; anything else
                 // in between (a tool, a notice) starts a new one.
                 self.running = None;
+                // Thinking is over; the answer is a new message.
+                if self
+                    .streaming
+                    .and_then(|index| self.messages.get(index))
+                    .is_some_and(|message| message.role == Role::Thought)
+                {
+                    self.streaming = None;
+                }
                 let index = match self.streaming {
                     Some(index) => index,
                     None => {
@@ -902,6 +941,14 @@ impl App {
             if index + 1 == self.messages.len() {
                 self.messages.remove(index);
             }
+        }
+        // Thinking belongs to the abandoned attempt, same as the half-answer.
+        while self
+            .messages
+            .last()
+            .is_some_and(|message| message.role == Role::Thought)
+        {
+            self.messages.pop();
         }
     }
 
@@ -2061,6 +2108,20 @@ mod tests {
         // The agent is gone; the send fails and that is not fatal.
         app.handle_key(press(KeyCode::Char('y')));
         assert!(app.approval.is_none());
+    }
+
+    #[test]
+    fn thinking_streams_into_its_own_message_then_the_answer_starts() {
+        let mut app = new_app();
+        app.handle_agent_event(AgentEvent::Thought("look ".to_string()));
+        app.handle_agent_event(AgentEvent::Thought("around".to_string()));
+        assert_eq!(app.messages.last().unwrap().role, Role::Thought);
+        assert_eq!(app.messages.last().unwrap().text, "look around");
+
+        app.handle_agent_event(AgentEvent::Text("done".to_string()));
+        assert_eq!(app.messages[app.messages.len() - 2].role, Role::Thought);
+        assert_eq!(app.messages.last().unwrap().role, Role::Assistant);
+        assert_eq!(app.messages.last().unwrap().text, "done");
     }
 
     #[test]

@@ -131,11 +131,10 @@ impl Parser for CommandCodeParser {
                 // frame rather than instead of it: returning early would let a
                 // frame that carried both drop part of the answer, which is a
                 // far worse failure than an uncounted token.
-                let is_delta = inner
+                let kind = inner
                     .and_then(|inner| inner.get("type"))
-                    .and_then(Value::as_str)
-                    == Some("text_delta");
-                if is_delta {
+                    .and_then(Value::as_str);
+                if kind == Some("text_delta") {
                     if let Some(chunk) = inner
                         .and_then(|inner| inner.get("delta"))
                         .and_then(Value::as_str)
@@ -143,6 +142,16 @@ impl Parser for CommandCodeParser {
                         if !chunk.is_empty() {
                             self.text.push_str(chunk);
                             events.push(StreamEvent::Text(chunk.to_string()));
+                        }
+                    }
+                }
+                if kind == Some("thinking_delta") {
+                    if let Some(chunk) = inner
+                        .and_then(|inner| inner.get("delta"))
+                        .and_then(Value::as_str)
+                    {
+                        if !chunk.is_empty() {
+                            events.push(StreamEvent::Thought(chunk.to_string()));
                         }
                     }
                 }
@@ -213,6 +222,12 @@ impl Parser for GrokParser {
                 }
                 _ => vec![StreamEvent::Activity],
             },
+            Some("thought") => match value.get("data").and_then(Value::as_str) {
+                Some(chunk) if !chunk.is_empty() => {
+                    vec![StreamEvent::Thought(chunk.to_string())]
+                }
+                _ => vec![StreamEvent::Activity],
+            },
             Some("usage") => {
                 self.stop_reason = value
                     .get("stopReason")
@@ -252,8 +267,8 @@ impl Parser for GrokParser {
                 );
                 vec![StreamEvent::Activity]
             }
-            // thought, tool_call, tool_call_update, plan, and anything added
-            // later: real progress, nothing to show.
+            // tool_call, tool_call_update, plan, and anything added later:
+            // real progress, nothing to print as the answer.
             _ => vec![StreamEvent::Activity],
         }
     }
@@ -436,6 +451,30 @@ mod tests {
     }
 
     #[test]
+    fn grok_streams_thoughts_separately_from_the_answer() {
+        let mut parser = parser_for(Dialect::Grok);
+        let events = feed(
+            &mut parser,
+            &[
+                r#"{"type":"thought","data":"Looking at the files…"}"#,
+                r#"{"type":"text","data":"Here is the summary."}"#,
+            ],
+        );
+        assert_eq!(text_of(&events), "Here is the summary.");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Thought(t) if t.contains("Looking"))),
+            "{events:?}"
+        );
+        assert_eq!(
+            parser.finish().expect("ok").text,
+            "Here is the summary.",
+            "thoughts are not the answer"
+        );
+    }
+
+    #[test]
     fn grok_reports_usage_as_soon_as_its_frame_arrives() {
         let mut parser = GrokParser::default();
 
@@ -503,6 +542,17 @@ mod tests {
             text_of(&events),
             "hello",
             "only the text_delta carries the answer"
+        );
+        let thinking: String = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::Thought(chunk) => Some(chunk.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            thinking.contains("user wants"),
+            "thinking_delta should be visible as thought, not as the answer: {thinking:?}"
         );
 
         let summary = parser.finish().expect("the recorded run succeeded");
@@ -588,7 +638,20 @@ mod tests {
                 r#"{"type":"tool_call_update","toolCallId":"call_1","status":"completed","content":[],"rawOutput":{"lines":42},"locations":[]}"#,
             ],
         );
-        assert!(events.iter().all(|e| matches!(e, StreamEvent::Activity)));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Thought(t) if t.contains("Analyzing"))),
+            "{events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, StreamEvent::Activity)),
+            "tool_call frames stay progress: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, StreamEvent::Text(_))),
+            "neither thoughts nor tool calls are the answer"
+        );
 
         let summary = parser.finish().expect("no error");
         assert!(summary.text.is_empty());

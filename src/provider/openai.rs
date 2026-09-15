@@ -264,6 +264,18 @@ impl StreamAccumulator {
             }
         }
 
+        // DeepSeek-reasoner, OpenRouter, and some local servers stream
+        // reasoning here rather than in `content`.
+        let reasoning = delta
+            .get("reasoning_content")
+            .or_else(|| delta.get("reasoning"))
+            .and_then(Value::as_str);
+        if let Some(chunk) = reasoning {
+            if !chunk.is_empty() {
+                events.push(StreamEvent::Thought(chunk.to_string()));
+            }
+        }
+
         if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
             for call in calls {
                 let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
@@ -495,6 +507,27 @@ mod tests {
             .expect("usage should be recorded");
         assert_eq!(usage.prompt_tokens, 11);
         assert_eq!(usage.completion_tokens, 7);
+    }
+
+    #[test]
+    fn streams_reasoning_as_thought_not_as_the_answer() {
+        let mut accumulator = StreamAccumulator::default();
+        let events = accumulator.apply(
+            r#"{"choices":[{"delta":{"reasoning_content":"let me think","content":"ok"}}]}"#,
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Thought(t) if t == "let me think")),
+            "{events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Text(t) if t == "ok")),
+            "{events:?}"
+        );
+        assert_eq!(accumulator.finish().text, "ok");
     }
 
     #[test]

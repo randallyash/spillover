@@ -105,6 +105,7 @@ pub fn lines(app: &App, theme: &Theme, width: usize) -> Vec<Line<'static>> {
             // The model answers in markdown whether or not anyone asked, so its
             // prose is parsed rather than shown with the markers intact.
             Role::Assistant => markdown::lines(&message.text, body_width, theme, theme.assistant),
+            Role::Thought => thought_lines(&message.text, body_width, theme),
             _ => plain(
                 &message.text,
                 body_width,
@@ -177,10 +178,20 @@ fn plain(
 
 /// What sits in the gutter: a bar beside the user's own words, nothing beside
 /// the model's.
+fn thought_lines(text: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    let label = theme.hint.add_modifier(ratatui::style::Modifier::ITALIC);
+    let body = theme.faint.add_modifier(ratatui::style::Modifier::ITALIC);
+    let mut lines = vec![Line::from(Span::styled("thinking", label))];
+    for part in text::wrap(text, width) {
+        lines.push(Line::from(Span::styled(part, body)));
+    }
+    lines
+}
+
 fn gutter_span(role: Role, theme: &Theme) -> Span<'static> {
     match role {
         Role::User => Span::styled(format!("{BAR} "), theme.accent),
-        Role::Assistant | Role::System => Span::raw(" ".repeat(GUTTER)),
+        Role::Assistant | Role::System | Role::Thought => Span::raw(" ".repeat(GUTTER)),
     }
 }
 
@@ -189,6 +200,7 @@ fn style_for(role: Role, text: &str, theme: &Theme) -> ratatui::style::Style {
     match role {
         Role::User => theme.user,
         Role::Assistant => theme.assistant,
+        Role::Thought => theme.faint,
         Role::System => match text.chars().next() {
             Some('✓') => theme.success,
             Some('✗') => theme.error,
@@ -285,6 +297,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn thinking_is_labelled_and_dim_and_not_the_answer() {
+        let theme = Theme::default();
+        let app = app_with(&[
+            (Role::Thought, "looking at the files"),
+            (Role::Assistant, "here is the summary"),
+        ]);
+        let drawn = flat(&lines(&app, &theme, 60));
+        assert!(
+            drawn.iter().any(|line| line.contains("thinking")),
+            "{drawn:?}"
+        );
+        assert!(
+            drawn
+                .iter()
+                .any(|line| line.contains("looking at the files")),
+            "{drawn:?}"
+        );
+        assert!(
+            drawn
+                .iter()
+                .any(|line| line.contains("here is the summary")),
+            "{drawn:?}"
+        );
     }
 
     #[test]

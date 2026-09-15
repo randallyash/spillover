@@ -38,7 +38,9 @@ into the expensive one. spill treats that as the product:
   `write_file` is refused before it reaches disk.
 
 It is an agent, not a chat window: it reads, searches, edits, and runs commands,
-and asks before anything that writes.
+and asks before anything that writes. When a model thinks out loud (Grok
+`thought`, Command Code thinking, OpenAI reasoning), that streams as a dim
+*thinking* block above the answer — not as the answer.
 
 ## Install
 
